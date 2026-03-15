@@ -1,0 +1,21 @@
+[package]
+name = "email-unsubscribe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+csv = "1"
+indicatif = "0.17"
+imap = "2"
+mail-parser = "0.9"
+native-tls = "0.2"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["blocking"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+url = "2"

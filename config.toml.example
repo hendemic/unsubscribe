@@ -1,0 +1,11 @@
+[imap]
+host = "imap.zoho.com"
+port = 993
+username = "you@zoho.com"
+password = "your-app-specific-password"
+
+[scan]
+# Folders to scan for unsubscribe links
+folders = ["INBOX"]
+# Folder to move archived emails into
+archive_folder = "Unsubscribed"
