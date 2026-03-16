@@ -1,6 +1,6 @@
 [package]
 name = "email-unsubscribe"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 
 [[bin]]
@@ -15,7 +15,7 @@ crossterm = "0.28"
 csv = "1"
 indicatif = "0.17"
 imap = "2"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 libc = "0.2"
 mail-parser = "0.9"
 native-tls = "0.2"

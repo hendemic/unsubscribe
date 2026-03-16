@@ -56,7 +56,18 @@ password_command = "pass show email/imap"
 password = "your-password"
 ```
 
-See [config.toml.example](config.toml.example) for the full template.
+### Supported providers
+
+| Provider | IMAP host | Notes |
+|----------|-----------|-------|
+| Gmail | `imap.gmail.com` | [App password](https://myaccount.google.com/apppasswords) required. Folders use `[Gmail]/` prefix (e.g. `[Gmail]/Promotions`). |
+| Outlook | `outlook.office365.com` | |
+| Yahoo | `imap.mail.yahoo.com` | |
+| Zoho | `imap.zoho.com` | |
+| iCloud | `imap.mail.me.com` | App-specific password required. |
+| Fastmail | `imap.fastmail.com` | |
+
+Any provider with IMAP support on port 993 should work. See [config.toml.example](config.toml.example) for the full template.
 
 ## License
 

@@ -14,3 +14,16 @@ username = "you@sample.com"
 folders = ["INBOX"]
 # Folder to move archived emails into
 archive_folder = "Unsubscribed"
+
+# Common IMAP hosts:
+#   Gmail:      imap.gmail.com (app password required, https://myaccount.google.com/apppasswords)
+#   Outlook:    outlook.office365.com
+#   Yahoo:      imap.mail.yahoo.com
+#   Zoho:       imap.zoho.com
+#   iCloud:     imap.mail.me.com (app-specific password required)
+#   Fastmail:   imap.fastmail.com
+#
+# Folder names vary by provider:
+#   Gmail:   folders use "[Gmail]/" prefix, e.g. "[Gmail]/All Mail", "[Gmail]/Promotions"
+#   Outlook: "Inbox", "Junk Email", etc.
+#   Most others: "INBOX", "Sent", etc.
