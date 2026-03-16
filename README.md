@@ -10,6 +10,14 @@ A CLI/TUI tool to bulk unsubscribe from email lists via IMAP.
 curl -sL https://raw.githubusercontent.com/hendemic/unsubscribe/main/install.sh | bash
 ```
 
+The binary is installed to `~/.local/bin`. Make sure it's in your PATH:
+
+```
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that line to your `~/.bashrc` or `~/.zshrc` to make it permanent.
+
 **From source:**
 
 ```

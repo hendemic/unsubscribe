@@ -22,12 +22,7 @@ esac
 
 ASSET="${BINARY}-${OS_TAG}-${ARCH_TAG}"
 
-# Determine install directory
-if [ "$OS_TAG" = "macos" ]; then
-    INSTALL_DIR="/usr/local/bin"
-else
-    INSTALL_DIR="${HOME}/.local/bin"
-fi
+INSTALL_DIR="${HOME}/.local/bin"
 
 echo "Installing ${BINARY} (${OS_TAG}-${ARCH_TAG})..."
 
