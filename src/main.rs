@@ -61,6 +61,8 @@ enum Commands {
     Init,
     /// Update IMAP credentials (server, username, password)
     Reauth,
+    /// Remove config, data, keychain entry, and binary
+    Uninstall,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +74,7 @@ fn main() -> Result<()> {
         Commands::Update => return cmd_update(),
         Commands::Init => return cmd_init(&config_path),
         Commands::Reauth => return cmd_reauth(&config_path),
+        Commands::Uninstall => return cmd_uninstall(&config_path),
         _ => {}
     }
 
@@ -87,9 +90,11 @@ fn main() -> Result<()> {
         Commands::Run { dry_run, min_emails } => cmd_run(&config, dry_run, min_emails),
         Commands::Scan { min_emails } => cmd_scan(&config, min_emails),
         Commands::Export { output, min_emails } => cmd_export(&config, &output, min_emails),
-        Commands::Warnings | Commands::Update | Commands::Init | Commands::Reauth => {
-            unreachable!()
-        }
+        Commands::Warnings
+        | Commands::Update
+        | Commands::Init
+        | Commands::Reauth
+        | Commands::Uninstall => unreachable!(),
     }
 }
 
@@ -301,6 +306,55 @@ fn cmd_reauth(config_path: &Path) -> Result<()> {
     config::Config::write_init(config_path, &host, port, &username, folders, &archive)?;
 
     eprintln!("\n{GREEN}Credentials updated.{RESET}");
+    Ok(())
+}
+
+fn cmd_uninstall(config_path: &Path) -> Result<()> {
+    eprintln!("{BOLD}This will remove:{RESET}");
+    eprintln!("  - Config:  {}", config_path.parent().unwrap_or(config_path).display());
+    eprintln!("  - Data:    {}", data_dir().display());
+    eprintln!("  - Keychain entry");
+    eprintln!("  - Binary:  {}", std::env::current_exe().unwrap_or_default().display());
+
+    eprint!("\n{BOLD}Are you sure?{RESET} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        eprintln!("Aborted.");
+        return Ok(());
+    }
+
+    // Remove keychain entry (best-effort, config may not exist)
+    if let Ok(config) = config::Config::load(config_path) {
+        let _ = config::Config::delete_password(&config.imap.username);
+        eprintln!("  {GREEN}Removed keychain entry{RESET}");
+    }
+
+    // Remove config directory
+    if let Some(config_dir) = config_path.parent() {
+        if config_dir.exists() {
+            std::fs::remove_dir_all(config_dir)?;
+            eprintln!("  {GREEN}Removed {}{RESET}", config_dir.display());
+        }
+    }
+
+    // Remove data directory
+    let data = data_dir();
+    if data.exists() {
+        std::fs::remove_dir_all(&data)?;
+        eprintln!("  {GREEN}Removed {}{RESET}", data.display());
+    }
+
+    // Remove binary (must be last since we're running it)
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.exists() {
+            std::fs::remove_file(&exe)?;
+            eprintln!("  {GREEN}Removed {}{RESET}", exe.display());
+        }
+    }
+
+    eprintln!("\n{GREEN}Uninstalled.{RESET}");
     Ok(())
 }
 
