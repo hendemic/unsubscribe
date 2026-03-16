@@ -8,6 +8,7 @@ authors = ["Mike Henderson"]
 [dependencies]
 unsubscribe-core = { path = "../unsubscribe-core" }
 anyhow = "1"
+base64 = "0.22"
 imap = "2"
 mail-parser = "0.9"
 native-tls = "0.2"
