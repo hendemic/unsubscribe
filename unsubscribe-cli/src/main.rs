@@ -110,6 +110,7 @@ fn make_provider(config: &config::Config) -> unsubscribe_imap::ImapProvider {
 }
 
 fn do_scan(config: &config::Config, min_emails: u32) -> Result<(Vec<SenderInfo>, Vec<String>)> {
+    eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(config);
     let folders: Vec<Folder> = config.scan.folders.iter().map(|f| Folder::new(f)).collect();
     let scan_result = provider.scan(&folders)?;
@@ -486,7 +487,6 @@ fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()
     }
 
     // Phase 1: Scan
-    eprintln!("{BOLD}Scanning mailbox for unsubscribe links...{RESET}\n");
     let (senders, warnings) = do_scan(config, min_emails)?;
 
     if senders.is_empty() {
