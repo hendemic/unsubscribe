@@ -8,6 +8,5 @@ authors = ["Mike Henderson"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-mail-parser = "0.9"
 scraper = "0.22"
 url = "2"
