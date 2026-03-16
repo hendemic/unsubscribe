@@ -8,7 +8,7 @@ use native_tls::TlsStream;
 
 use unsubscribe_core::{
     domain_from_email, parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId,
-    ScanResult, SenderInfo,
+    ScanProgress, ScanResult, SenderInfo,
 };
 
 /// IMAP adapter for the `EmailProvider` trait.
@@ -45,34 +45,38 @@ impl ImapProvider {
 }
 
 impl EmailProvider for ImapProvider {
-    fn scan(&self, folders: &[Folder]) -> Result<ScanResult> {
-        // Spawn a thread per folder, each with its own IMAP connection
-        let handles: Vec<_> = folders
-            .iter()
-            .map(|folder| {
-                let provider = ImapProvider {
-                    host: self.host.clone(),
-                    port: self.port,
-                    username: self.username.clone(),
-                    password: self.password.clone(),
-                };
-                let folder = folder.clone();
-                std::thread::spawn(move || scan_folder(&provider, &folder))
-            })
-            .collect();
-
+    fn scan(&self, folders: &[Folder], progress: &dyn ScanProgress) -> Result<ScanResult> {
         let mut combined: HashMap<String, SenderInfo> = HashMap::new();
         let mut all_warnings: Vec<String> = Vec::new();
 
-        for handle in handles {
-            let folder_result = handle.join().expect("scan thread panicked")?;
-            let warnings = merge_folder_result(&mut combined, folder_result);
-            for w in warnings {
-                if !all_warnings.contains(&w) {
-                    all_warnings.push(w);
+        // Use scoped threads so the progress reference can be shared safely
+        std::thread::scope(|s| {
+            let handles: Vec<_> = folders
+                .iter()
+                .map(|folder| {
+                    let provider = ImapProvider {
+                        host: self.host.clone(),
+                        port: self.port,
+                        username: self.username.clone(),
+                        password: self.password.clone(),
+                    };
+                    let folder = folder.clone();
+                    s.spawn(move || scan_folder(&provider, &folder, progress))
+                })
+                .collect();
+
+            for handle in handles {
+                let folder_result = handle.join().expect("scan thread panicked")?;
+                let warnings = merge_folder_result(&mut combined, folder_result);
+                for w in warnings {
+                    if !all_warnings.contains(&w) {
+                        all_warnings.push(w);
+                    }
                 }
             }
-        }
+
+            Ok::<(), anyhow::Error>(())
+        })?;
 
         let mut senders: Vec<SenderInfo> = combined.into_values().collect();
         senders.sort_by(|a, b| b.email_count.cmp(&a.email_count));
@@ -153,7 +157,11 @@ struct FolderResult {
 }
 
 /// Scan a single IMAP folder on a dedicated connection.
-fn scan_folder(provider: &ImapProvider, folder: &Folder) -> Result<FolderResult> {
+fn scan_folder(
+    provider: &ImapProvider,
+    folder: &Folder,
+    progress: &dyn ScanProgress,
+) -> Result<FolderResult> {
     let mut session = provider.connect()?;
     let mut senders: HashMap<String, SenderInfo> = HashMap::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -165,7 +173,10 @@ fn scan_folder(provider: &ImapProvider, folder: &Folder) -> Result<FolderResult>
         .with_context(|| format!("Failed to select folder: {folder_name}"))?;
 
     let total = mailbox.exists;
+    progress.on_folder_start(folder, total);
+
     if total == 0 {
+        progress.on_folder_done(folder);
         session.logout().ok();
         return Ok(FolderResult { senders, warnings });
     }
@@ -257,9 +268,12 @@ fn scan_folder(provider: &ImapProvider, folder: &Folder) -> Result<FolderResult>
             }
         }
 
+        let batch_count = (end - start + 1).min(messages.iter().count() as u32);
+        progress.on_messages_scanned(folder, batch_count);
         start = end + 1;
     }
 
+    progress.on_folder_done(folder);
     session.logout().ok();
     Ok(FolderResult { senders, warnings })
 }

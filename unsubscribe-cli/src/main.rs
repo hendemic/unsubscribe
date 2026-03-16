@@ -1,5 +1,6 @@
 mod config;
 mod http;
+mod progress;
 mod tui;
 
 use anyhow::{Context, Result};
@@ -113,7 +114,8 @@ fn do_scan(config: &config::Config, min_emails: u32) -> Result<(Vec<SenderInfo>,
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(config);
     let folders: Vec<Folder> = config.scan.folders.iter().map(|f| Folder::new(f)).collect();
-    let scan_result = provider.scan(&folders)?;
+    let progress = progress::CliScanProgress::new();
+    let scan_result = provider.scan(&folders, &progress)?;
 
     // Save warnings to log
     if !scan_result.warnings.is_empty() {
