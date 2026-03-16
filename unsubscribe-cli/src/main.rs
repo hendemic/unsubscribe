@@ -1,11 +1,13 @@
 mod config;
+mod http;
 mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use unsubscribe_core::{ScanResult, SenderInfo, UnsubscribeResult};
+use unsubscribe_core::{EmailProvider, Folder, SenderInfo, UnsubscribeResult};
 
 // ANSI color helpers
 const BOLD: &str = "\x1b[1m";
@@ -98,11 +100,19 @@ fn main() -> Result<()> {
     }
 }
 
+fn make_provider(config: &config::Config) -> unsubscribe_imap::ImapProvider {
+    unsubscribe_imap::ImapProvider::new(
+        config.imap.host.clone(),
+        config.imap.port,
+        config.imap.username.clone(),
+        config.imap.password.clone(),
+    )
+}
+
 fn do_scan(config: &config::Config, min_emails: u32) -> Result<(Vec<SenderInfo>, Vec<String>)> {
-    // TODO(issue-7): Wire up EmailProvider adapter to perform the scan.
-    // let provider = unsubscribe_imap::ImapProvider::new(...);
-    // let scan_result = provider.scan(&folders)?;
-    let scan_result: ScanResult = todo!("issue #7: wire up EmailProvider.scan()");
+    let provider = make_provider(config);
+    let folders: Vec<Folder> = config.scan.folders.iter().map(|f| Folder::new(f)).collect();
+    let scan_result = provider.scan(&folders)?;
 
     // Save warnings to log
     if !scan_result.warnings.is_empty() {
@@ -520,10 +530,48 @@ fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()
 
     // Phase 3: Unsubscribe
     eprintln!("{BOLD}Unsubscribing...{RESET}\n");
-    // TODO(issue-7): Wire up unsubscribe orchestration via core + HttpClient adapter.
-    // let http_client = ReqwestHttpClient::new();
-    // let results = unsubscribe_core::orchestrate_unsubscribe(&http_client, &to_unsub, dry_run);
-    let results: Vec<UnsubscribeResult> = todo!("issue #7: wire up unsubscribe orchestration");
+
+    let results: Vec<UnsubscribeResult> = if dry_run {
+        to_unsub
+            .iter()
+            .map(|s| {
+                let url = s
+                    .unsubscribe_urls
+                    .first()
+                    .or(s.unsubscribe_mailto.first())
+                    .cloned()
+                    .unwrap_or_default();
+                UnsubscribeResult {
+                    email: s.email.clone(),
+                    method: "dry-run".to_string(),
+                    success: true,
+                    detail: "Would unsubscribe".to_string(),
+                    url,
+                }
+            })
+            .collect()
+    } else {
+        let http_client = http::ReqwestHttpClient::new()?;
+        let pb = ProgressBar::new(to_unsub.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(" [{bar:40.cyan/dim}] \x1b[36m{pos}\x1b[0m/{len} unsubscribing")
+                .expect("valid template")
+                .progress_chars("=> "),
+        );
+
+        let results: Vec<UnsubscribeResult> = to_unsub
+            .iter()
+            .map(|sender| {
+                let result = unsubscribe_core::unsubscribe(&[sender], &http_client);
+                pb.inc(1);
+                result.into_iter().next().expect("one sender produces one result")
+            })
+            .collect();
+
+        pb.finish();
+        results
+    };
 
     let success_count = results.iter().filter(|r| r.success).count();
     let fail_count = results.iter().filter(|r| !r.success).count();
@@ -542,9 +590,21 @@ fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()
 
     // Phase 4: Archive
     eprintln!("\n{BOLD}Archiving emails...{RESET}\n");
-    // TODO(issue-7): Wire up EmailProvider.archive() via adapter.
-    // let archived = provider.archive(&messages, &destination)?;
-    let archived: u32 = todo!("issue #7: wire up EmailProvider.archive()");
+
+    let archived: u32 = if dry_run {
+        let total: u32 = to_unsub.iter().map(|s| s.email_count).sum();
+        eprintln!(
+            "Dry run: would archive {total} emails to '{}'",
+            config.scan.archive_folder
+        );
+        total
+    } else {
+        let provider = make_provider(config);
+        let messages: Vec<_> = to_unsub.iter().flat_map(|s| s.messages.clone()).collect();
+        let destination = Folder::new(&config.scan.archive_folder);
+        provider.archive(&messages, &destination)?
+    };
+
     eprintln!(
         "{GREEN}Archived {archived} emails{RESET} to '{}'.",
         config.scan.archive_folder
