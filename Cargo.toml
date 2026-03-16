@@ -3,6 +3,10 @@ name = "email-unsubscribe"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "unsubscribe"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -11,11 +15,14 @@ crossterm = "0.28"
 csv = "1"
 indicatif = "0.17"
 imap = "2"
+keyring = "3"
+libc = "0.2"
 mail-parser = "0.9"
 native-tls = "0.2"
 ratatui = "0.29"
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_json = "1"
 url = "2"

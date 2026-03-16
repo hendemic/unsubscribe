@@ -1,8 +1,13 @@
+# Password is stored in your OS keychain (unsubscribe)
+# To use a command instead, add:
+#   password_command = "pass show email/imap"
+
 [imap]
-host = "imap.zoho.com"
+host = "imap.sample.com"
 port = 993
-username = "you@zoho.com"
-password = "your-app-specific-password"
+username = "you@sample.com"
+# password_command = "pass show email/zoho"
+# password = "fallback-plaintext-password"  # not recommended
 
 [scan]
 # Folders to scan for unsubscribe links

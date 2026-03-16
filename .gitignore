@@ -2,3 +2,4 @@
 config.toml
 unsubscribe_log.csv
 unsubscribe_senders.csv
+/.claude

@@ -190,142 +190,241 @@ pub struct ScanResult {
     pub warnings: Vec<String>,
 }
 
-/// Scan all configured folders and return sender info grouped by sender email
-pub fn scan(config: &Config) -> Result<ScanResult> {
+/// Per-folder scan result before merging
+struct FolderResult {
+    senders: HashMap<String, SenderInfo>,
+    warnings: Vec<String>,
+}
+
+/// Scan a single folder on its own IMAP connection
+fn scan_folder(config: &Config, folder: &str, pb: ProgressBar) -> Result<FolderResult> {
     let mut session = connect(config)?;
     let mut senders: HashMap<String, SenderInfo> = HashMap::new();
     let mut warnings: Vec<String> = Vec::new();
     let parser = MessageParser::default();
 
-    // Track UIDVALIDITY per folder for safety checks during archive
-    let mut uid_validities: HashMap<String, u32> = HashMap::new();
+    let mailbox = session
+        .select(folder)
+        .with_context(|| format!("Failed to select folder: {folder}"))?;
 
-    for folder in &config.scan.folders {
-        eprintln!("Scanning folder: {folder}");
-        let mailbox = session
-            .select(folder)
-            .with_context(|| format!("Failed to select folder: {folder}"))?;
-
-        let total = mailbox.exists;
-        if total == 0 {
-            eprintln!("  (empty)");
-            continue;
-        }
-
-        if let Some(validity) = mailbox.uid_validity {
-            uid_validities.insert(folder.clone(), validity);
-        }
-
-        let pb = ProgressBar::new(total as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  [{bar:40}] {pos}/{len} emails scanned")
-                .unwrap()
-                .progress_chars("=> "),
-        );
-
-        // Fetch in batches to bound memory usage on large mailboxes
-        let batch_size = 500u32;
-        let mut start = 1u32;
-        while start <= total {
-            let end = total.min(start + batch_size - 1);
-            let sequence = format!("{start}:{end}");
-            let messages = session
-                .fetch(&sequence, "(UID BODY.PEEK[HEADER])")
-                .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
-
-            for msg in messages.iter() {
-                pb.inc(1);
-
-                let Some(uid) = msg.uid else { continue };
-                let Some(header_bytes) = msg.header() else {
-                    continue;
-                };
-                let Some(parsed) = parser.parse(header_bytes) else {
-                    continue;
-                };
-
-                // Check for List-Unsubscribe header
-                let Some(unsub_header) = parsed.header_raw("List-Unsubscribe") else {
-                    continue;
-                };
-                let unsub_header = unsub_header.to_string();
-
-                let has_one_click = parsed.header_raw("List-Unsubscribe-Post").is_some();
-
-                // Extract sender info
-                let Some(from) = parsed.from() else {
-                    continue;
-                };
-                let Some(first) = from.clone().into_list().into_iter().next() else {
-                    continue;
-                };
-                let sender_name = first.name().unwrap_or("").to_string();
-                let sender_email = first.address().unwrap_or("unknown").to_string();
-
-                let parsed_unsub = parse_list_unsubscribe(&unsub_header, &sender_email);
-                if let Some(w) = parsed_unsub.warning {
-                    if !warnings.contains(&w) {
-                        warnings.push(w);
-                    }
-                }
-                let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
-
-                let sender_key = sender_email.to_lowercase();
-                let entry = senders.entry(sender_key).or_insert_with(|| {
-                    let domain = domain_from_email(&sender_email);
-                    SenderInfo {
-                        display_name: sender_name.clone(),
-                        email: sender_email.clone(),
-                        domain,
-                        unsubscribe_urls: Vec::new(),
-                        unsubscribe_mailto: Vec::new(),
-                        one_click: false,
-                        email_count: 0,
-                        uids: HashMap::new(),
-                        uid_validity: HashMap::new(),
-                    }
-                });
-
-                // Merge URLs (dedup)
-                for u in urls {
-                    if !entry.unsubscribe_urls.contains(&u) {
-                        entry.unsubscribe_urls.push(u);
-                    }
-                }
-                for m in mailtos {
-                    if !entry.unsubscribe_mailto.contains(&m) {
-                        entry.unsubscribe_mailto.push(m);
-                    }
-                }
-                if has_one_click {
-                    entry.one_click = true;
-                }
-                entry.email_count += 1;
-                entry.uids.entry(folder.clone()).or_default().push(uid);
-
-                // Store UIDVALIDITY for this folder
-                if let Some(&validity) = uid_validities.get(folder.as_str()) {
-                    entry.uid_validity.insert(folder.clone(), validity);
-                }
-
-                // Update display name if we got a better one
-                if entry.display_name.is_empty() && !sender_name.is_empty() {
-                    entry.display_name = sender_name;
-                }
-            }
-
-            start = end + 1;
-        }
-
-        pb.finish();
+    let total = mailbox.exists;
+    if total == 0 {
+        pb.finish_with_message("(empty)");
+        session.logout().ok();
+        return Ok(FolderResult { senders, warnings });
     }
 
-    session.logout().ok();
+    let uid_validity = mailbox.uid_validity;
+    pb.set_length(total as u64);
 
-    let mut senders: Vec<SenderInfo> = senders.into_values().collect();
+    // Fetch in batches to bound memory usage on large mailboxes
+    let batch_size = 500u32;
+    let mut start = 1u32;
+    while start <= total {
+        let end = total.min(start + batch_size - 1);
+        let sequence = format!("{start}:{end}");
+        let messages = session
+            .fetch(&sequence, "(UID BODY.PEEK[HEADER])")
+            .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
+
+        for msg in messages.iter() {
+            pb.inc(1);
+
+            let Some(uid) = msg.uid else { continue };
+            let Some(header_bytes) = msg.header() else {
+                continue;
+            };
+            let Some(parsed) = parser.parse(header_bytes) else {
+                continue;
+            };
+
+            // Check for List-Unsubscribe header
+            let Some(unsub_header) = parsed.header_raw("List-Unsubscribe") else {
+                continue;
+            };
+            let unsub_header = unsub_header.to_string();
+
+            let has_one_click = parsed.header_raw("List-Unsubscribe-Post").is_some();
+
+            // Extract sender info
+            let Some(from) = parsed.from() else {
+                continue;
+            };
+            let Some(first) = from.clone().into_list().into_iter().next() else {
+                continue;
+            };
+            let sender_name = first.name().unwrap_or("").to_string();
+            let sender_email = first.address().unwrap_or("unknown").to_string();
+
+            let parsed_unsub = parse_list_unsubscribe(&unsub_header, &sender_email);
+            if let Some(w) = parsed_unsub.warning {
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
+
+            let sender_key = sender_email.to_lowercase();
+            let entry = senders.entry(sender_key).or_insert_with(|| {
+                let domain = domain_from_email(&sender_email);
+                SenderInfo {
+                    display_name: sender_name.clone(),
+                    email: sender_email.clone(),
+                    domain,
+                    unsubscribe_urls: Vec::new(),
+                    unsubscribe_mailto: Vec::new(),
+                    one_click: false,
+                    email_count: 0,
+                    uids: HashMap::new(),
+                    uid_validity: HashMap::new(),
+                }
+            });
+
+            // Merge URLs (dedup)
+            for u in urls {
+                if !entry.unsubscribe_urls.contains(&u) {
+                    entry.unsubscribe_urls.push(u);
+                }
+            }
+            for m in mailtos {
+                if !entry.unsubscribe_mailto.contains(&m) {
+                    entry.unsubscribe_mailto.push(m);
+                }
+            }
+            if has_one_click {
+                entry.one_click = true;
+            }
+            entry.email_count += 1;
+            entry
+                .uids
+                .entry(folder.to_string())
+                .or_default()
+                .push(uid);
+
+            if let Some(validity) = uid_validity {
+                entry
+                    .uid_validity
+                    .insert(folder.to_string(), validity);
+            }
+
+            // Update display name if we got a better one
+            if entry.display_name.is_empty() && !sender_name.is_empty() {
+                entry.display_name = sender_name;
+            }
+        }
+
+        start = end + 1;
+    }
+
+    pb.finish();
+    session.logout().ok();
+    Ok(FolderResult { senders, warnings })
+}
+
+/// Merge a per-folder result into the combined sender map
+fn merge_folder_result(
+    combined: &mut HashMap<String, SenderInfo>,
+    folder_result: FolderResult,
+) -> Vec<String> {
+    for (key, sender) in folder_result.senders {
+        let entry = combined.entry(key).or_insert_with(|| SenderInfo {
+            display_name: sender.display_name.clone(),
+            email: sender.email.clone(),
+            domain: sender.domain.clone(),
+            unsubscribe_urls: Vec::new(),
+            unsubscribe_mailto: Vec::new(),
+            one_click: false,
+            email_count: 0,
+            uids: HashMap::new(),
+            uid_validity: HashMap::new(),
+        });
+
+        for u in &sender.unsubscribe_urls {
+            if !entry.unsubscribe_urls.contains(u) {
+                entry.unsubscribe_urls.push(u.clone());
+            }
+        }
+        for m in &sender.unsubscribe_mailto {
+            if !entry.unsubscribe_mailto.contains(m) {
+                entry.unsubscribe_mailto.push(m.clone());
+            }
+        }
+        if sender.one_click {
+            entry.one_click = true;
+        }
+        entry.email_count += sender.email_count;
+        for (folder, uids) in &sender.uids {
+            entry
+                .uids
+                .entry(folder.clone())
+                .or_default()
+                .extend(uids);
+        }
+        for (folder, validity) in &sender.uid_validity {
+            entry.uid_validity.insert(folder.clone(), *validity);
+        }
+        if entry.display_name.is_empty() && !sender.display_name.is_empty() {
+            entry.display_name = sender.display_name.clone();
+        }
+    }
+
+    folder_result.warnings
+}
+
+/// Scan all configured folders in parallel and return sender info grouped by sender email
+pub fn scan(config: &Config) -> Result<ScanResult> {
+    let mp = indicatif::MultiProgress::new();
+    let bar_style = ProgressStyle::default_bar()
+        .template(" \x1b[1m{prefix:<12}\x1b[0m [{bar:30.cyan/dim}] \x1b[36m{pos}\x1b[0m/{len}")
+        .unwrap()
+        .progress_chars("=> ");
+
+    // Spawn a thread per folder, each with its own IMAP connection
+    let handles: Vec<_> = config
+        .scan
+        .folders
+        .iter()
+        .map(|folder| {
+            let pb = mp.add(ProgressBar::new(0));
+            pb.set_style(bar_style.clone());
+            pb.set_prefix(folder.clone());
+            let config = Config {
+                imap: crate::config::ImapConfig {
+                    host: config.imap.host.clone(),
+                    port: config.imap.port,
+                    username: config.imap.username.clone(),
+                    password: config.imap.password.clone(),
+                },
+                scan: crate::config::ScanConfig {
+                    folders: config.scan.folders.clone(),
+                    archive_folder: config.scan.archive_folder.clone(),
+                },
+            };
+            let folder = folder.clone();
+            std::thread::spawn(move || scan_folder(&config, &folder, pb))
+        })
+        .collect();
+
+    // Collect results
+    let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    for handle in handles {
+        let folder_result = handle.join().expect("scan thread panicked")?;
+        let warnings = merge_folder_result(&mut combined, folder_result);
+        for w in warnings {
+            if !all_warnings.contains(&w) {
+                all_warnings.push(w);
+            }
+        }
+    }
+
+    let mut senders: Vec<SenderInfo> = combined.into_values().collect();
     senders.sort_by(|a, b| b.email_count.cmp(&a.email_count));
-    Ok(ScanResult { senders, warnings })
+    Ok(ScanResult {
+        senders,
+        warnings: all_warnings,
+    })
 }
 
 /// Keywords that indicate an unsubscribe-related form or link
@@ -504,7 +603,7 @@ pub fn unsubscribe(senders: &[&SenderInfo], dry_run: bool) -> Vec<UnsubscribeRes
     let pb = ProgressBar::new(senders.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[{bar:40}] {pos}/{len} unsubscribing")
+            .template(" [{bar:40.cyan/dim}] \x1b[36m{pos}\x1b[0m/{len} unsubscribing")
             .unwrap()
             .progress_chars("=> "),
     );
