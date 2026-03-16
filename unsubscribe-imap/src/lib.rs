@@ -194,6 +194,8 @@ fn scan_folder(
             .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
 
         for msg in messages.iter() {
+            progress.on_messages_scanned(folder, 1);
+
             let Some(uid) = msg.uid else { continue };
             let Some(header_bytes) = msg.header() else { continue };
             let Some(parsed) = parser.parse(header_bytes) else { continue };
@@ -268,8 +270,6 @@ fn scan_folder(
             }
         }
 
-        let batch_count = (end - start + 1).min(messages.iter().count() as u32);
-        progress.on_messages_scanned(folder, batch_count);
         start = end + 1;
     }
 
