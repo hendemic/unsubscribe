@@ -1,0 +1,14 @@
+[package]
+name = "unsubscribe-imap"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["Mike Henderson"]
+
+[dependencies]
+unsubscribe-core = { path = "../unsubscribe-core" }
+anyhow = "1"
+imap = "2"
+mail-parser = "0.9"
+native-tls = "0.2"
+openssl = { version = "0.10", features = ["vendored"] }

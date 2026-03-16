@@ -465,31 +465,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "email-unsubscribe"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "crossterm",
- "csv",
- "imap",
- "indicatif",
- "keyring",
- "libc",
- "mail-parser",
- "native-tls",
- "openssl",
- "ratatui",
- "reqwest",
- "scraper",
- "serde",
- "serde_json",
- "toml",
- "url",
-]
-
-[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2317,6 +2292,49 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsubscribe-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "csv",
+ "indicatif",
+ "keyring",
+ "libc",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "toml",
+ "unsubscribe-core",
+ "unsubscribe-imap",
+]
+
+[[package]]
+name = "unsubscribe-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "mail-parser",
+ "scraper",
+ "url",
+]
+
+[[package]]
+name = "unsubscribe-imap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "imap",
+ "mail-parser",
+ "native-tls",
+ "openssl",
+ "unsubscribe-core",
+]
 
 [[package]]
 name = "untrusted"

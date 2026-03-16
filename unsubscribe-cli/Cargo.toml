@@ -1,0 +1,26 @@
+[package]
+name = "unsubscribe-cli"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["Mike Henderson"]
+
+[[bin]]
+name = "unsubscribe"
+path = "src/main.rs"
+
+[dependencies]
+unsubscribe-core = { path = "../unsubscribe-core" }
+unsubscribe-imap = { path = "../unsubscribe-imap" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+csv = "1"
+indicatif = "0.17"
+keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
+libc = "0.2"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
