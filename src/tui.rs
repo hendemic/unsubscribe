@@ -33,7 +33,7 @@ impl App {
         let len = senders.len();
         Self {
             senders,
-            selected: vec![true; len],
+            selected: vec![false; len],
             cursor: 0,
             scroll_offset: 0,
             confirmed: false,
@@ -42,8 +42,16 @@ impl App {
     }
 
     fn toggle(&mut self) {
-        if !self.senders.is_empty() {
-            self.selected[self.cursor] = !self.selected[self.cursor];
+        if self.cursor == 0 {
+            // "Select All" row: if any are unselected, select all; otherwise deselect all
+            if self.selected.iter().all(|&s| s) {
+                self.selected.fill(false);
+            } else {
+                self.selected.fill(true);
+            }
+        } else if !self.senders.is_empty() {
+            let idx = self.cursor - 1;
+            self.selected[idx] = !self.selected[idx];
         }
     }
 
@@ -62,7 +70,8 @@ impl App {
     }
 
     fn move_down(&mut self) {
-        if self.cursor + 1 < self.senders.len() {
+        // total rows = senders.len() + 1 (for "Select All" row)
+        if self.cursor + 1 < self.senders.len() + 1 {
             self.cursor += 1;
         }
     }
@@ -116,9 +125,8 @@ pub fn select_senders(senders: Vec<SenderInfo>) -> anyhow::Result<Option<Vec<(Se
                 KeyCode::Char('n') => app.deselect_all(),
                 KeyCode::Home | KeyCode::Char('g') => app.cursor = 0,
                 KeyCode::End | KeyCode::Char('G') => {
-                    if !app.senders.is_empty() {
-                        app.cursor = app.senders.len() - 1;
-                    }
+                    // last row index = senders.len() (row 0 is Select All)
+                    app.cursor = app.senders.len();
                 }
                 _ => {}
             }
@@ -164,6 +172,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Scrollable list
     let visible_height = chunks[1].height as usize;
+    let total_rows = app.senders.len() + 1; // +1 for "Select All" row
 
     // Adjust scroll to keep cursor visible
     if app.cursor < app.scroll_offset {
@@ -172,16 +181,28 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.scroll_offset = app.cursor - visible_height + 1;
     }
 
-    let items: Vec<Line> = app
-        .senders
-        .iter()
-        .zip(app.selected.iter())
-        .enumerate()
-        .skip(app.scroll_offset)
-        .take(visible_height)
-        .map(|(i, (sender, &selected))| {
+    // Build visible rows: row 0 = "Select All", rows 1..=senders.len() = actual senders
+    let mut items: Vec<Line> = Vec::new();
+    for row in app.scroll_offset..total_rows.min(app.scroll_offset + visible_height) {
+        if row == 0 {
+            // "Select All" row
+            let all_selected = !app.selected.is_empty() && app.selected.iter().all(|&s| s);
+            let checkbox = if all_selected { "[x]" } else { "[ ]" };
+            let text = format!(" {checkbox} Select All");
+            let is_cursor = app.cursor == 0;
+            let style = if is_cursor {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            items.push(Line::styled(text, style));
+        } else {
+            // Sender row: sender index = row - 1
+            let idx = row - 1;
+            let sender = &app.senders[idx];
+            let selected = app.selected[idx];
             let checkbox = if selected { "[x]" } else { "[ ]" };
-            let is_cursor = i == app.cursor;
+            let is_cursor = row == app.cursor;
             let name = if sender.display_name.is_empty() {
                 &sender.email
             } else {
@@ -209,9 +230,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::Green)
             };
 
-            Line::styled(text, style)
-        })
-        .collect();
+            items.push(Line::styled(text, style));
+        }
+    }
 
     let list = Paragraph::new(items).block(
         Block::default()

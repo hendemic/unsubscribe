@@ -59,6 +59,8 @@ enum Commands {
     Update,
     /// Create config file with interactive setup
     Init,
+    /// Update IMAP credentials (server, username, password)
+    Reauth,
 }
 
 fn main() -> Result<()> {
@@ -69,6 +71,7 @@ fn main() -> Result<()> {
         Commands::Warnings => return cmd_warnings(),
         Commands::Update => return cmd_update(),
         Commands::Init => return cmd_init(&config_path),
+        Commands::Reauth => return cmd_reauth(&config_path),
         _ => {}
     }
 
@@ -84,7 +87,9 @@ fn main() -> Result<()> {
         Commands::Run { dry_run, min_emails } => cmd_run(&config, dry_run, min_emails),
         Commands::Scan { min_emails } => cmd_scan(&config, min_emails),
         Commands::Export { output, min_emails } => cmd_export(&config, &output, min_emails),
-        Commands::Warnings | Commands::Update | Commands::Init => unreachable!(),
+        Commands::Warnings | Commands::Update | Commands::Init | Commands::Reauth => {
+            unreachable!()
+        }
     }
 }
 
@@ -231,6 +236,9 @@ fn cmd_init(config_path: &Path) -> Result<()> {
     let port = prompt("IMAP port", "993")?;
     let username = prompt("Email address", "")?;
     let password = prompt_password("App password")?;
+    if password.is_empty() {
+        anyhow::bail!("App password is required");
+    }
     let folders = prompt("Folders to scan (comma-separated)", "INBOX")?;
     let archive = prompt("Archive folder", "Unsubscribed")?;
 
@@ -251,6 +259,48 @@ fn cmd_init(config_path: &Path) -> Result<()> {
 
     eprintln!("{GREEN}Config written to {}{RESET}", config_path.display());
     eprintln!("\nRun {BOLD}unsubscribe scan{RESET} to test your connection.");
+    Ok(())
+}
+
+fn cmd_reauth(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        eprintln!("{YELLOW}No config file found.{RESET}");
+        eprintln!("Run {BOLD}unsubscribe init{RESET} first.\n");
+        std::process::exit(1);
+    }
+
+    let config = config::Config::load(config_path)?;
+
+    eprintln!("{BOLD}Update IMAP credentials{RESET}");
+    eprintln!("{DIM}Press Enter to keep current value{RESET}\n");
+
+    let host = prompt("IMAP host", &config.imap.host)?;
+    let port = prompt("IMAP port", &config.imap.port.to_string())?;
+    let username = prompt("Email address", &config.imap.username)?;
+    let password = prompt_password("App password (enter new or press Enter to keep current)")?;
+
+    let port: u16 = port.parse().context("Invalid port number")?;
+
+    // Read current scan config to preserve it
+    let folders = config.scan.folders.clone();
+    let archive = config.scan.archive_folder.clone();
+
+    // If password was entered, update keychain; otherwise keep existing
+    let password = if password.is_empty() {
+        config.imap.password.clone()
+    } else {
+        password
+    };
+
+    // Delete old keychain entry if username changed
+    if username != config.imap.username {
+        let _ = config::Config::delete_password(&config.imap.username);
+    }
+
+    config::Config::store_password(&username, &password)?;
+    config::Config::write_init(config_path, &host, port, &username, folders, &archive)?;
+
+    eprintln!("\n{GREEN}Credentials updated.{RESET}");
     Ok(())
 }
 
@@ -299,22 +349,14 @@ fn prompt_password(label: &str) -> Result<String> {
         eprintln!(); // newline after hidden input
 
         result?;
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            anyhow::bail!("{label} is required");
-        }
-        Ok(input)
+        Ok(input.trim().to_string())
     }
 
     #[cfg(not(unix))]
     {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            anyhow::bail!("{label} is required");
-        }
-        Ok(input)
+        Ok(input.trim().to_string())
     }
 }
 
