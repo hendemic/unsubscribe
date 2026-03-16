@@ -50,6 +50,19 @@ unsubscribe <command> [options]
 
 Global option: `-c <path>` to specify a config file.
 
+Its recommended that you start with a dry run to see what would happen without making any changes:
+
+```
+unsubscribe run --dry-run
+```
+
+By default, only senders with 3 or more emails are shown. Use `--min-emails` / `-m` to adjust:
+
+```
+unsubscribe run --min-emails 5
+unsubscribe scan -m 1
+```
+
 ## Config
 
 Config file location: `~/.config/email-unsubscribe/config.toml`
