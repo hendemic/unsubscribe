@@ -2302,15 +2302,13 @@ dependencies = [
  "crossterm",
  "csv",
  "indicatif",
- "keyring",
  "libc",
  "ratatui",
  "reqwest",
- "serde",
  "serde_json",
- "toml",
  "unsubscribe-core",
  "unsubscribe-email",
+ "unsubscribe-persistence",
 ]
 
 [[package]]
@@ -2334,6 +2332,17 @@ dependencies = [
  "openssl",
  "serde",
  "serde_json",
+ "unsubscribe-core",
+]
+
+[[package]]
+name = "unsubscribe-persistence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "keyring",
+ "serde",
+ "toml",
  "unsubscribe-core",
 ]
 

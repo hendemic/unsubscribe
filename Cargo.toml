@@ -2,6 +2,7 @@
 members = [
     "unsubscribe-core",
     "unsubscribe-email",
+    "unsubscribe-persistence",
     "unsubscribe-cli",
 ]
 resolver = "3"
