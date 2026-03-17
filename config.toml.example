@@ -3,9 +3,13 @@
 #   password_command = "pass show email/imap"
 
 [imap]
+# Provider type: "imap" (default) or "gmail"
+# Gmail uses OAuth and the Gmail REST API instead of IMAP.
+provider = "imap"
 host = "imap.sample.com"
 port = 993
 username = "you@sample.com"
+auth_type = "password"
 # password_command = "pass show email/zoho"
 # password = "fallback-plaintext-password"  # not recommended
 
@@ -16,7 +20,7 @@ folders = ["INBOX"]
 archive_folder = "Unsubscribed"
 
 # Common IMAP hosts:
-#   Gmail:      imap.gmail.com (app password required, https://myaccount.google.com/apppasswords)
+#   Gmail:      imap.gmail.com (or use provider = "gmail" for OAuth)
 #   Outlook:    outlook.office365.com
 #   Yahoo:      imap.mail.yahoo.com
 #   Zoho:       imap.zoho.com
@@ -27,3 +31,15 @@ archive_folder = "Unsubscribed"
 #   Gmail:   folders use "[Gmail]/" prefix, e.g. "[Gmail]/All Mail", "[Gmail]/Promotions"
 #   Outlook: "Inbox", "Junk Email", etc.
 #   Most others: "INBOX", "Sent", etc.
+
+# --- Gmail OAuth example ---
+# [imap]
+# provider = "gmail"
+# host = "gmail.googleapis.com"
+# port = 443
+# username = "you@gmail.com"
+# auth_type = "oauth"
+#
+# [scan]
+# folders = ["INBOX"]
+# archive_folder = "Unsubscribed"

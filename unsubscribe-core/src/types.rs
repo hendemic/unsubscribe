@@ -108,6 +108,21 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// Which email provider protocol/API to use for an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderType {
+    /// Standard IMAP connection (any provider: Zoho, Fastmail, self-hosted, etc.)
+    Imap,
+    /// Gmail REST API via OAuth2.
+    Gmail,
+}
+
+impl Default for ProviderType {
+    fn default() -> Self {
+        Self::Imap
+    }
+}
+
 /// How an account authenticates with its email provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthType {
@@ -132,9 +147,11 @@ impl Default for AuthType {
 pub struct AccountConfig {
     /// Unique identifier for this account (e.g. the email address)
     pub account_id: String,
-    /// Provider host (e.g. "imap.gmail.com")
+    /// Which provider protocol to use (IMAP, Gmail API, etc.)
+    pub provider_type: ProviderType,
+    /// Provider host (e.g. "imap.gmail.com"). Not used by Gmail API provider.
     pub host: String,
-    /// Provider port, if applicable (e.g. 993 for IMAPS)
+    /// Provider port, if applicable (e.g. 993 for IMAPS). Not used by Gmail API provider.
     pub port: Option<u16>,
     /// Username for authentication
     pub username: String,

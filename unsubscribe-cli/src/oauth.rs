@@ -20,6 +20,16 @@ use sha2::Digest;
 const GOOGLE_CLIENT_ID: &str = "PLACEHOLDER_CLIENT_ID";
 const GOOGLE_CLIENT_SECRET: &str = "PLACEHOLDER_CLIENT_SECRET";
 
+/// Public accessors so the credential store can use the same client credentials
+/// for token refresh as the initial authorization flow.
+pub fn google_client_id() -> &'static str {
+    GOOGLE_CLIENT_ID
+}
+
+pub fn google_client_secret() -> &'static str {
+    GOOGLE_CLIENT_SECRET
+}
+
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
