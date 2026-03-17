@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::types::{Folder, FolderMessage, HttpResponse, ScanResult};
+use crate::types::{AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult};
 
 /// Port for scan progress reporting.
 ///
@@ -51,4 +51,31 @@ pub trait HttpClient {
 
     /// Perform an HTTP POST with the given content-type and raw body.
     fn post_body(&self, url: &str, content_type: &str, body: &str) -> Result<HttpResponse>;
+}
+
+/// Port for reading and writing account configuration.
+///
+/// CLI implements this with TOML files. iOS will use CoreData/SwiftData.
+/// The persistence crate (`unsubscribe-persistence`) provides the CLI implementation.
+pub trait ConfigStore {
+    /// Read the configuration for an account, or None if it doesn't exist.
+    fn read_config(&self, account_id: &str) -> Result<Option<AccountConfig>>;
+
+    /// Write (create or update) the configuration for an account.
+    fn write_config(&self, config: &AccountConfig) -> Result<()>;
+}
+
+/// Port for storing, retrieving, and deleting credentials.
+///
+/// CLI implements this with the OS keychain. iOS will use Keychain Services.
+/// The persistence crate (`unsubscribe-persistence`) provides the CLI implementation.
+pub trait CredentialStore {
+    /// Store a credential for the given account.
+    fn store_credential(&self, account_id: &str, credential: &Credential) -> Result<()>;
+
+    /// Retrieve the credential for the given account, or None if not stored.
+    fn get_credential(&self, account_id: &str) -> Result<Option<Credential>>;
+
+    /// Delete the credential for the given account. No-op if not stored.
+    fn delete_credential(&self, account_id: &str) -> Result<()>;
 }

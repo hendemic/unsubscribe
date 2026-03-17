@@ -107,3 +107,36 @@ pub struct HttpResponse {
     /// Response body as a string
     pub body: String,
 }
+
+/// Configuration for a single email account.
+///
+/// This is the runtime shape that consumers pass around. It is provider-agnostic:
+/// the same struct works for IMAP, future Gmail API, Exchange, etc. Fields that
+/// only apply to certain providers (like `port`) are optional.
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    /// Unique identifier for this account (e.g. the email address)
+    pub account_id: String,
+    /// Provider host (e.g. "imap.gmail.com")
+    pub host: String,
+    /// Provider port, if applicable (e.g. 993 for IMAPS)
+    pub port: Option<u16>,
+    /// Username for authentication
+    pub username: String,
+    /// Folders to scan for unsubscribe headers
+    pub scan_folders: Vec<String>,
+    /// Folder to move archived messages into
+    pub archive_folder: String,
+}
+
+/// A stored credential, supporting passwords today and OAuth tokens in the future.
+#[derive(Debug, Clone)]
+pub enum Credential {
+    /// Plain password (IMAP app passwords, etc.)
+    Password(String),
+    /// OAuth2 access + refresh token pair for providers that require it.
+    OAuthToken {
+        access_token: String,
+        refresh_token: Option<String>,
+    },
+}
