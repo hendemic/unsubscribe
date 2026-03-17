@@ -348,3 +348,359 @@ fn parse_message_id(id: &str) -> Result<(u32, u32)> {
     Ok((uid, uid_validity))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use unsubscribe_core::{Folder, FolderMessage, MessageId, ScanProgress, SenderInfo};
+
+    // -----------------------------------------------------------------------
+    // Test infrastructure
+    // -----------------------------------------------------------------------
+
+    /// Records all ScanProgress calls for assertion in tests.
+    struct TestProgress {
+        calls: Mutex<Vec<ProgressCall>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum ProgressCall {
+        FolderStart { folder: String, total: u32 },
+        MessagesScanned { folder: String, count: u32 },
+        FolderDone { folder: String },
+    }
+
+    impl TestProgress {
+        fn new() -> Self {
+            Self { calls: Mutex::new(Vec::new()) }
+        }
+
+        fn calls(&self) -> Vec<ProgressCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ScanProgress for TestProgress {
+        fn on_folder_start(&self, folder: &Folder, total_messages: u32) {
+            self.calls.lock().unwrap().push(ProgressCall::FolderStart {
+                folder: folder.as_str().to_string(),
+                total: total_messages,
+            });
+        }
+
+        fn on_messages_scanned(&self, folder: &Folder, count: u32) {
+            self.calls.lock().unwrap().push(ProgressCall::MessagesScanned {
+                folder: folder.as_str().to_string(),
+                count,
+            });
+        }
+
+        fn on_folder_done(&self, folder: &Folder) {
+            self.calls.lock().unwrap().push(ProgressCall::FolderDone {
+                folder: folder.as_str().to_string(),
+            });
+        }
+    }
+
+    /// Builds a SenderInfo with sensible defaults for testing.
+    fn make_sender(
+        email: &str,
+        email_count: u32,
+        urls: Vec<&str>,
+        mailtos: Vec<&str>,
+        one_click: bool,
+        display_name: &str,
+        messages: Vec<FolderMessage>,
+    ) -> SenderInfo {
+        SenderInfo {
+            display_name: display_name.to_string(),
+            email: email.to_string(),
+            domain: domain_from_email(email),
+            unsubscribe_urls: urls.into_iter().map(String::from).collect(),
+            unsubscribe_mailto: mailtos.into_iter().map(String::from).collect(),
+            one_click,
+            email_count,
+            messages,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MessageId encoding/decoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn message_id_round_trip() {
+        let id = encode_message_id("INBOX", 42, 12345);
+        let (uid, validity) = parse_message_id(id.as_str()).unwrap();
+        assert_eq!(uid, 42);
+        assert_eq!(validity, 12345);
+    }
+
+    #[test]
+    fn message_id_folder_with_colons() {
+        // Gmail-style folder names contain colons and slashes
+        let id = encode_message_id("[Gmail]/All Mail", 100, 999);
+        let (uid, validity) = parse_message_id(id.as_str()).unwrap();
+        assert_eq!(uid, 100);
+        assert_eq!(validity, 999);
+    }
+
+    #[test]
+    fn message_id_folder_with_multiple_colons() {
+        let id = encode_message_id("a:b:c", 7, 8);
+        let (uid, validity) = parse_message_id(id.as_str()).unwrap();
+        assert_eq!(uid, 7);
+        assert_eq!(validity, 8);
+    }
+
+    #[test]
+    fn parse_message_id_missing_all_segments() {
+        let err = parse_message_id("nocolonshere").unwrap_err();
+        assert!(
+            format!("{err}").contains("missing uidvalidity"),
+            "expected 'missing uidvalidity' in: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_message_id_missing_uid_segment() {
+        // Only one colon: "folder:uidvalidity" -- uid segment is missing
+        let err = parse_message_id("INBOX:12345").unwrap_err();
+        assert!(
+            format!("{err}").contains("missing uid"),
+            "expected 'missing uid' in: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_message_id_non_numeric_uid() {
+        let err = parse_message_id("INBOX:abc:12345").unwrap_err();
+        assert!(
+            format!("{err}").contains("Invalid uid"),
+            "expected 'Invalid uid' in: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_message_id_non_numeric_validity() {
+        let err = parse_message_id("INBOX:42:xyz").unwrap_err();
+        assert!(
+            format!("{err}").contains("Invalid uidvalidity"),
+            "expected 'Invalid uidvalidity' in: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sender aggregation (merge_folder_result)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_same_sender_across_folders_sums_email_count() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let folder1 = FolderResult {
+            senders: HashMap::from([(
+                "news@example.com".to_string(),
+                make_sender(
+                    "news@example.com", 3,
+                    vec!["https://example.com/unsub"],
+                    vec![],
+                    false,
+                    "Example News",
+                    vec![FolderMessage {
+                        folder: Folder::new("INBOX"),
+                        message_id: MessageId::new("INBOX:1:100"),
+                    }],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        let folder2 = FolderResult {
+            senders: HashMap::from([(
+                "news@example.com".to_string(),
+                make_sender(
+                    "news@example.com", 2,
+                    vec!["https://example.com/unsub"],
+                    vec![],
+                    false,
+                    "",
+                    vec![FolderMessage {
+                        folder: Folder::new("Spam"),
+                        message_id: MessageId::new("Spam:5:200"),
+                    }],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        merge_folder_result(&mut combined, folder1);
+        merge_folder_result(&mut combined, folder2);
+
+        let sender = &combined["news@example.com"];
+        assert_eq!(sender.email_count, 5);
+        assert_eq!(sender.messages.len(), 2);
+    }
+
+    #[test]
+    fn merge_deduplicates_urls_and_mailtos() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let folder1 = FolderResult {
+            senders: HashMap::from([(
+                "a@test.com".to_string(),
+                make_sender(
+                    "a@test.com", 1,
+                    vec!["https://test.com/unsub"],
+                    vec!["mailto:unsub@test.com"],
+                    false, "", vec![],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        let folder2 = FolderResult {
+            senders: HashMap::from([(
+                "a@test.com".to_string(),
+                make_sender(
+                    "a@test.com", 1,
+                    vec!["https://test.com/unsub", "https://test.com/unsub2"],
+                    vec!["mailto:unsub@test.com"],
+                    false, "", vec![],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        merge_folder_result(&mut combined, folder1);
+        merge_folder_result(&mut combined, folder2);
+
+        let sender = &combined["a@test.com"];
+        assert_eq!(sender.unsubscribe_urls.len(), 2);
+        assert_eq!(sender.unsubscribe_mailto.len(), 1);
+    }
+
+    #[test]
+    fn merge_display_name_first_non_empty_wins() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        // First folder has empty display name
+        let folder1 = FolderResult {
+            senders: HashMap::from([(
+                "b@test.com".to_string(),
+                make_sender("b@test.com", 1, vec![], vec![], false, "", vec![]),
+            )]),
+            warnings: vec![],
+        };
+
+        // Second folder has a display name
+        let folder2 = FolderResult {
+            senders: HashMap::from([(
+                "b@test.com".to_string(),
+                make_sender("b@test.com", 1, vec![], vec![], false, "Beta News", vec![]),
+            )]),
+            warnings: vec![],
+        };
+
+        merge_folder_result(&mut combined, folder1);
+        merge_folder_result(&mut combined, folder2);
+
+        assert_eq!(combined["b@test.com"].display_name, "Beta News");
+    }
+
+    #[test]
+    fn merge_one_click_flag_ored_across_folders() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let folder1 = FolderResult {
+            senders: HashMap::from([(
+                "c@test.com".to_string(),
+                make_sender("c@test.com", 1, vec![], vec![], false, "", vec![]),
+            )]),
+            warnings: vec![],
+        };
+
+        let folder2 = FolderResult {
+            senders: HashMap::from([(
+                "c@test.com".to_string(),
+                make_sender("c@test.com", 1, vec![], vec![], true, "", vec![]),
+            )]),
+            warnings: vec![],
+        };
+
+        merge_folder_result(&mut combined, folder1);
+        merge_folder_result(&mut combined, folder2);
+
+        assert!(combined["c@test.com"].one_click);
+    }
+
+    #[test]
+    fn merge_single_folder_adds_sender_to_map() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let folder = FolderResult {
+            senders: HashMap::from([(
+                "only@test.com".to_string(),
+                make_sender(
+                    "only@test.com", 5,
+                    vec!["https://test.com/unsub"],
+                    vec!["mailto:leave@test.com"],
+                    true, "Only Sender",
+                    vec![FolderMessage {
+                        folder: Folder::new("INBOX"),
+                        message_id: MessageId::new("INBOX:10:500"),
+                    }],
+                ),
+            )]),
+            warnings: vec!["some warning".to_string()],
+        };
+
+        let warnings = merge_folder_result(&mut combined, folder);
+
+        assert_eq!(combined.len(), 1);
+        let sender = &combined["only@test.com"];
+        assert_eq!(sender.email_count, 5);
+        assert_eq!(sender.display_name, "Only Sender");
+        assert!(sender.one_click);
+        assert_eq!(sender.unsubscribe_urls, vec!["https://test.com/unsub"]);
+        assert_eq!(sender.unsubscribe_mailto, vec!["mailto:leave@test.com"]);
+        assert_eq!(sender.messages.len(), 1);
+        assert_eq!(warnings, vec!["some warning"]);
+    }
+
+    #[test]
+    fn merge_returns_warnings_from_folder_result() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let folder = FolderResult {
+            senders: HashMap::new(),
+            warnings: vec!["warn1".to_string(), "warn2".to_string()],
+        };
+
+        let warnings = merge_folder_result(&mut combined, folder);
+        assert_eq!(warnings, vec!["warn1", "warn2"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // TestProgress infrastructure verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_progress_records_calls() {
+        let progress = TestProgress::new();
+        let folder = Folder::new("INBOX");
+
+        progress.on_folder_start(&folder, 100);
+        progress.on_messages_scanned(&folder, 50);
+        progress.on_messages_scanned(&folder, 50);
+        progress.on_folder_done(&folder);
+
+        let calls = progress.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], ProgressCall::FolderStart { folder: "INBOX".to_string(), total: 100 });
+        assert_eq!(calls[1], ProgressCall::MessagesScanned { folder: "INBOX".to_string(), count: 50 });
+        assert_eq!(calls[2], ProgressCall::MessagesScanned { folder: "INBOX".to_string(), count: 50 });
+        assert_eq!(calls[3], ProgressCall::FolderDone { folder: "INBOX".to_string() });
+    }
+}
+

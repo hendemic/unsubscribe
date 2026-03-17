@@ -150,6 +150,185 @@ pub fn select_senders(senders: Vec<SenderInfo>) -> anyhow::Result<Option<Vec<(Se
     Ok(Some(result))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unsubscribe_core::SenderInfo;
+
+    /// Builds a minimal SenderInfo for TUI state tests.
+    fn make_sender(email: &str, email_count: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: String::new(),
+            email: email.to_string(),
+            domain: String::new(),
+            unsubscribe_urls: vec![],
+            unsubscribe_mailto: vec![],
+            one_click: false,
+            email_count,
+            messages: vec![],
+        }
+    }
+
+    fn three_senders() -> Vec<SenderInfo> {
+        vec![
+            make_sender("a@test.com", 10),
+            make_sender("b@test.com", 20),
+            make_sender("c@test.com", 5),
+        ]
+    }
+
+    // -------------------------------------------------------------------
+    // Cursor movement
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn move_up_stops_at_zero() {
+        let mut app = App::new(three_senders());
+        assert_eq!(app.cursor, 0);
+        app.move_up();
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn move_down_stops_at_last_row() {
+        let mut app = App::new(three_senders());
+        // Total rows = 3 senders + 1 Select All = 4 rows (indices 0..3)
+        app.move_down(); // 1
+        app.move_down(); // 2
+        app.move_down(); // 3
+        assert_eq!(app.cursor, 3);
+        app.move_down(); // should stay at 3
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn move_up_and_down_traverse_all_rows() {
+        let mut app = App::new(three_senders());
+        for i in 0..3 {
+            assert_eq!(app.cursor, i);
+            app.move_down();
+        }
+        assert_eq!(app.cursor, 3);
+        for i in (0..3).rev() {
+            app.move_up();
+            assert_eq!(app.cursor, i);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Toggle
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn toggle_on_row_zero_selects_all_when_any_unselected() {
+        let mut app = App::new(three_senders());
+        assert_eq!(app.cursor, 0);
+        // All start unselected, toggling row 0 should select all
+        app.toggle();
+        assert!(app.selected.iter().all(|&s| s));
+    }
+
+    #[test]
+    fn toggle_on_row_zero_deselects_all_when_all_selected() {
+        let mut app = App::new(three_senders());
+        app.select_all();
+        assert_eq!(app.cursor, 0);
+        app.toggle();
+        assert!(app.selected.iter().all(|&s| !s));
+    }
+
+    #[test]
+    fn toggle_on_row_zero_selects_all_when_partially_selected() {
+        let mut app = App::new(three_senders());
+        app.selected[0] = true; // only first selected
+        assert_eq!(app.cursor, 0);
+        app.toggle();
+        assert!(app.selected.iter().all(|&s| s));
+    }
+
+    #[test]
+    fn toggle_on_sender_row_toggles_individual() {
+        let mut app = App::new(three_senders());
+        app.cursor = 1; // first sender
+        assert!(!app.selected[0]);
+        app.toggle();
+        assert!(app.selected[0]);
+        assert!(!app.selected[1]);
+        assert!(!app.selected[2]);
+        app.toggle();
+        assert!(!app.selected[0]);
+    }
+
+    // -------------------------------------------------------------------
+    // Select all / deselect all
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn select_all_sets_all_flags() {
+        let mut app = App::new(three_senders());
+        app.select_all();
+        assert!(app.selected.iter().all(|&s| s));
+    }
+
+    #[test]
+    fn deselect_all_clears_all_flags() {
+        let mut app = App::new(three_senders());
+        app.select_all();
+        app.deselect_all();
+        assert!(app.selected.iter().all(|&s| !s));
+    }
+
+    // -------------------------------------------------------------------
+    // Counting
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn count_selected_correct() {
+        let mut app = App::new(three_senders());
+        assert_eq!(app.count_selected(), 0);
+        app.selected[0] = true;
+        app.selected[2] = true;
+        assert_eq!(app.count_selected(), 2);
+    }
+
+    #[test]
+    fn total_emails_selected_sums_only_selected() {
+        let mut app = App::new(three_senders());
+        // a=10, b=20, c=5
+        app.selected[1] = true; // b=20
+        app.selected[2] = true; // c=5
+        assert_eq!(app.total_emails_selected(), 25);
+    }
+
+    #[test]
+    fn total_emails_selected_none_selected_is_zero() {
+        let app = App::new(three_senders());
+        assert_eq!(app.total_emails_selected(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Empty senders list
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn empty_senders_no_panic() {
+        let mut app = App::new(vec![]);
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.count_selected(), 0);
+        assert_eq!(app.total_emails_selected(), 0);
+
+        // Movement should not panic
+        app.move_up();
+        app.move_down();
+        assert_eq!(app.cursor, 0);
+
+        // Toggle on row 0 with empty selected vec should not panic
+        app.toggle();
+        app.select_all();
+        app.deselect_all();
+    }
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
