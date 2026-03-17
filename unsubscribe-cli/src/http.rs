@@ -36,6 +36,21 @@ impl HttpClient for ReqwestHttpClient {
         Ok(HttpResponse { status, body })
     }
 
+    fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        let mut builder = self.client.get(url);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = builder
+            .send()
+            .with_context(|| format!("GET request failed: {url}"))?;
+
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+
+        Ok(HttpResponse { status, body })
+    }
+
     fn post_form(&self, url: &str, params: &[(&str, &str)]) -> Result<HttpResponse> {
         let resp = self
             .client
@@ -56,6 +71,34 @@ impl HttpClient for ReqwestHttpClient {
             .post(url)
             .header("Content-Type", content_type)
             .body(body.to_string())
+            .send()
+            .with_context(|| format!("POST body request failed: {url}"))?;
+
+        let status = resp.status().as_u16();
+        let resp_body = resp.text().unwrap_or_default();
+
+        Ok(HttpResponse {
+            status,
+            body: resp_body,
+        })
+    }
+
+    fn post_body_with_headers(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse> {
+        let mut builder = self
+            .client
+            .post(url)
+            .header("Content-Type", content_type)
+            .body(body.to_string());
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = builder
             .send()
             .with_context(|| format!("POST body request failed: {url}"))?;
 

@@ -370,10 +370,22 @@ mod tests {
         fn get(&self, url: &str) -> Result<HttpResponse> {
             self.respond(url)
         }
+        fn get_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            self.respond(url)
+        }
         fn post_form(&self, url: &str, _params: &[(&str, &str)]) -> Result<HttpResponse> {
             self.respond(url)
         }
         fn post_body(&self, url: &str, _content_type: &str, _body: &str) -> Result<HttpResponse> {
+            self.respond(url)
+        }
+        fn post_body_with_headers(
+            &self,
+            url: &str,
+            _content_type: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<HttpResponse> {
             self.respond(url)
         }
     }

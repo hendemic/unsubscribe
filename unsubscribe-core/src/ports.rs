@@ -39,18 +39,30 @@ pub trait EmailProvider {
     fn archive(&self, messages: &[FolderMessage], destination: &Folder) -> Result<u32>;
 }
 
-/// Port for HTTP operations needed during unsubscribe flows.
+/// Port for HTTP operations needed during unsubscribe flows and API access.
 ///
 /// CLI provides this via reqwest, iOS via URLSession, tests via mocks.
 pub trait HttpClient {
     /// Perform an HTTP GET request.
     fn get(&self, url: &str) -> Result<HttpResponse>;
 
+    /// Perform an HTTP GET request with additional request headers.
+    fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
+
     /// Perform an HTTP POST with form-encoded key-value pairs.
     fn post_form(&self, url: &str, params: &[(&str, &str)]) -> Result<HttpResponse>;
 
     /// Perform an HTTP POST with the given content-type and raw body.
     fn post_body(&self, url: &str, content_type: &str, body: &str) -> Result<HttpResponse>;
+
+    /// Perform an HTTP POST with the given content-type, raw body, and additional request headers.
+    fn post_body_with_headers(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse>;
 }
 
 /// Port for reading and writing account configuration.

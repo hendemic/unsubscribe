@@ -1,0 +1,25 @@
+[package]
+name = "unsubscribe-email"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["Mike Henderson"]
+
+[features]
+default = ["imap", "gmail"]
+imap = ["dep:imap", "dep:native-tls", "dep:openssl", "dep:mail-parser"]
+gmail = ["dep:serde_json"]
+
+[dependencies]
+unsubscribe-core = { path = "../unsubscribe-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+
+# imap feature deps
+imap = { version = "2", optional = true }
+mail-parser = { version = "0.9", optional = true }
+native-tls = { version = "0.2", optional = true }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
+# gmail feature deps
+serde_json = { version = "1", optional = true }
