@@ -92,12 +92,10 @@ fn main() -> Result<()> {
     }
 
     if !config_path.exists() {
-        eprintln!(
-            "{YELLOW}No config file found at {}{RESET}",
+        bail!(
+            "No config file found at {}. Run `unsubscribe init` to set up your config.",
             config_path.display()
         );
-        eprintln!("Run {BOLD}unsubscribe init{RESET} to set up your config.\n");
-        std::process::exit(1);
     }
 
     let (account, credential) = load_account(&config_dir)?;
@@ -226,7 +224,7 @@ fn do_scan(
     // Save warnings to log
     if !scan_result.warnings.is_empty() {
         let warnings_path = data_dir().join("warnings.log");
-        std::fs::create_dir_all(warnings_path.parent().unwrap())?;
+        std::fs::create_dir_all(warnings_path.parent().expect("path has parent"))?;
         std::fs::write(&warnings_path, scan_result.warnings.join("\n") + "\n")?;
     }
 
@@ -387,9 +385,7 @@ fn init_imap(config_dir: &Path) -> Result<()> {
 fn cmd_reauth(config_dir: &Path) -> Result<()> {
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
-        eprintln!("{YELLOW}No config file found.{RESET}");
-        eprintln!("Run {BOLD}unsubscribe init{RESET} first.\n");
-        std::process::exit(1);
+        bail!("No config file found. Run `unsubscribe init` first.");
     }
 
     let config_store = TomlConfigStore::new(config_dir);
@@ -758,11 +754,9 @@ fn cmd_run(
             .iter()
             .map(|s| {
                 let url = s
-                    .unsubscribe_urls
-                    .first()
-                    .or(s.unsubscribe_mailto.first())
-                    .cloned()
-                    .unwrap_or_default();
+                    .best_unsubscribe_url()
+                    .unwrap_or_default()
+                    .to_string();
                 UnsubscribeResult {
                     email: s.email.clone(),
                     method: "dry-run".to_string(),
@@ -834,7 +828,7 @@ fn cmd_run(
 
     // Write action log to XDG data dir
     let log_path = data_dir().join("unsubscribe_log.csv");
-    std::fs::create_dir_all(log_path.parent().unwrap())?;
+    std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
     write_log(&results, &log_path)?;
     eprintln!("{DIM}Action log written to {}{RESET}", log_path.display());
 
@@ -865,11 +859,9 @@ fn cmd_export(
             "mailto"
         };
         let url = s
-            .unsubscribe_urls
-            .first()
-            .or(s.unsubscribe_mailto.first())
-            .cloned()
-            .unwrap_or_default();
+            .best_unsubscribe_url()
+            .unwrap_or_default()
+            .to_string();
 
         wtr.write_record([
             &s.display_name,

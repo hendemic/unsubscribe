@@ -24,7 +24,6 @@ struct App {
     selected: Vec<bool>,
     cursor: usize,
     scroll_offset: usize,
-    confirmed: bool,
     cancelled: bool,
 }
 
@@ -36,7 +35,6 @@ impl App {
             selected: vec![false; len],
             cursor: 0,
             scroll_offset: 0,
-            confirmed: false,
             cancelled: false,
         }
     }
@@ -115,7 +113,6 @@ pub fn select_senders(senders: Vec<SenderInfo>) -> anyhow::Result<Option<Vec<(Se
                     break;
                 }
                 KeyCode::Enter => {
-                    app.confirmed = true;
                     break;
                 }
                 KeyCode::Up | KeyCode::Char('k') => app.move_up(),

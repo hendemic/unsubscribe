@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, ProviderType};
 
-const KEYRING_SERVICE: &str = "unsubscribe";
+use crate::KEYRING_SERVICE;
 
 /// On-disk TOML structure -- matches the existing config format exactly.
 #[derive(Debug, Serialize, Deserialize)]
@@ -239,7 +239,14 @@ impl ConfigStore for TomlConfigStore {
         // Preserve existing password/password_command fields if they exist
         let path = self.config_path(&config.account_id);
         let (existing_password, existing_command) = if path.exists() {
-            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Failed to read existing config: {}", path.display())))
+                }
+            };
             if let Ok(file) = toml::from_str::<FileConfig>(&contents) {
                 (file.imap.password, file.imap.password_command)
             } else {

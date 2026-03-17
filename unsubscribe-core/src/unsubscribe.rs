@@ -27,6 +27,7 @@ const UNSUB_KEYWORDS: &[&str] = &[
 /// 3. Reports mailto-only senders as skipped (sending email is a consumer concern)
 ///
 /// Core always executes -- dry-run filtering belongs in the consumer.
+#[must_use]
 pub fn unsubscribe(senders: &[&SenderInfo], http: &dyn HttpClient) -> Vec<UnsubscribeResult> {
     senders.iter().map(|sender| unsubscribe_one(sender, http)).collect()
 }
@@ -34,11 +35,9 @@ pub fn unsubscribe(senders: &[&SenderInfo], http: &dyn HttpClient) -> Vec<Unsubs
 /// Run the unsubscribe flow for a single sender.
 fn unsubscribe_one(sender: &SenderInfo, http: &dyn HttpClient) -> UnsubscribeResult {
     let fallback_url = sender
-        .unsubscribe_urls
-        .first()
-        .or(sender.unsubscribe_mailto.first())
-        .cloned()
-        .unwrap_or_default();
+        .best_unsubscribe_url()
+        .unwrap_or_default()
+        .to_string();
 
     // Strategy 1: RFC 8058 one-click POST
     if sender.one_click {

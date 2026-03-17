@@ -5,7 +5,7 @@ use unsubscribe_core::{HttpClient, HttpResponse};
 
 /// Reqwest-based HTTP client adapter for the `HttpClient` trait.
 ///
-/// Uses a 15-second timeout and 5-redirect limit to match legacy behavior.
+/// Uses a 60-second timeout and 5-redirect limit to match legacy behavior.
 pub struct ReqwestHttpClient {
     client: reqwest::blocking::Client,
 }
@@ -31,7 +31,7 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("GET request failed: {url}"))?;
 
         let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse { status, body })
     }
@@ -46,7 +46,7 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("GET request failed: {url}"))?;
 
         let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse { status, body })
     }
@@ -60,7 +60,7 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST form request failed: {url}"))?;
 
         let status = resp.status().as_u16();
-        let body = resp.text().unwrap_or_default();
+        let body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse { status, body })
     }
@@ -75,7 +75,7 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST body request failed: {url}"))?;
 
         let status = resp.status().as_u16();
-        let resp_body = resp.text().unwrap_or_default();
+        let resp_body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse {
             status,
@@ -103,7 +103,7 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST body request failed: {url}"))?;
 
         let status = resp.status().as_u16();
-        let resp_body = resp.text().unwrap_or_default();
+        let resp_body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse {
             status,

@@ -3,12 +3,12 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use log::warn;
 
 use unsubscribe_core::{AuthType, ConfigStore, Credential, CredentialStore, HttpClient};
 
+use crate::KEYRING_SERVICE;
 use crate::config::TomlConfigStore;
-
-const KEYRING_SERVICE: &str = "unsubscribe";
 
 /// Keyring key suffix for OAuth refresh tokens, appended after the account ID.
 const OAUTH_REFRESH_SUFFIX: &str = ":oauth_refresh";
@@ -132,18 +132,17 @@ impl KeyringCredentialStore {
                 Ok(password) => return Ok(password),
                 Err(keyring::Error::NoEntry) => {} // fall through
                 Err(e) => {
-                    eprintln!("Warning: keychain lookup failed: {e}");
+                    warn!("Keychain lookup failed: {e}");
                 }
             },
             Err(e) => {
-                eprintln!("Warning: could not access keychain: {e}");
+                warn!("Could not access keychain: {e}");
             }
         }
 
         // 3. Plain text password in config (legacy fallback)
         if let Some(password) = &info.password {
-            eprintln!("Warning: using plain text password from config file.");
-            eprintln!("Run `unsubscribe init` to store it securely in your OS keychain.\n");
+            warn!("Using plain text password from config file. Run `unsubscribe init` to store it securely in your OS keychain.");
             return Ok(password.clone());
         }
 

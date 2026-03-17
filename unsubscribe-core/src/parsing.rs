@@ -1,5 +1,6 @@
 /// Result of parsing a List-Unsubscribe header value.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct ParsedUnsub {
     /// HTTP(S) unsubscribe URLs
     pub urls: Vec<String>,
@@ -13,6 +14,7 @@ pub struct ParsedUnsub {
 ///
 /// Handles `=?charset?Q?encoded?=` (quoted-printable) and `=?charset?B?encoded?=` (base64).
 /// Also unfolds continuation lines per RFC 5322.
+#[must_use]
 pub fn decode_rfc2047(input: &str) -> String {
     // Unfold the header: remove CRLF + leading whitespace on continuation lines
     let unfolded = input
@@ -63,6 +65,7 @@ pub fn decode_rfc2047(input: &str) -> String {
 
         match encoding.to_uppercase().as_str() {
             "Q" => {
+                let mut bytes = Vec::new();
                 let mut chars = encoded_text.chars();
                 while let Some(c) = chars.next() {
                     match c {
@@ -72,14 +75,15 @@ pub fn decode_rfc2047(input: &str) -> String {
                             if let (Some(h1), Some(h2)) = (h1, h2) {
                                 let hex = format!("{h1}{h2}");
                                 if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                    result.push(byte as char);
+                                    bytes.push(byte);
                                 }
                             }
                         }
-                        '_' => result.push(' '),
-                        _ => result.push(c),
+                        '_' => bytes.push(b' '),
+                        _ => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
                     }
                 }
+                result.push_str(&String::from_utf8_lossy(&bytes));
             }
             "B" => {
                 use base64::Engine;
@@ -104,6 +108,7 @@ pub fn decode_rfc2047(input: &str) -> String {
 ///
 /// Expects the RFC 2369 format: `<https://example.com/unsub>, <mailto:unsub@example.com>`
 /// Decodes RFC 2047 encoded words before parsing.
+#[must_use]
 pub fn parse_list_unsubscribe(header_value: &str, sender_email: &str) -> ParsedUnsub {
     let decoded = decode_rfc2047(header_value);
 
@@ -165,7 +170,7 @@ mod tests {
     fn decode_rfc2047_q_encoding_hex_escape() {
         assert_eq!(
             decode_rfc2047("=?UTF-8?Q?caf=C3=A9?="),
-            "caf\u{00C3}\u{00A9}"
+            "caf\u{00E9}"
         );
     }
 

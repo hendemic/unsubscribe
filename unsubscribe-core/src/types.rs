@@ -75,8 +75,19 @@ pub struct SenderInfo {
     pub messages: Vec<FolderMessage>,
 }
 
+impl SenderInfo {
+    /// Returns the best unsubscribe URL for this sender: prefers HTTP URLs over mailto.
+    pub fn best_unsubscribe_url(&self) -> Option<&str> {
+        self.unsubscribe_urls
+            .first()
+            .or(self.unsubscribe_mailto.first())
+            .map(|s| s.as_str())
+    }
+}
+
 /// Result of scanning one or more folders.
 #[derive(Debug)]
+#[must_use]
 pub struct ScanResult {
     /// Senders found, sorted by email count descending
     pub senders: Vec<SenderInfo>,
@@ -86,6 +97,7 @@ pub struct ScanResult {
 
 /// Outcome of an unsubscribe attempt for a single sender.
 #[derive(Debug)]
+#[must_use]
 pub struct UnsubscribeResult {
     /// Sender email address
     pub email: String,

@@ -218,12 +218,10 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
     /// all mail.
     fn scan(&self, _folders: &[Folder], progress: &dyn ScanProgress) -> Result<ScanResult> {
         let inbox = Folder::new("Gmail");
-        progress.on_folder_start(&inbox, 0);
 
         let message_ids = self.list_unsubscribe_message_ids()?;
         let total = message_ids.len() as u32;
 
-        // Report the real total now that we know it
         progress.on_folder_start(&inbox, total);
 
         let mut senders: HashMap<String, SenderInfo> = HashMap::new();
@@ -337,7 +335,7 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
 
             progress.on_messages_scanned(&inbox, 1);
             } // end for (id, result) in batch_results
-        } // end for chunk in message_ids.chunks(100)
+        } // end for chunk in message_ids.chunks(50)
 
         progress.on_folder_done(&inbox);
 
@@ -493,7 +491,7 @@ fn parse_single_batch_part(part: &str) -> Result<MessageMetadata> {
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .with_context(|| format!("Failed to parse HTTP status code from: {status_line}"))?;
 
     if status_code >= 400 {
         bail!("HTTP {status_code}: {}", json_body.trim());
@@ -649,32 +647,48 @@ mod tests {
         )
     }
 
+    /// Wrap individual JSON metadata responses into a multipart batch response
+    /// matching the format returned by Gmail's batch API.
+    fn make_batch_response(metadata_jsons: &[String]) -> String {
+        let boundary = "batch_boundary";
+        let mut body = String::new();
+        for json in metadata_jsons {
+            body.push_str(&format!(
+                "--{boundary}\r\n\
+                 Content-Type: application/http\r\n\
+                 \r\n\
+                 HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 \r\n\
+                 {json}\r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body
+    }
+
     #[test]
     fn scan_aggregates_senders() {
         let http = MockHttpClient::new();
 
         // First page: two messages
         http.push(200, make_list_response(&["msg1", "msg2"], None));
-        // msg1 metadata
-        http.push(
-            200,
+        // Batch metadata response for both messages
+        let batch = make_batch_response(&[
             make_metadata_response(
                 "msg1",
                 "Newsletter <news@example.com>",
                 "<https://example.com/unsub>",
                 false,
             ),
-        );
-        // msg2 metadata — same sender
-        http.push(
-            200,
             make_metadata_response(
                 "msg2",
                 "Newsletter <news@example.com>",
                 "<https://example.com/unsub>",
                 true,
             ),
-        );
+        ]);
+        http.push(200, batch);
 
         let provider = GmailProvider::new("test-token", http);
         let result = provider.scan(&[], &NoopProgress).unwrap();
@@ -697,26 +711,22 @@ mod tests {
         http.push(200, make_list_response(&["msg1"], Some("token-page-2")));
         // Page 2 — no next_page_token
         http.push(200, make_list_response(&["msg2"], None));
-        // msg1 metadata
-        http.push(
-            200,
+        // Single batch response for both messages (IDs collected across pages first)
+        let batch = make_batch_response(&[
             make_metadata_response(
                 "msg1",
                 "Sender A <a@example.com>",
                 "<https://a.com/unsub>",
                 false,
             ),
-        );
-        // msg2 metadata
-        http.push(
-            200,
             make_metadata_response(
                 "msg2",
                 "Sender B <b@example.com>",
                 "<https://b.com/unsub>",
                 false,
             ),
-        );
+        ]);
+        http.push(200, batch);
 
         let provider = GmailProvider::new("test-token", http);
         let result = provider.scan(&[], &NoopProgress).unwrap();
@@ -729,11 +739,12 @@ mod tests {
         let http = MockHttpClient::new();
 
         http.push(200, make_list_response(&["msg1"], None));
-        // Metadata response without List-Unsubscribe header
-        http.push(
-            200,
-            r#"{"id":"msg1","payload":{"headers":[{"name":"From","value":"news@example.com"}]}}"#,
-        );
+        // Batch response with metadata lacking List-Unsubscribe header
+        let batch = make_batch_response(&[
+            r#"{"id":"msg1","payload":{"headers":[{"name":"From","value":"news@example.com"}]}}"#
+                .to_string(),
+        ]);
+        http.push(200, batch);
 
         let provider = GmailProvider::new("test-token", http);
         let result = provider.scan(&[], &NoopProgress).unwrap();
