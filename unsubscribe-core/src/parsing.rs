@@ -144,3 +144,328 @@ pub fn domain_from_email(email: &str) -> String {
         .map(|(_, domain)| domain.to_lowercase())
         .unwrap_or_else(|| email.to_lowercase())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // decode_rfc2047
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_rfc2047_q_encoding() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello_World?="),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_q_encoding_hex_escape() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?caf=C3=A9?="),
+            "caf\u{00C3}\u{00A9}"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_b_encoding() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?B?SGVsbG8=?="),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_mixed_text_and_encoded() {
+        assert_eq!(
+            decode_rfc2047("Plain =?UTF-8?Q?Encoded?= more plain"),
+            "Plain Encoded more plain"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_crlf_space() {
+        assert_eq!(
+            decode_rfc2047("Line one\r\n continues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_crlf_tab() {
+        assert_eq!(
+            decode_rfc2047("Line one\r\n\tcontinues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_lf_space() {
+        assert_eq!(
+            decode_rfc2047("Line one\n continues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_lf_tab() {
+        assert_eq!(
+            decode_rfc2047("Line one\n\tcontinues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_adjacent_encoded_words_whitespace_collapse() {
+        // RFC 2047 sec 6.2: whitespace between adjacent encoded-words is ignored
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello?= =?UTF-8?Q?_World?="),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_adjacent_encoded_words_no_whitespace() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello?==?UTF-8?Q?World?="),
+            "HelloWorld"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_non_adjacent_text_preserved() {
+        // Non-whitespace text between encoded words should be preserved
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?A?=--=?UTF-8?Q?B?="),
+            "A--B"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_incomplete_start() {
+        // =? without the rest of the structure
+        assert_eq!(decode_rfc2047("=?broken"), "=?broken");
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_missing_end() {
+        // Missing ?= terminator -- charset and encoding parse, but no end marker
+        let result = decode_rfc2047("=?UTF-8?Q?noend");
+        // The parser skips the incomplete encoded word
+        assert!(!result.is_empty() || result.is_empty()); // doesn't panic
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_invalid_hex() {
+        // Invalid hex in Q encoding -- should be skipped silently
+        let result = decode_rfc2047("=?UTF-8?Q?=ZZ?=");
+        assert!(!result.contains("panic"));
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_incomplete_hex() {
+        // Q encoding with = followed by only one char
+        let result = decode_rfc2047("=?UTF-8?Q?=A?=");
+        // Should not panic even with insufficient hex digits
+        let _ = result;
+    }
+
+    #[test]
+    fn decode_rfc2047_empty_encoded_text() {
+        assert_eq!(decode_rfc2047("=?UTF-8?Q??="), "");
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_charset_still_decodes() {
+        // Non-UTF-8 charset -- B encoding will decode the bytes, lossy conversion
+        let result = decode_rfc2047("=?ISO-8859-1?B?SGVsbG8=?=");
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_encoding_passthrough() {
+        // Unknown encoding type (not Q or B) -- encoded text passed through
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?X?literal?="),
+            "literal"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_multiple_interleaved_sections() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?A?= middle =?UTF-8?B?Qg==?= end"),
+            "A middle B end"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_plain_text_passthrough() {
+        assert_eq!(decode_rfc2047("No encoding here"), "No encoding here");
+    }
+
+    #[test]
+    fn decode_rfc2047_empty_input() {
+        assert_eq!(decode_rfc2047(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_list_unsubscribe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_list_unsubscribe_standard_format() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>, <mailto:unsub@example.com>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_url_only() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert!(result.mailtos.is_empty());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_mailto_only() {
+        let result = parse_list_unsubscribe(
+            "<mailto:unsub@example.com>",
+            "news@example.com",
+        );
+        assert!(result.urls.is_empty());
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_multiple_urls() {
+        let result = parse_list_unsubscribe(
+            "<https://a.com/unsub>, <https://b.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls.len(), 2);
+        assert_eq!(result.urls[0], "https://a.com/unsub");
+        assert_eq!(result.urls[1], "https://b.com/unsub");
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_without_angle_brackets() {
+        let result = parse_list_unsubscribe(
+            "https://example.com/unsub, mailto:unsub@example.com",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_rfc2047_encoded() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/=?UTF-8?Q?unsub?=>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_warning_for_unparseable() {
+        let result = parse_list_unsubscribe(
+            "ftp://example.com/unsub",
+            "news@example.com",
+        );
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_some());
+        assert!(result.warning.as_ref().unwrap().contains("news@example.com"));
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_warning_not_generated_when_urls_found() {
+        // If at least one valid URL is found, unparseable parts don't generate a warning
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>, ftp://nope",
+            "news@example.com",
+        );
+        assert_eq!(result.urls.len(), 1);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_empty_header() {
+        let result = parse_list_unsubscribe("", "news@example.com");
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_whitespace_only() {
+        let result = parse_list_unsubscribe("   \t  ", "news@example.com");
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_extra_whitespace() {
+        let result = parse_list_unsubscribe(
+            "  <https://example.com/unsub>  ,  <mailto:unsub@example.com>  ",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_http_url() {
+        let result = parse_list_unsubscribe(
+            "<http://example.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["http://example.com/unsub"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // domain_from_email
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn domain_from_email_standard() {
+        assert_eq!(domain_from_email("user@example.com"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_no_at() {
+        assert_eq!(domain_from_email("nodomain"), "nodomain");
+    }
+
+    #[test]
+    fn domain_from_email_uppercase() {
+        assert_eq!(domain_from_email("User@EXAMPLE.COM"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_empty_domain() {
+        assert_eq!(domain_from_email("user@"), "");
+    }
+
+    #[test]
+    fn domain_from_email_multiple_at() {
+        // rsplit_once splits on the last @
+        assert_eq!(domain_from_email("user@sub@example.com"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_empty_input() {
+        assert_eq!(domain_from_email(""), "");
+    }
+}
