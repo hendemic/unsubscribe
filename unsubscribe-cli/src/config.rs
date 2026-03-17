@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use unsubscribe_core::{ConfigStore, Credential, CredentialStore};
+use unsubscribe_core::{AuthType, ConfigStore, Credential, CredentialStore};
 use unsubscribe_persistence::{KeyringCredentialStore, TomlConfigStore};
 
 /// Runtime config with a resolved password, ready for use by CLI commands.
@@ -107,6 +107,6 @@ impl Config {
             .context("Config path has no parent directory")?;
 
         let config_store = TomlConfigStore::new(config_dir);
-        config_store.write_init(host, port, username, folders, archive_folder)
+        config_store.write_init(host, port, username, &AuthType::Password, folders, archive_folder)
     }
 }

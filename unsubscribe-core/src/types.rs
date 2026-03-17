@@ -108,6 +108,21 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// How an account authenticates with its email provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthType {
+    /// Plain password or app password (IMAP providers, etc.)
+    Password,
+    /// OAuth2 with token refresh (Gmail, future Exchange, etc.)
+    OAuth,
+}
+
+impl Default for AuthType {
+    fn default() -> Self {
+        Self::Password
+    }
+}
+
 /// Configuration for a single email account.
 ///
 /// This is the runtime shape that consumers pass around. It is provider-agnostic:
@@ -123,6 +138,8 @@ pub struct AccountConfig {
     pub port: Option<u16>,
     /// Username for authentication
     pub username: String,
+    /// How this account authenticates (password vs OAuth)
+    pub auth_type: AuthType,
     /// Folders to scan for unsubscribe headers
     pub scan_folders: Vec<String>,
     /// Folder to move archived messages into

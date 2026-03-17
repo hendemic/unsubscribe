@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use unsubscribe_core::{AccountConfig, ConfigStore};
+use unsubscribe_core::{AccountConfig, AuthType, ConfigStore};
 
 const KEYRING_SERVICE: &str = "unsubscribe";
 
@@ -23,6 +23,13 @@ struct FileImapConfig {
     password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password_command: Option<String>,
+    /// "password" (default) or "oauth". Controls how credentials are resolved.
+    #[serde(default = "default_auth_type")]
+    auth_type: String,
+}
+
+fn default_auth_type() -> String {
+    "password".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,9 +124,15 @@ impl TomlConfigStore {
         host: &str,
         port: u16,
         username: &str,
+        auth_type: &AuthType,
         folders: Vec<String>,
         archive_folder: &str,
     ) -> Result<()> {
+        let auth_type_str = match auth_type {
+            AuthType::OAuth => "oauth".to_string(),
+            AuthType::Password => "password".to_string(),
+        };
+
         let file = FileConfig {
             imap: FileImapConfig {
                 host: host.to_string(),
@@ -127,6 +140,7 @@ impl TomlConfigStore {
                 username: username.to_string(),
                 password: None,
                 password_command: None,
+                auth_type: auth_type_str,
             },
             scan: FileScanConfig {
                 folders,
@@ -174,11 +188,17 @@ impl ConfigStore for TomlConfigStore {
         })?;
         let file: FileConfig = toml::from_str(&contents).context("Failed to parse config")?;
 
+        let auth_type = match file.imap.auth_type.as_str() {
+            "oauth" => AuthType::OAuth,
+            _ => AuthType::Password,
+        };
+
         Ok(Some(AccountConfig {
             account_id: file.imap.username.clone(),
             host: file.imap.host,
             port: Some(file.imap.port),
             username: file.imap.username,
+            auth_type,
             scan_folders: file.scan.folders,
             archive_folder: file.scan.archive_folder,
         }))
@@ -200,6 +220,11 @@ impl ConfigStore for TomlConfigStore {
             (None, None)
         };
 
+        let auth_type_str = match config.auth_type {
+            AuthType::OAuth => "oauth".to_string(),
+            AuthType::Password => "password".to_string(),
+        };
+
         let file = FileConfig {
             imap: FileImapConfig {
                 host: config.host.clone(),
@@ -207,6 +232,7 @@ impl ConfigStore for TomlConfigStore {
                 username: config.username.clone(),
                 password: existing_password,
                 password_command: existing_command,
+                auth_type: auth_type_str,
             },
             scan: FileScanConfig {
                 folders: config.scan_folders.clone(),
