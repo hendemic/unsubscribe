@@ -11,10 +11,15 @@ use unsubscribe_core::{
     ScanProgress, ScanResult, SenderInfo,
 };
 
+/// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
+/// connections; we stay well under that to avoid throttling.
+const MAX_CONCURRENT_CONNECTIONS: usize = 5;
+
 /// IMAP adapter for the `EmailProvider` trait.
 ///
 /// Connects to an IMAP server over TLS and scans mailboxes for senders
-/// with List-Unsubscribe headers. Spawns one thread per folder for parallelism.
+/// with List-Unsubscribe headers. Spawns one thread per folder for parallelism,
+/// capped at `MAX_CONCURRENT_CONNECTIONS` to respect server limits.
 pub struct ImapProvider {
     pub host: String,
     pub port: u16,
@@ -49,34 +54,36 @@ impl EmailProvider for ImapProvider {
         let mut combined: HashMap<String, SenderInfo> = HashMap::new();
         let mut all_warnings: Vec<String> = Vec::new();
 
-        // Use scoped threads so the progress reference can be shared safely
-        std::thread::scope(|s| {
-            let handles: Vec<_> = folders
-                .iter()
-                .map(|folder| {
-                    let provider = ImapProvider {
-                        host: self.host.clone(),
-                        port: self.port,
-                        username: self.username.clone(),
-                        password: self.password.clone(),
-                    };
-                    let folder = folder.clone();
-                    s.spawn(move || scan_folder(&provider, &folder, progress))
-                })
-                .collect();
+        // Process folders in batches to respect server connection limits
+        for batch in folders.chunks(MAX_CONCURRENT_CONNECTIONS) {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|folder| {
+                        let provider = ImapProvider {
+                            host: self.host.clone(),
+                            port: self.port,
+                            username: self.username.clone(),
+                            password: self.password.clone(),
+                        };
+                        let folder = folder.clone();
+                        s.spawn(move || scan_folder(&provider, &folder, progress))
+                    })
+                    .collect();
 
-            for handle in handles {
-                let folder_result = handle.join().expect("scan thread panicked")?;
-                let warnings = merge_folder_result(&mut combined, folder_result);
-                for w in warnings {
-                    if !all_warnings.contains(&w) {
-                        all_warnings.push(w);
+                for handle in handles {
+                    let folder_result = handle.join().expect("scan thread panicked")?;
+                    let warnings = merge_folder_result(&mut combined, folder_result);
+                    for w in warnings {
+                        if !all_warnings.contains(&w) {
+                            all_warnings.push(w);
+                        }
                     }
                 }
-            }
 
-            Ok::<(), anyhow::Error>(())
-        })?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
 
         let mut senders: Vec<SenderInfo> = combined.into_values().collect();
         senders.sort_by(|a, b| b.email_count.cmp(&a.email_count));
@@ -87,6 +94,13 @@ impl EmailProvider for ImapProvider {
     fn archive(&self, messages: &[FolderMessage], destination: &Folder) -> Result<u32> {
         let mut session = self.connect()?;
         let dest = destination.as_str();
+
+        // Check if server supports MOVE (RFC 6851). Gmail and some other servers
+        // don't, so we fall back to COPY + STORE \Deleted + EXPUNGE.
+        let has_move = session
+            .capabilities()
+            .map(|caps| caps.has_str("MOVE"))
+            .unwrap_or(false);
 
         // Create destination folder if it doesn't exist
         session.create(dest).ok();
@@ -132,11 +146,30 @@ impl EmailProvider for ImapProvider {
             // Process in chunks to avoid overly long IMAP commands
             for chunk in uids.chunks(100) {
                 let uid_set = chunk.join(",");
-                session
-                    .uid_mv(&uid_set, dest)
-                    .with_context(|| {
-                        format!("Failed to move emails from {folder} to {dest}")
+
+                if has_move {
+                    session
+                        .uid_mv(&uid_set, dest)
+                        .with_context(|| {
+                            format!("Failed to move emails from {folder} to {dest}")
+                        })?;
+                } else {
+                    // Fallback: COPY + flag \Deleted + EXPUNGE
+                    session
+                        .uid_copy(&uid_set, dest)
+                        .with_context(|| {
+                            format!("Failed to copy emails from {folder} to {dest}")
+                        })?;
+                    let _ = session
+                        .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+                        .with_context(|| {
+                            format!("Failed to flag emails as deleted in {folder}")
+                        })?;
+                    session.expunge().with_context(|| {
+                        format!("Failed to expunge deleted emails from {folder}")
                     })?;
+                }
+
                 archived += chunk.len() as u32;
             }
         }
