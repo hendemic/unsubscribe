@@ -1,4 +1,3 @@
-mod config;
 mod http;
 mod progress;
 mod tui;
@@ -8,7 +7,11 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use unsubscribe_core::{EmailProvider, Folder, SenderInfo, UnsubscribeResult};
+use unsubscribe_core::{
+    AccountConfig, AuthType, ConfigStore, Credential, CredentialStore, EmailProvider, Folder,
+    SenderInfo, UnsubscribeResult,
+};
+use unsubscribe_persistence::{KeyringCredentialStore, TomlConfigStore};
 
 // ANSI color helpers
 const BOLD: &str = "\x1b[1m";
@@ -70,29 +73,40 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(config::Config::default_path);
+    let config_dir = cli
+        .config
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(TomlConfigStore::default_dir);
+    let config_path = config_dir.join("config.toml");
 
     match &cli.command {
         Commands::Warnings => return cmd_warnings(),
         Commands::Update => return cmd_update(),
-        Commands::Init => return cmd_init(&config_path),
-        Commands::Reauth => return cmd_reauth(&config_path),
-        Commands::Uninstall => return cmd_uninstall(&config_path),
+        Commands::Init => return cmd_init(&config_dir),
+        Commands::Reauth => return cmd_reauth(&config_dir),
+        Commands::Uninstall => return cmd_uninstall(&config_dir),
         _ => {}
     }
 
     if !config_path.exists() {
-        eprintln!("{YELLOW}No config file found at {}{RESET}", config_path.display());
+        eprintln!(
+            "{YELLOW}No config file found at {}{RESET}",
+            config_path.display()
+        );
         eprintln!("Run {BOLD}unsubscribe init{RESET} to set up your config.\n");
         std::process::exit(1);
     }
 
-    let config = config::Config::load(&config_path)?;
+    let (account, password) = load_account(&config_dir)?;
 
     match cli.command {
-        Commands::Run { dry_run, min_emails } => cmd_run(&config, dry_run, min_emails),
-        Commands::Scan { min_emails } => cmd_scan(&config, min_emails),
-        Commands::Export { output, min_emails } => cmd_export(&config, &output, min_emails),
+        Commands::Run { dry_run, min_emails } => cmd_run(&account, &password, dry_run, min_emails),
+        Commands::Scan { min_emails } => cmd_scan(&account, &password, min_emails),
+        Commands::Export { output, min_emails } => {
+            cmd_export(&account, &password, &output, min_emails)
+        }
         Commands::Warnings
         | Commands::Update
         | Commands::Init
@@ -101,19 +115,52 @@ fn main() -> Result<()> {
     }
 }
 
-fn make_provider(config: &config::Config) -> unsubscribe_email::ImapProvider {
+/// Load account config and resolve the password through the persistence layer.
+fn load_account(config_dir: &Path) -> Result<(AccountConfig, String)> {
+    let config_store = TomlConfigStore::new(config_dir);
+    let credential_store = KeyringCredentialStore::new(TomlConfigStore::new(config_dir));
+
+    let account = config_store
+        .read_config("")?
+        .context(format!(
+            "Failed to read config: {}\n\nRun `unsubscribe init` to set up your config.",
+            config_dir.join("config.toml").display()
+        ))?;
+
+    let credential = credential_store
+        .get_credential(&account.account_id)?
+        .context(
+            "No password found. Run `unsubscribe init` to store your password,\n\
+             or add password_command to your config.",
+        )?;
+
+    let password = match credential {
+        Credential::Password(p) => p,
+        Credential::OAuthToken { .. } => {
+            anyhow::bail!("OAuth tokens are not yet supported for IMAP connections")
+        }
+    };
+
+    Ok((account, password))
+}
+
+fn make_provider(account: &AccountConfig, password: &str) -> unsubscribe_email::ImapProvider {
     unsubscribe_email::ImapProvider::new(
-        config.imap.host.clone(),
-        config.imap.port,
-        config.imap.username.clone(),
-        config.imap.password.clone(),
+        account.host.clone(),
+        account.port.unwrap_or(993),
+        account.username.clone(),
+        password.to_string(),
     )
 }
 
-fn do_scan(config: &config::Config, min_emails: u32) -> Result<(Vec<SenderInfo>, Vec<String>)> {
+fn do_scan(
+    account: &AccountConfig,
+    password: &str,
+    min_emails: u32,
+) -> Result<(Vec<SenderInfo>, Vec<String>)> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
-    let provider = make_provider(config);
-    let folders: Vec<Folder> = config.scan.folders.iter().map(|f| Folder::new(f)).collect();
+    let provider = make_provider(account, password);
+    let folders: Vec<Folder> = account.scan_folders.iter().map(|f| Folder::new(f)).collect();
     let progress = progress::CliScanProgress::new();
     let scan_result = provider.scan(&folders, &progress)?;
 
@@ -238,9 +285,14 @@ fn cmd_update() -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(config_path: &Path) -> Result<()> {
+fn cmd_init(config_dir: &Path) -> Result<()> {
+    let config_path = config_dir.join("config.toml");
+
     if config_path.exists() {
-        eprintln!("{YELLOW}Config already exists at {}{RESET}", config_path.display());
+        eprintln!(
+            "{YELLOW}Config already exists at {}{RESET}",
+            config_path.display()
+        );
         eprint!("Overwrite? [y/N] ");
         std::io::stderr().flush()?;
         let mut answer = String::new();
@@ -271,66 +323,80 @@ fn cmd_init(config_path: &Path) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    let config_store = TomlConfigStore::new(config_dir);
+    let credential_store = KeyringCredentialStore::new(TomlConfigStore::new(config_dir));
+
     // Store password in OS keychain
-    config::Config::store_password(&username, &password)?;
+    credential_store.store_credential(&username, &Credential::Password(password))?;
     eprintln!("\n  {GREEN}Password stored in OS keychain{RESET}");
 
     // Write config file (without password)
-    config::Config::write_init(config_path, &host, port, &username, folders_vec, &archive)?;
+    config_store.write_init(&host, port, &username, &AuthType::Password, folders_vec, &archive)?;
 
-    eprintln!("{GREEN}Config written to {}{RESET}", config_path.display());
+    eprintln!(
+        "{GREEN}Config written to {}{RESET}",
+        config_path.display()
+    );
     eprintln!("\nRun {BOLD}unsubscribe scan{RESET} to test your connection.");
     Ok(())
 }
 
-fn cmd_reauth(config_path: &Path) -> Result<()> {
+fn cmd_reauth(config_dir: &Path) -> Result<()> {
+    let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
         eprintln!("{YELLOW}No config file found.{RESET}");
         eprintln!("Run {BOLD}unsubscribe init{RESET} first.\n");
         std::process::exit(1);
     }
 
-    let config = config::Config::load(config_path)?;
+    let (account, existing_password) = load_account(config_dir)?;
 
     eprintln!("{BOLD}Update IMAP credentials{RESET}");
     eprintln!("{DIM}Press Enter to keep current value{RESET}\n");
 
-    let host = prompt("IMAP host", &config.imap.host)?;
-    let port = prompt("IMAP port", &config.imap.port.to_string())?;
-    let username = prompt("Email address", &config.imap.username)?;
+    let host = prompt("IMAP host", &account.host)?;
+    let port_default = account.port.unwrap_or(993).to_string();
+    let port = prompt("IMAP port", &port_default)?;
+    let username = prompt("Email address", &account.username)?;
     let password = prompt_password("App password (enter new or press Enter to keep current)")?;
 
     let port: u16 = port.parse().context("Invalid port number")?;
 
-    // Read current scan config to preserve it
-    let folders = config.scan.folders.clone();
-    let archive = config.scan.archive_folder.clone();
+    // Preserve current scan config
+    let folders = account.scan_folders.clone();
+    let archive = account.archive_folder.clone();
 
-    // If password was entered, update keychain; otherwise keep existing
+    // If password was entered, use it; otherwise keep existing
     let password = if password.is_empty() {
-        config.imap.password.clone()
+        existing_password
     } else {
         password
     };
 
+    let config_store = TomlConfigStore::new(config_dir);
+    let credential_store = KeyringCredentialStore::new(TomlConfigStore::new(config_dir));
+
     // Delete old keychain entry if username changed
-    if username != config.imap.username {
-        let _ = config::Config::delete_password(&config.imap.username);
+    if username != account.username {
+        let _ = credential_store.delete_credential(&account.username);
     }
 
-    config::Config::store_password(&username, &password)?;
-    config::Config::write_init(config_path, &host, port, &username, folders, &archive)?;
+    credential_store.store_credential(&username, &Credential::Password(password))?;
+    config_store.write_init(&host, port, &username, &AuthType::Password, folders, &archive)?;
 
     eprintln!("\n{GREEN}Credentials updated.{RESET}");
     Ok(())
 }
 
-fn cmd_uninstall(config_path: &Path) -> Result<()> {
+fn cmd_uninstall(config_dir: &Path) -> Result<()> {
     eprintln!("{BOLD}This will remove:{RESET}");
-    eprintln!("  - Config:  {}", config_path.parent().unwrap_or(config_path).display());
+    eprintln!("  - Config:  {}", config_dir.display());
     eprintln!("  - Data:    {}", data_dir().display());
     eprintln!("  - Keychain entry");
-    eprintln!("  - Binary:  {}", std::env::current_exe().unwrap_or_default().display());
+    eprintln!(
+        "  - Binary:  {}",
+        std::env::current_exe().unwrap_or_default().display()
+    );
 
     eprint!("\n{BOLD}Are you sure?{RESET} [y/N] ");
     std::io::stderr().flush()?;
@@ -342,17 +408,17 @@ fn cmd_uninstall(config_path: &Path) -> Result<()> {
     }
 
     // Remove keychain entry (best-effort, config may not exist)
-    if let Ok(config) = config::Config::load(config_path) {
-        let _ = config::Config::delete_password(&config.imap.username);
+    if let Ok((account, _)) = load_account(config_dir) {
+        let credential_store =
+            KeyringCredentialStore::new(TomlConfigStore::new(config_dir));
+        let _ = credential_store.delete_credential(&account.username);
         eprintln!("  {GREEN}Removed keychain entry{RESET}");
     }
 
     // Remove config directory
-    if let Some(config_dir) = config_path.parent() {
-        if config_dir.exists() {
-            std::fs::remove_dir_all(config_dir)?;
-            eprintln!("  {GREEN}Removed {}{RESET}", config_dir.display());
-        }
+    if config_dir.exists() {
+        std::fs::remove_dir_all(config_dir)?;
+        eprintln!("  {GREEN}Removed {}{RESET}", config_dir.display());
     }
 
     // Remove data directory
@@ -430,8 +496,8 @@ fn prompt_password(label: &str) -> Result<String> {
     }
 }
 
-fn cmd_scan(config: &config::Config, min_emails: u32) -> Result<()> {
-    let (senders, warnings) = do_scan(config, min_emails)?;
+fn cmd_scan(account: &AccountConfig, password: &str, min_emails: u32) -> Result<()> {
+    let (senders, warnings) = do_scan(account, password, min_emails)?;
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -483,13 +549,18 @@ fn cmd_scan(config: &config::Config, min_emails: u32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()> {
+fn cmd_run(
+    account: &AccountConfig,
+    password: &str,
+    dry_run: bool,
+    min_emails: u32,
+) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
     }
 
     // Phase 1: Scan
-    let (senders, warnings) = do_scan(config, min_emails)?;
+    let (senders, warnings) = do_scan(account, password, min_emails)?;
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -597,19 +668,19 @@ fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()
         let total: u32 = to_unsub.iter().map(|s| s.email_count).sum();
         eprintln!(
             "Dry run: would archive {total} emails to '{}'",
-            config.scan.archive_folder
+            account.archive_folder
         );
         total
     } else {
-        let provider = make_provider(config);
+        let provider = make_provider(account, password);
         let messages: Vec<_> = to_unsub.iter().flat_map(|s| s.messages.clone()).collect();
-        let destination = Folder::new(&config.scan.archive_folder);
+        let destination = Folder::new(&account.archive_folder);
         provider.archive(&messages, &destination)?
     };
 
     eprintln!(
         "{GREEN}Archived {archived} emails{RESET} to '{}'.",
-        config.scan.archive_folder
+        account.archive_folder
     );
 
     // Write action log to XDG data dir
@@ -623,8 +694,13 @@ fn cmd_run(config: &config::Config, dry_run: bool, min_emails: u32) -> Result<()
     Ok(())
 }
 
-fn cmd_export(config: &config::Config, output: &Path, min_emails: u32) -> Result<()> {
-    let (senders, _) = do_scan(config, min_emails)?;
+fn cmd_export(
+    account: &AccountConfig,
+    password: &str,
+    output: &Path,
+    min_emails: u32,
+) -> Result<()> {
+    let (senders, _) = do_scan(account, password, min_emails)?;
 
     let mut wtr =
         csv::Writer::from_path(output).context("Failed to create CSV")?;
