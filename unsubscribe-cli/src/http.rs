@@ -13,7 +13,7 @@ pub struct ReqwestHttpClient {
 impl ReqwestHttpClient {
     pub fn new() -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .context("Failed to build HTTP client")?;

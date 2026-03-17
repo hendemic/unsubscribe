@@ -244,7 +244,7 @@ fn print_warnings_summary(warnings: &[String]) {
         return;
     }
     eprintln!(
-        "\n{YELLOW}{} sender(s) had unparseable List-Unsubscribe headers.{RESET}",
+        "\n{YELLOW}{} email(s) had unparseable or missing List-Unsubscribe headers.{RESET}",
         warnings.len()
     );
     eprintln!("{DIM}Run `unsubscribe warnings` to see details.{RESET}\n");

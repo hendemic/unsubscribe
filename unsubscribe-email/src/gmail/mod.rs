@@ -1,6 +1,8 @@
 pub mod api;
 
 use std::collections::HashMap;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -16,7 +18,7 @@ use api::{
 
 /// Gmail REST API adapter for the `EmailProvider` trait.
 ///
-/// Implements scanning via `q=list:unsubscribe` filter and archiving via
+/// Implements scanning via Gmail's `^unsub` system label and archiving via
 /// `batchModify`. Requires a valid OAuth2 access token — token acquisition
 /// and refresh are handled by the caller.
 ///
@@ -83,8 +85,10 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
     // Scanning
     // -----------------------------------------------------------------------
 
-    /// Fetch all message IDs matching `q=list:unsubscribe`, paginating through
-    /// the full result set.
+    /// Fetch all message IDs from Gmail's `^unsub` system label, paginating
+    /// through the full result set. This label is automatically applied by
+    /// Gmail to bulk/newsletter emails — broader coverage than searching
+    /// for the `List-Unsubscribe` header alone.
     fn list_unsubscribe_message_ids(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
@@ -92,9 +96,9 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
         loop {
             let query = match &page_token {
                 Some(token) => format!(
-                    "messages?q=list%3Aunsubscribe&maxResults=500&pageToken={token}"
+                    "messages?q=label%3A%5Eunsub&maxResults=500&pageToken={token}"
                 ),
-                None => "messages?q=list%3Aunsubscribe&maxResults=500".to_string(),
+                None => "messages?q=label%3A%5Eunsub&maxResults=500".to_string(),
             };
 
             let body = self.api_get(&query)?;
@@ -112,16 +116,57 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
         Ok(ids)
     }
 
-    /// Fetch metadata headers for a single message.
-    fn fetch_message_metadata(&self, id: &str) -> Result<MessageMetadata> {
-        let path = format!(
-            "messages/{id}?format=metadata\
-             &metadataHeaders=From\
-             &metadataHeaders=List-Unsubscribe\
-             &metadataHeaders=List-Unsubscribe-Post"
-        );
-        let body = self.api_get(&path)?;
-        serde_json::from_str(&body).context("Failed to parse message metadata response")
+    /// Fetch metadata headers for a batch of messages in a single HTTP request.
+    ///
+    /// Gmail's batch endpoint accepts up to 100 individual requests as
+    /// `multipart/mixed`. This is ~100x faster than one-request-per-message.
+    fn fetch_message_metadata_batch(&self, ids: &[String]) -> Result<Vec<(String, Result<MessageMetadata>)>> {
+        let boundary = "batch_unsub";
+        let mut body = String::new();
+
+        for id in ids {
+            body.push_str(&format!(
+                "--{boundary}\r\n\
+                 Content-Type: application/http\r\n\
+                 Content-ID: <{id}>\r\n\
+                 \r\n\
+                 GET /gmail/v1/users/me/messages/{id}?format=metadata\
+                 &metadataHeaders=From\
+                 &metadataHeaders=List-Unsubscribe\
+                 &metadataHeaders=List-Unsubscribe-Post HTTP/1.1\r\n\
+                 \r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+
+        let content_type = format!("multipart/mixed; boundary={boundary}");
+
+        // Retry with exponential backoff on 429 rate limit errors
+        let mut attempt = 0;
+        let response = loop {
+            let resp = self
+                .http
+                .post_body_with_headers(
+                    "https://www.googleapis.com/batch/gmail/v1",
+                    &content_type,
+                    &body,
+                    &[("Authorization", &format!("Bearer {}", self.access_token))],
+                )
+                .context("Gmail batch request failed")?;
+
+            if resp.status == 429 && attempt < 3 {
+                attempt += 1;
+                thread::sleep(Duration::from_secs(2u64.pow(attempt)));
+                continue;
+            }
+            break resp;
+        };
+
+        if response.status >= 400 {
+            bail!("Gmail batch API error {}: {}", response.status, response.body);
+        }
+
+        parse_batch_response(&response.body, ids)
     }
 
     // -----------------------------------------------------------------------
@@ -166,11 +211,10 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
 }
 
 impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
-    /// Scan for senders with List-Unsubscribe headers via Gmail API.
+    /// Scan for bulk/newsletter senders via Gmail API.
     ///
-    /// Uses `q=list:unsubscribe` server-side filter so we only fetch messages
-    /// that have unsubscribe headers — much more efficient than IMAP scanning.
-    /// The `folders` parameter is ignored; Gmail's server-side filter covers
+    /// Uses Gmail's `^unsub` system label to find messages Gmail has identified
+    /// as bulk email. The `folders` parameter is ignored; Gmail's label covers
     /// all mail.
     fn scan(&self, _folders: &[Folder], progress: &dyn ScanProgress) -> Result<ScanResult> {
         let inbox = Folder::new("Gmail");
@@ -185,8 +229,36 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
         let mut senders: HashMap<String, SenderInfo> = HashMap::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        for id in &message_ids {
-            let meta = match self.fetch_message_metadata(id) {
+        // Fetch metadata in batches of 50 with rate-limit delays.
+        // Gmail counts each sub-request against quota, so 50 per batch
+        // with a pause between avoids 429 Too Many Requests errors.
+        let mut delay = Duration::from_millis(250);
+        for (i, chunk) in message_ids.chunks(50).enumerate() {
+            if i > 0 {
+                thread::sleep(delay);
+            }
+            let batch_results = match self.fetch_message_metadata_batch(chunk) {
+                Ok(results) => results,
+                Err(e) => {
+                    // Escalate delay on batch-level failures (likely rate limit)
+                    delay = (delay * 2).min(Duration::from_secs(4));
+                    warnings.push(format!("Batch fetch failed: {e}"));
+                    progress.on_messages_scanned(&inbox, chunk.len() as u32);
+                    continue;
+                }
+            };
+
+            // Check if any sub-requests hit rate limits and adjust delay
+            let had_errors = batch_results.iter().any(|(_, r)| r.is_err());
+            if had_errors {
+                delay = (delay * 2).min(Duration::from_secs(4));
+            } else if delay > Duration::from_millis(250) {
+                // Ease back down after a clean batch
+                delay = Duration::from_millis(250);
+            }
+
+            for (id, result) in batch_results {
+            let meta = match result {
                 Ok(m) => m,
                 Err(e) => {
                     let w = format!("Failed to fetch message {id}: {e}");
@@ -264,7 +336,8 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
             }
 
             progress.on_messages_scanned(&inbox, 1);
-        }
+            } // end for (id, result) in batch_results
+        } // end for chunk in message_ids.chunks(100)
 
         progress.on_folder_done(&inbox);
 
@@ -338,6 +411,95 @@ fn parse_from_header(from: &str) -> (String, String) {
 
     // Plain email address
     (String::new(), from.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Batch response parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a Gmail batch API `multipart/mixed` response into individual results.
+///
+/// Each part contains an HTTP response with status line, headers, and a JSON body.
+/// We extract the status code and body, then deserialize successful responses
+/// into `MessageMetadata`.
+fn parse_batch_response(
+    body: &str,
+    ids: &[String],
+) -> Result<Vec<(String, Result<MessageMetadata>)>> {
+    // Extract boundary from the response body — find the first line starting
+    // with "--". Google may include leading whitespace or blank lines.
+    let boundary = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("--"))
+        .map(|b| b.trim().to_string())
+        .context("Could not find boundary in batch response")?;
+
+    let mut results = Vec::new();
+    let separator = format!("--{boundary}");
+
+    let parts: Vec<&str> = body.split(&separator).collect();
+
+    // Skip first (empty before first boundary) and last (closing boundary)
+    let mut id_iter = ids.iter();
+    for part in parts.iter().skip(1) {
+        let part = part.trim();
+        if part == "--" || part.is_empty() {
+            continue;
+        }
+
+        let id = match id_iter.next() {
+            Some(id) => id.clone(),
+            None => break,
+        };
+
+        // Find the JSON body — everything after the blank line that follows
+        // the inner HTTP response headers
+        let result = parse_single_batch_part(part);
+        results.push((id, result));
+    }
+
+    Ok(results)
+}
+
+/// Parse a single part from a batch response into a `MessageMetadata`.
+///
+/// Each part has the structure:
+/// ```text
+/// Content-Type: application/http
+/// <blank line>
+/// HTTP/1.1 200 OK
+/// <headers>
+/// <blank line>
+/// <JSON body>
+/// ```
+fn parse_single_batch_part(part: &str) -> Result<MessageMetadata> {
+    // Split on double newline to separate headers from body sections.
+    // The part has: MIME headers \n\n HTTP response (status + headers \n\n body)
+    // Find the HTTP status line
+    let http_start = part
+        .find("HTTP/")
+        .context("No HTTP status line in batch part")?;
+    let http_section = &part[http_start..];
+
+    // Split HTTP response into headers+status and body
+    let (http_headers, json_body) = http_section
+        .split_once("\r\n\r\n")
+        .or_else(|| http_section.split_once("\n\n"))
+        .context("Could not separate HTTP headers from body in batch part")?;
+
+    // Check status code
+    let status_line = http_headers.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if status_code >= 400 {
+        bail!("HTTP {status_code}: {}", json_body.trim());
+    }
+
+    serde_json::from_str(json_body.trim()).context("Failed to parse message metadata from batch")
 }
 
 // ---------------------------------------------------------------------------
