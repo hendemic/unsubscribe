@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 unsubscribe-core = { path = "../unsubscribe-core" }
-unsubscribe-imap = { path = "../unsubscribe-imap" }
+unsubscribe-email = { path = "../unsubscribe-email" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"

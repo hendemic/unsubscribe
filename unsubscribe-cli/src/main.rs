@@ -101,8 +101,8 @@ fn main() -> Result<()> {
     }
 }
 
-fn make_provider(config: &config::Config) -> unsubscribe_imap::ImapProvider {
-    unsubscribe_imap::ImapProvider::new(
+fn make_provider(config: &config::Config) -> unsubscribe_email::ImapProvider {
+    unsubscribe_email::ImapProvider::new(
         config.imap.host.clone(),
         config.imap.port,
         config.imap.username.clone(),

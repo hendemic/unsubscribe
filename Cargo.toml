@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "unsubscribe-core",
-    "unsubscribe-imap",
+    "unsubscribe-email",
     "unsubscribe-cli",
 ]
 resolver = "3"
