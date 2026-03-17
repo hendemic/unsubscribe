@@ -15,10 +15,10 @@ use base64::Engine;
 use rand::Rng;
 use sha2::Digest;
 
-/// Placeholder OAuth client credentials for development (unverified app, 100-user cap).
-/// Replace with real credentials from Google Cloud Console before shipping.
-const GOOGLE_CLIENT_ID: &str = "PLACEHOLDER_CLIENT_ID";
-const GOOGLE_CLIENT_SECRET: &str = "PLACEHOLDER_CLIENT_SECRET";
+/// OAuth client credentials, injected at build time from environment variables.
+/// Set via .cargo/config.toml (gitignored) or CI secrets.
+const GOOGLE_CLIENT_ID: &str = env!("GOOGLE_CLIENT_ID");
+const GOOGLE_CLIENT_SECRET: &str = env!("GOOGLE_CLIENT_SECRET");
 
 /// Public accessors so the credential store can use the same client credentials
 /// for token refresh as the initial authorization flow.
