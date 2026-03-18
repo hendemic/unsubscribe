@@ -201,9 +201,10 @@ fn make_provider(
                 }
             };
             let http_client = http::ReqwestHttpClient::new()?;
-            Ok(Box::new(unsubscribe_email::GmailProvider::new(
+            Ok(Box::new(unsubscribe_email::GmailProvider::with_archive_label(
                 access_token,
                 http_client,
+                &account.archive_folder,
             )))
         }
     }
