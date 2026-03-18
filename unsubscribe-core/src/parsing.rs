@@ -10,6 +10,24 @@ pub struct ParsedUnsub {
     pub warning: Option<String>,
 }
 
+/// Convert a byte slice to a UTF-8 string using the given charset label.
+///
+/// Uses `encoding_rs` for WHATWG-standard charset resolution (ISO-8859-1 maps
+/// to Windows-1252, all aliases are handled). UTF-8 charsets skip the
+/// roundtrip. Unknown charsets fall back to lossy UTF-8 conversion.
+fn decode_bytes_with_charset(bytes: &[u8], charset: &str) -> String {
+    if charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("us-ascii") {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    encoding_rs::Encoding::for_label(charset.as_bytes())
+        .map(|enc| {
+            let (decoded, _, _) = enc.decode(bytes);
+            decoded.into_owned()
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Decode RFC 2047 encoded words in a header value.
 ///
 /// Handles `=?charset?Q?encoded?=` (quoted-printable) and `=?charset?B?encoded?=` (base64).
@@ -63,7 +81,7 @@ pub fn decode_rfc2047(input: &str) -> String {
         let encoded_text = &remaining[..end];
         remaining = &remaining[end + 2..];
 
-        match encoding.to_uppercase().as_str() {
+        let bytes: Option<Vec<u8>> = match encoding.to_uppercase().as_str() {
             "Q" => {
                 let mut bytes = Vec::new();
                 let mut chars = encoded_text.chars();
@@ -83,19 +101,22 @@ pub fn decode_rfc2047(input: &str) -> String {
                         _ => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
                     }
                 }
-                result.push_str(&String::from_utf8_lossy(&bytes));
+                Some(bytes)
             }
             "B" => {
                 use base64::Engine;
-                if let Ok(decoded) =
-                    base64::engine::general_purpose::STANDARD.decode(encoded_text)
-                {
-                    result.push_str(&String::from_utf8_lossy(&decoded));
-                }
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded_text)
+                    .ok()
             }
             _ => {
                 result.push_str(encoded_text);
+                None
             }
+        };
+
+        if let Some(bytes) = bytes {
+            result.push_str(&decode_bytes_with_charset(&bytes, charset));
         }
         last_was_encoded = true;
     }
@@ -284,9 +305,38 @@ mod tests {
 
     #[test]
     fn decode_rfc2047_unknown_charset_still_decodes() {
-        // Non-UTF-8 charset -- B encoding will decode the bytes, lossy conversion
+        // ISO-8859-1 B-encoded ASCII content — should decode correctly regardless
         let result = decode_rfc2047("=?ISO-8859-1?B?SGVsbG8=?=");
         assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn decode_rfc2047_iso_8859_1_q_encoding() {
+        // =?ISO-8859-1?Q?caf=E9?= — 0xE9 is 'é' in ISO-8859-1/Windows-1252
+        assert_eq!(decode_rfc2047("=?ISO-8859-1?Q?caf=E9?="), "café");
+    }
+
+    #[test]
+    fn decode_rfc2047_windows_1252_b_encoding() {
+        // Windows-1252 smart quotes: 0x93 = left double quote, 0x94 = right double quote
+        // These bytes are invalid in UTF-8 and ISO-8859-1 but defined in Windows-1252.
+        // encoding_rs maps ISO-8859-1 to Windows-1252 per the WHATWG standard.
+        use base64::Engine;
+        let encoded_text =
+            base64::engine::general_purpose::STANDARD.encode(b"\x93smart\x94");
+        let header = format!("=?windows-1252?B?{encoded_text}?=");
+        let result = decode_rfc2047(&header);
+        assert!(result.contains('\u{201C}')); // left double quotation mark
+        assert!(result.contains('\u{201D}')); // right double quotation mark
+        assert!(result.contains("smart"));
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_charset_falls_back() {
+        // Charset label not recognized by encoding_rs — falls back to lossy UTF-8
+        // Using ASCII content so the fallback produces correct output
+        let result = decode_rfc2047("=?X-UNKNOWN?Q?test?=");
+        assert_eq!(result, "test");
     }
 
     #[test]

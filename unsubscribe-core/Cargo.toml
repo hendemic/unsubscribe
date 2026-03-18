@@ -8,5 +8,6 @@ authors = ["Mike Henderson"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+encoding_rs = "0.8"
 scraper = "0.22"
 url = "2"
