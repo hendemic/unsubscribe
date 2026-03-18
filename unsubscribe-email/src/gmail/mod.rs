@@ -28,11 +28,29 @@ pub struct GmailProvider<C: unsubscribe_core::HttpClient> {
     /// Short-lived OAuth2 access token with `gmail.modify` scope.
     access_token: String,
     http: C,
+    /// Archive label name used to exclude already-archived messages from scans.
+    /// When set, the query appends `-label:"<name>"` so previously handled
+    /// senders do not reappear on subsequent scans.
+    archive_label: Option<String>,
 }
 
 impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
     pub fn new(access_token: impl Into<String>, http: C) -> Self {
-        Self { access_token: access_token.into(), http }
+        Self { access_token: access_token.into(), http, archive_label: None }
+    }
+
+    /// Construct a provider that excludes messages carrying `archive_label`
+    /// from scan results. Pass the same label name used by `archive()`.
+    pub fn with_archive_label(
+        access_token: impl Into<String>,
+        http: C,
+        archive_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            access_token: access_token.into(),
+            http,
+            archive_label: Some(archive_label.into()),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -89,16 +107,34 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
     /// through the full result set. This label is automatically applied by
     /// Gmail to bulk/newsletter emails — broader coverage than searching
     /// for the `List-Unsubscribe` header alone.
+    ///
+    /// When an archive label is configured, messages carrying that label are
+    /// excluded via `-label:"<name>"` so already-archived senders don't
+    /// reappear. If the label doesn't exist yet in Gmail the exclusion is a
+    /// no-op (Gmail ignores unknown label references in search queries).
     fn list_unsubscribe_message_ids(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
 
+        // Build the scan query, excluding the archive label when configured.
+        // Label names with spaces must be quoted in Gmail query syntax.
+        // The query string is percent-encoded for the URL.
+        let encoded_q = match &self.archive_label {
+            Some(label) if label.contains(' ') => {
+                format!("label%3A%5Eunsub+-label%3A%22{}%22", percent_encode_label(label))
+            }
+            Some(label) => {
+                format!("label%3A%5Eunsub+-label%3A{}", percent_encode_label(label))
+            }
+            None => "label%3A%5Eunsub".to_string(),
+        };
+
         loop {
             let query = match &page_token {
                 Some(token) => format!(
-                    "messages?q=label%3A%5Eunsub&maxResults=500&pageToken={token}"
+                    "messages?q={encoded_q}&maxResults=500&pageToken={token}"
                 ),
-                None => "messages?q=label%3A%5Eunsub&maxResults=500".to_string(),
+                None => format!("messages?q={encoded_q}&maxResults=500"),
             };
 
             let body = self.api_get(&query)?;
@@ -378,6 +414,27 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
 
         Ok(archived)
     }
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+/// Percent-encode a Gmail label name for use inside a query string value.
+///
+/// Encodes characters that are not safe inside a URL query component:
+/// spaces become `%20`, `"` becomes `%22`, `+` becomes `%2B`.
+fn percent_encode_label(label: &str) -> String {
+    label
+        .chars()
+        .flat_map(|c| match c {
+            ' ' => vec!['%', '2', '0'],
+            '"' => vec!['%', '2', '2'],
+            '+' => vec!['%', '2', 'B'],
+            '%' => vec!['%', '2', '5'],
+            c => vec![c],
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +819,63 @@ mod tests {
 
         assert_eq!(result.senders.len(), 0);
         assert_eq!(result.warnings.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Query construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_query_excludes_archive_label_without_spaces() {
+        let http = MockHttpClient::new();
+        // Return empty result so the test ends after the first list call
+        http.push(200, r#"{"messages":[]}"#);
+
+        let provider =
+            GmailProvider::with_archive_label("test-token", http, "Unsubscribed");
+        let _ = provider.scan(&[], &NoopProgress).unwrap();
+
+        let calls = provider.http.calls();
+        // The first call is the messages list; verify the URL contains the exclusion
+        let url = &calls[0].1;
+        assert!(
+            url.contains("-label%3AUnsubscribed"),
+            "Expected archive label exclusion in query URL, got: {url}"
+        );
+    }
+
+    #[test]
+    fn scan_query_excludes_archive_label_with_spaces() {
+        let http = MockHttpClient::new();
+        http.push(200, r#"{"messages":[]}"#);
+
+        let provider =
+            GmailProvider::with_archive_label("test-token", http, "My Archive");
+        let _ = provider.scan(&[], &NoopProgress).unwrap();
+
+        let calls = provider.http.calls();
+        let url = &calls[0].1;
+        // Spaces in the label name must be quoted, and space → %20 inside quotes
+        assert!(
+            url.contains("-label%3A%22My%20Archive%22"),
+            "Expected quoted archive label exclusion in query URL, got: {url}"
+        );
+    }
+
+    #[test]
+    fn scan_query_no_exclusion_when_no_archive_label() {
+        let http = MockHttpClient::new();
+        http.push(200, r#"{"messages":[]}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let _ = provider.scan(&[], &NoopProgress).unwrap();
+
+        let calls = provider.http.calls();
+        let url = &calls[0].1;
+        assert!(
+            !url.contains("-label"),
+            "Expected no label exclusion in query URL without archive label, got: {url}"
+        );
     }
 
     // -----------------------------------------------------------------------
