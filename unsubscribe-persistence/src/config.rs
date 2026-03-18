@@ -7,17 +7,23 @@ use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, ProviderType};
 use crate::KEYRING_SERVICE;
 
 /// On-disk TOML structure -- matches the existing config format exactly.
+///
+/// The `[account]` section is the canonical name. The `[imap]` alias provides
+/// backward compatibility with configs written before this rename.
 #[derive(Debug, Serialize, Deserialize)]
 struct FileConfig {
-    imap: FileImapConfig,
+    #[serde(alias = "imap")]
+    account: FileAccountConfig,
     #[serde(default)]
     scan: FileScanConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FileImapConfig {
-    host: String,
-    port: u16,
+struct FileAccountConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
     username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -120,17 +126,17 @@ impl TomlConfigStore {
         let file: FileConfig = toml::from_str(&contents).context("Failed to parse config")?;
 
         Ok(Some(PasswordResolutionInfo {
-            username: file.imap.username,
-            password: file.imap.password,
-            password_command: file.imap.password_command,
+            username: file.account.username,
+            password: file.account.password,
+            password_command: file.account.password_command,
         }))
     }
 
     /// Write a config file with a header comment about credential storage.
     pub fn write_init(
         &self,
-        host: &str,
-        port: u16,
+        host: Option<&str>,
+        port: Option<u16>,
         username: &str,
         provider_type: &ProviderType,
         auth_type: &AuthType,
@@ -148,8 +154,8 @@ impl TomlConfigStore {
         };
 
         let file = FileConfig {
-            imap: FileImapConfig {
-                host: host.to_string(),
+            account: FileAccountConfig {
+                host: host.map(str::to_string),
                 port,
                 username: username.to_string(),
                 password: None,
@@ -211,22 +217,22 @@ impl ConfigStore for TomlConfigStore {
         })?;
         let file: FileConfig = toml::from_str(&contents).context("Failed to parse config")?;
 
-        let auth_type = match file.imap.auth_type.as_str() {
+        let auth_type = match file.account.auth_type.as_str() {
             "oauth" => AuthType::OAuth,
             _ => AuthType::Password,
         };
 
-        let provider_type = match file.imap.provider.as_str() {
+        let provider_type = match file.account.provider.as_str() {
             "gmail" => ProviderType::Gmail,
             _ => ProviderType::Imap,
         };
 
         Ok(Some(AccountConfig {
-            account_id: file.imap.username.clone(),
+            account_id: file.account.username.clone(),
             provider_type,
-            host: file.imap.host,
-            port: Some(file.imap.port),
-            username: file.imap.username,
+            host: file.account.host,
+            port: file.account.port,
+            username: file.account.username,
             auth_type,
             scan_folders: file.scan.folders,
             archive_folder: file.scan.archive_folder,
@@ -234,8 +240,6 @@ impl ConfigStore for TomlConfigStore {
     }
 
     fn write_config(&self, config: &AccountConfig) -> Result<()> {
-        let port = config.port.unwrap_or(993);
-
         // Preserve existing password/password_command fields if they exist
         let path = self.config_path(&config.account_id);
         let (existing_password, existing_command) = if path.exists() {
@@ -248,7 +252,7 @@ impl ConfigStore for TomlConfigStore {
                 }
             };
             if let Ok(file) = toml::from_str::<FileConfig>(&contents) {
-                (file.imap.password, file.imap.password_command)
+                (file.account.password, file.account.password_command)
             } else {
                 (None, None)
             }
@@ -267,9 +271,9 @@ impl ConfigStore for TomlConfigStore {
         };
 
         let file = FileConfig {
-            imap: FileImapConfig {
+            account: FileAccountConfig {
                 host: config.host.clone(),
-                port,
+                port: config.port,
                 username: config.username.clone(),
                 password: existing_password,
                 password_command: existing_command,
