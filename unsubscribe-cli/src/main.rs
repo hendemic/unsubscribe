@@ -64,7 +64,11 @@ enum Commands {
     /// Show recent scan warnings (unparseable headers)
     Warnings,
     /// Update to the latest release from GitHub
-    Update,
+    Update {
+        /// Include pre-releases when checking for updates
+        #[arg(long)]
+        pre: bool,
+    },
     /// Create config file with interactive setup
     Init,
     /// Update credentials (re-authenticate with your email provider)
@@ -91,7 +95,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Warnings => return cmd_warnings(),
-        Commands::Update => return cmd_update(),
+        Commands::Update { pre } => return cmd_update(*pre),
         Commands::Init => return cmd_init(&config_dir),
         Commands::Reauth => return cmd_reauth(&config_dir),
         Commands::Uninstall => return cmd_uninstall(&config_dir),
@@ -117,7 +121,7 @@ fn main() -> Result<()> {
             cmd_export(&account, &credential, &output, min_emails)
         }
         Commands::Warnings
-        | Commands::Update
+        | Commands::Update { .. }
         | Commands::Init
         | Commands::Reauth
         | Commands::Uninstall
@@ -586,23 +590,40 @@ fn cmd_warnings() -> Result<()> {
 // Update command
 // ---------------------------------------------------------------------------
 
-fn cmd_update() -> Result<()> {
+fn cmd_update(pre: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
 
     eprintln!("{BOLD}Checking for updates...{RESET}");
 
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get("https://api.github.com/repos/hendemic/unsubscribe/releases/latest")
-        .header("User-Agent", "unsubscribe")
-        .send()
-        .context("Failed to check for updates")?;
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("No releases found. Check https://github.com/hendemic/unsubscribe/releases");
-    }
+    let release: serde_json::Value = if pre {
+        let resp = client
+            .get("https://api.github.com/repos/hendemic/unsubscribe/releases")
+            .header("User-Agent", "unsubscribe")
+            .send()
+            .context("Failed to check for updates")?;
 
-    let release: serde_json::Value = resp.json().context("Failed to parse release info")?;
+        let releases: Vec<serde_json::Value> =
+            resp.json().context("Failed to parse releases list")?;
+
+        releases
+            .into_iter()
+            .next()
+            .context("No releases found. Check https://github.com/hendemic/unsubscribe/releases")?
+    } else {
+        let resp = client
+            .get("https://api.github.com/repos/hendemic/unsubscribe/releases/latest")
+            .header("User-Agent", "unsubscribe")
+            .send()
+            .context("Failed to check for updates")?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("No releases found. Check https://github.com/hendemic/unsubscribe/releases");
+        }
+
+        resp.json().context("Failed to parse release info")?
+    };
     let latest_tag = release["tag_name"]
         .as_str()
         .context("No tag_name in release")?;
