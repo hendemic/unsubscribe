@@ -601,16 +601,20 @@ fn cmd_update() -> Result<()> {
     // Determine the right binary for this platform
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "linux-x86_64",
-        ("linux", "aarch64") => "linux-aarch64",
         ("macos", "x86_64") => "macos-x86_64",
         ("macos", "aarch64") => "macos-aarch64",
-        (os, arch) => bail!("Unsupported platform: {os}-{arch}"),
+        (os, arch) => bail!(
+            "Automatic updates are not supported on {os}-{arch}. \
+             Download the latest release manually from https://github.com/hendemic/unsubscribe/releases"
+        ),
     };
 
     let asset_name = format!("unsubscribe-{target}");
+    let checksum_name = format!("{asset_name}.sha256");
     let assets = release["assets"]
         .as_array()
         .context("No assets in release")?;
+
     let asset = assets
         .iter()
         .find(|a| a["name"].as_str() == Some(&asset_name))
@@ -618,6 +622,20 @@ fn cmd_update() -> Result<()> {
     let download_url = asset["browser_download_url"]
         .as_str()
         .context("No download URL for asset")?;
+
+    // Require a checksum file — releases without one are not trusted.
+    let checksum_asset = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(&checksum_name))
+        .with_context(|| {
+            format!(
+                "No checksum file ({checksum_name}) found for this release. \
+                 Cannot verify download integrity. Aborting update."
+            )
+        })?;
+    let checksum_url = checksum_asset["browser_download_url"]
+        .as_str()
+        .context("No download URL for checksum asset")?;
 
     eprintln!("Downloading {CYAN}{asset_name}{RESET}...");
     let bytes = client
@@ -628,7 +646,34 @@ fn cmd_update() -> Result<()> {
         .bytes()
         .context("Failed to read update binary")?;
 
-    // Replace current binary
+    // Fetch and verify SHA256 checksum before touching the filesystem.
+    let checksum_raw = client
+        .get(checksum_url)
+        .header("User-Agent", "unsubscribe")
+        .send()
+        .context("Failed to download checksum file")?
+        .text()
+        .context("Failed to read checksum file")?;
+
+    // sha256sum output format: "<hex>  <filename>"
+    let expected_hex = checksum_raw
+        .split_whitespace()
+        .next()
+        .context("Checksum file is empty or malformed")?;
+
+    use sha2::{Digest, Sha256};
+    let actual_hex = format!("{:x}", Sha256::digest(&bytes));
+
+    if actual_hex != expected_hex {
+        bail!(
+            "Checksum verification failed.\n  expected: {expected_hex}\n  actual:   {actual_hex}\n\
+             The downloaded binary may be corrupted or tampered with. Aborting update."
+        );
+    }
+
+    eprintln!("{GREEN}Checksum verified.{RESET}");
+
+    // Replace current binary only after integrity is confirmed.
     let current_exe = std::env::current_exe().context("Cannot determine current binary path")?;
     let tmp = current_exe.with_extension("tmp");
     std::fs::write(&tmp, &bytes).context("Failed to write update")?;
