@@ -16,6 +16,7 @@ unsubscribe-persistence = { path = "../unsubscribe-persistence" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.28"
 csv = "1"
 indicatif = "0.17"
