@@ -1,34 +1,36 @@
-//! Google OAuth2 authorization code flow with PKCE.
+//! Google OAuth2 authorization code flow with PKCE and token refresh.
 //!
-//! Handles the interactive browser-based consent flow for Gmail API access:
-//! open browser -> user approves -> redirect to localhost -> exchange code for tokens.
+//! Handles both the interactive browser-based consent flow for Gmail API access
+//! and the non-interactive token refresh flow for ongoing API access.
 //!
-//! This module lives in the CLI crate because it is inherently interactive and
-//! platform-specific (opening browsers, binding localhost ports). Core and
-//! persistence never touch this.
+//! This module lives in the CLI crate because:
+//! - The authorization flow is inherently interactive (opening browsers, binding ports)
+//! - Token refresh requires an HTTP client and Google-specific logic
+//! - iOS will use Apple's Accounts framework instead of raw HTTP token refresh
+//!
+//! Core and persistence never touch this.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use rand::Rng;
 use sha2::Digest;
+use unsubscribe_core::HttpClient;
 
 /// OAuth client credentials, injected at build time from environment variables.
 /// Set via .cargo/config.toml (gitignored) or CI secrets.
 const GOOGLE_CLIENT_ID: &str = env!("GOOGLE_CLIENT_ID");
 const GOOGLE_CLIENT_SECRET: &str = env!("GOOGLE_CLIENT_SECRET");
 
-/// Public accessors so the credential store can use the same client credentials
-/// for token refresh as the initial authorization flow.
-pub fn google_client_id() -> &'static str {
-    GOOGLE_CLIENT_ID
-}
-
-pub fn google_client_secret() -> &'static str {
-    GOOGLE_CLIENT_SECRET
-}
+/// Safety margin subtracted from the reported token lifetime to avoid using
+/// a token right at the edge of expiry. 60 seconds is conservative enough
+/// for typical clock drift and request latency.
+const EXPIRY_BUFFER_SECS: u64 = 60;
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -312,4 +314,140 @@ fn open_browser(url: &str) -> Result<()> {
 /// Base64url encoding without padding, per RFC 4648 Section 5.
 fn base64_url_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+// ---------------------------------------------------------------------------
+// Token refresh and caching
+// ---------------------------------------------------------------------------
+
+/// A cached access token with its expiry time.
+struct CachedAccessToken {
+    token: String,
+    expires_at: Instant,
+}
+
+/// Manages OAuth access token refresh and in-memory caching.
+///
+/// Holds a refresh token and exchanges it for short-lived access tokens
+/// via Google's token endpoint, caching them to avoid redundant refreshes
+/// within a session.
+pub struct TokenRefresher {
+    http_client: Box<dyn HttpClient>,
+    cache: Mutex<HashMap<String, CachedAccessToken>>,
+}
+
+impl TokenRefresher {
+    pub fn new(http_client: Box<dyn HttpClient>) -> Self {
+        Self {
+            http_client,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve a fresh access token for the given account.
+    ///
+    /// Returns a cached token if one exists and hasn't expired, otherwise
+    /// exchanges the refresh token for a new access token.
+    pub fn resolve_access_token(&self, account_id: &str, refresh_token: &str) -> Result<String> {
+        // Check cache first
+        if let Some(cached) = self.get_cached_token(account_id) {
+            return Ok(cached);
+        }
+
+        let (access_token, expires_in) = refresh_access_token(
+            &*self.http_client,
+            refresh_token,
+        )?;
+
+        self.cache_token(account_id, &access_token, expires_in);
+
+        Ok(access_token)
+    }
+
+    fn get_cached_token(&self, account_id: &str) -> Option<String> {
+        let cache = self.cache.lock().ok()?;
+        let cached = cache.get(account_id)?;
+        if Instant::now() < cached.expires_at {
+            Some(cached.token.clone())
+        } else {
+            None
+        }
+    }
+
+    fn cache_token(&self, account_id: &str, token: &str, expires_in_secs: u64) {
+        let effective_lifetime = expires_in_secs.saturating_sub(EXPIRY_BUFFER_SECS);
+        let expires_at = Instant::now() + std::time::Duration::from_secs(effective_lifetime);
+
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                account_id.to_string(),
+                CachedAccessToken {
+                    token: token.to_string(),
+                    expires_at,
+                },
+            );
+        }
+    }
+}
+
+/// Exchange a refresh token for a new access token via Google's token endpoint.
+///
+/// Returns `(access_token, expires_in_seconds)`.
+fn refresh_access_token(
+    http: &dyn HttpClient,
+    refresh_token: &str,
+) -> Result<(String, u64)> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("client_secret", GOOGLE_CLIENT_SECRET),
+    ];
+
+    let response = http
+        .post_form(GOOGLE_TOKEN_URL, &params)
+        .context("Failed to contact Google's token endpoint for token refresh")?;
+
+    if response.status == 400 || response.status == 401 {
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&response.body) {
+            let error = body["error"].as_str().unwrap_or("unknown");
+            if error == "invalid_grant" {
+                bail!(
+                    "OAuth refresh token has been revoked or expired. \
+                     Run `unsubscribe init` to re-authenticate with your email provider."
+                );
+            }
+            bail!(
+                "OAuth token refresh failed: {} ({})",
+                body["error_description"].as_str().unwrap_or("unknown error"),
+                error
+            );
+        }
+        bail!(
+            "OAuth token refresh failed with HTTP {}: {}",
+            response.status,
+            response.body
+        );
+    }
+
+    if response.status >= 400 {
+        bail!(
+            "OAuth token refresh failed with HTTP {}: {}",
+            response.status,
+            response.body
+        );
+    }
+
+    let body: serde_json::Value = serde_json::from_str(&response.body)
+        .context("Failed to parse token refresh response")?;
+
+    let access_token = body["access_token"]
+        .as_str()
+        .context("Token refresh response missing access_token")?
+        .to_string();
+
+    // Google tokens typically expire in 3600 seconds (1 hour)
+    let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
+
+    Ok((access_token, expires_in))
 }

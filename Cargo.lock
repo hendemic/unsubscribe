@@ -2436,7 +2436,6 @@ dependencies = [
  "keyring",
  "log",
  "serde",
- "serde_json",
  "toml",
  "unsubscribe-core",
 ]

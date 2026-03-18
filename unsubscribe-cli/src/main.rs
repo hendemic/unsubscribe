@@ -12,7 +12,7 @@ use unsubscribe_core::{
     AccountConfig, AuthType, ConfigStore, Credential, CredentialStore, EmailProvider, Folder,
     ProviderType, SenderInfo, UnsubscribeResult,
 };
-use unsubscribe_persistence::{KeyringCredentialStore, OAuthClientConfig, TomlConfigStore};
+use unsubscribe_persistence::{KeyringCredentialStore, TomlConfigStore};
 
 // ANSI color helpers
 const BOLD: &str = "\x1b[1m";
@@ -121,6 +121,10 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Load account config and resolve credentials through the persistence layer.
+///
+/// For OAuth accounts, this exchanges the stored refresh token for a fresh
+/// access token before returning. The token is cached in memory for the
+/// lifetime of the session.
 fn load_account(config_dir: &Path) -> Result<(AccountConfig, Credential)> {
     let config_store = TomlConfigStore::new(config_dir);
 
@@ -131,7 +135,7 @@ fn load_account(config_dir: &Path) -> Result<(AccountConfig, Credential)> {
             config_dir.join("config.toml").display()
         ))?;
 
-    let credential_store = make_credential_store(config_dir, &account)?;
+    let credential_store = make_credential_store(config_dir);
 
     let credential = credential_store
         .get_credential(&account.account_id)?
@@ -140,32 +144,33 @@ fn load_account(config_dir: &Path) -> Result<(AccountConfig, Credential)> {
              or `unsubscribe reauth` to re-authenticate.",
         )?;
 
+    // For OAuth accounts, the credential store returns the raw refresh token.
+    // Exchange it for a fresh access token before handing it to the provider.
+    let credential = match credential {
+        Credential::OAuthToken {
+            refresh_token: Some(refresh_token),
+            ..
+        } => {
+            let http_client = Box::new(http::ReqwestHttpClient::new()?);
+            let refresher = oauth::TokenRefresher::new(http_client);
+            let access_token = refresher.resolve_access_token(
+                &account.account_id,
+                &refresh_token,
+            )?;
+            Credential::OAuthToken {
+                access_token,
+                refresh_token: None,
+            }
+        }
+        other => other,
+    };
+
     Ok((account, credential))
 }
 
-/// Build the appropriate credential store based on the account's auth type.
-///
-/// OAuth accounts need an HTTP client and client config for token refresh.
-/// Password accounts use a simpler store without OAuth support.
-fn make_credential_store(
-    config_dir: &Path,
-    account: &AccountConfig,
-) -> Result<KeyringCredentialStore> {
-    match account.auth_type {
-        AuthType::OAuth => {
-            let http_client = Box::new(http::ReqwestHttpClient::new()?);
-            let oauth_config = OAuthClientConfig {
-                client_id: oauth::google_client_id().to_string(),
-                client_secret: oauth::google_client_secret().to_string(),
-            };
-            Ok(KeyringCredentialStore::with_oauth(
-                TomlConfigStore::new(config_dir),
-                http_client,
-                oauth_config,
-            ))
-        }
-        AuthType::Password => Ok(KeyringCredentialStore::new(TomlConfigStore::new(config_dir))),
-    }
+/// Build a credential store for reading/writing raw credentials from the keychain.
+fn make_credential_store(config_dir: &Path) -> KeyringCredentialStore {
+    KeyringCredentialStore::new(TomlConfigStore::new(config_dir))
 }
 
 /// Create the appropriate email provider based on the account's provider type.
@@ -505,9 +510,9 @@ fn cmd_uninstall(config_dir: &Path) -> Result<()> {
     }
 
     // Remove keychain entry (best-effort, config may not exist)
-    if let Ok((account, _)) = load_account(config_dir) {
-        let credential_store = make_credential_store(config_dir, &account)
-            .unwrap_or_else(|_| KeyringCredentialStore::new(TomlConfigStore::new(config_dir)));
+    let config_store = TomlConfigStore::new(config_dir);
+    if let Ok(Some(account)) = config_store.read_config("") {
+        let credential_store = make_credential_store(config_dir);
         let _ = credential_store.delete_credential(&account.username);
         eprintln!("  {GREEN}Removed keychain entry{RESET}");
     }
