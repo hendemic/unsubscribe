@@ -1,5 +1,5 @@
 use scraper::{Html, Selector};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use crate::ports::HttpClient;
 use crate::types::{SenderInfo, UnsubscribeResult};
@@ -206,15 +206,15 @@ fn try_submit_form(
 
         let result = if method == "GET" {
             // Build the URL with query params for GET forms
-            let mut get_url = form_url.clone();
-            if !param_refs.is_empty() {
-                let query: Vec<String> = param_refs
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", urlencoding(k), urlencoding(v)))
-                    .collect();
-                let sep = if get_url.contains('?') { "&" } else { "?" };
-                get_url = format!("{get_url}{sep}{}", query.join("&"));
-            }
+            let get_url = if param_refs.is_empty() {
+                form_url.clone()
+            } else {
+                let query = form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(param_refs.iter().copied())
+                    .finish();
+                let sep = if form_url.contains('?') { "&" } else { "?" };
+                format!("{form_url}{sep}{query}")
+            };
             http.get(&get_url)
         } else {
             http.post_form(&form_url, &param_refs)
@@ -290,21 +290,6 @@ fn resolve_url(page_url: &str, target: &str) -> String {
         .unwrap_or_else(|| page_url.to_string())
 }
 
-/// Minimal percent-encoding for URL query parameter components.
-fn urlencoding(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(b as char);
-            }
-            _ => {
-                result.push_str(&format!("%{b:02X}"));
-            }
-        }
-    }
-    result
-}
 
 #[cfg(test)]
 mod tests {
@@ -1018,37 +1003,4 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // urlencoding
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn urlencoding_alphanumeric_passthrough() {
-        assert_eq!(urlencoding("abcXYZ012"), "abcXYZ012");
-    }
-
-    #[test]
-    fn urlencoding_unreserved_passthrough() {
-        assert_eq!(urlencoding("-_.~"), "-_.~");
-    }
-
-    #[test]
-    fn urlencoding_special_chars() {
-        assert_eq!(urlencoding("hello world"), "hello%20world");
-        assert_eq!(urlencoding("a@b.com"), "a%40b.com");
-        assert_eq!(urlencoding("key=value"), "key%3Dvalue");
-        assert_eq!(urlencoding("a&b"), "a%26b");
-    }
-
-    #[test]
-    fn urlencoding_utf8_multibyte() {
-        // e-acute is U+00E9 = 0xC3 0xA9 in UTF-8
-        let encoded = urlencoding("\u{00E9}");
-        assert_eq!(encoded, "%C3%A9");
-    }
-
-    #[test]
-    fn urlencoding_empty() {
-        assert_eq!(urlencoding(""), "");
-    }
 }
