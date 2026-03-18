@@ -161,6 +161,39 @@ pub fn parse_list_unsubscribe(header_value: &str, sender_email: &str) -> ParsedU
     }
 }
 
+/// Parse a RFC 5322 From header value into `(display_name, email)`.
+///
+/// Handles the common formats found in real-world email:
+/// - `"Display Name" <email@example.com>`
+/// - `Display Name <email@example.com>`
+/// - `<email@example.com>`
+/// - `email@example.com`
+///
+/// RFC 2047 encoded display names (e.g. `=?UTF-8?Q?...?=`) are decoded.
+#[must_use]
+pub fn parse_from_header(from: &str) -> (String, String) {
+    let from = from.trim();
+
+    if from.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // "Name" <email> or Name <email>
+    if let Some(angle_start) = from.rfind('<') {
+        if let Some(angle_end) = from[angle_start..].find('>') {
+            let email = from[angle_start + 1..angle_start + angle_end]
+                .trim()
+                .to_string();
+            let raw_name = from[..angle_start].trim().trim_matches('"').trim();
+            let name = decode_rfc2047(raw_name);
+            return (name, email);
+        }
+    }
+
+    // Plain email address
+    (String::new(), from.to_string())
+}
+
 /// Extract the domain from an email address, lowercased.
 ///
 /// Returns the full input lowercased if no `@` is found.
@@ -487,6 +520,61 @@ mod tests {
             "news@example.com",
         );
         assert_eq!(result.urls, vec!["http://example.com/unsub"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_from_header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_from_quoted_name_with_angle() {
+        let (name, email) = parse_from_header(r#""Acme Newsletter" <news@acme.com>"#);
+        assert_eq!(name, "Acme Newsletter");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_unquoted_name_with_angle() {
+        let (name, email) = parse_from_header("Acme Newsletter <news@acme.com>");
+        assert_eq!(name, "Acme Newsletter");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_angle_only() {
+        let (name, email) = parse_from_header("<news@acme.com>");
+        assert_eq!(name, "");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_plain_email() {
+        let (name, email) = parse_from_header("news@acme.com");
+        assert_eq!(name, "");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_header_rfc2047_encoded_name() {
+        let (name, email) = parse_from_header(
+            "=?UTF-8?Q?Caf=C3=A9_Newsletter?= <cafe@example.com>",
+        );
+        assert_eq!(name, "Café Newsletter");
+        assert_eq!(email, "cafe@example.com");
+    }
+
+    #[test]
+    fn parse_from_header_empty_input() {
+        let (name, email) = parse_from_header("");
+        assert_eq!(name, "");
+        assert_eq!(email, "");
+    }
+
+    #[test]
+    fn parse_from_header_whitespace_handling() {
+        let (name, email) = parse_from_header("  Newsletter  <list@example.com>  ");
+        assert_eq!(name, "Newsletter");
+        assert_eq!(email, "list@example.com");
     }
 
     // -----------------------------------------------------------------------

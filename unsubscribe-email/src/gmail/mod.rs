@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use unsubscribe_core::{
-    domain_from_email, parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId,
-    ScanProgress, ScanResult, SenderInfo,
+    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, Folder,
+    FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
 };
 
 use api::{
@@ -381,37 +381,6 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
 }
 
 // ---------------------------------------------------------------------------
-// From header parsing
-// ---------------------------------------------------------------------------
-
-/// Parse a RFC 5322 From header value into (display_name, email).
-///
-/// Handles the common formats:
-/// - `"Display Name" <email@example.com>`
-/// - `Display Name <email@example.com>`
-/// - `<email@example.com>`
-/// - `email@example.com`
-fn parse_from_header(from: &str) -> (String, String) {
-    let from = from.trim();
-
-    // "Name" <email> or Name <email>
-    if let Some(angle_start) = from.rfind('<') {
-        if let Some(angle_end) = from[angle_start..].find('>') {
-            let email = from[angle_start + 1..angle_start + angle_end].trim().to_string();
-            let name = from[..angle_start]
-                .trim()
-                .trim_matches('"')
-                .trim()
-                .to_string();
-            return (name, email);
-        }
-    }
-
-    // Plain email address
-    (String::new(), from.to_string())
-}
-
-// ---------------------------------------------------------------------------
 // Batch response parsing
 // ---------------------------------------------------------------------------
 
@@ -582,38 +551,6 @@ mod tests {
         ) -> Result<HttpResponse> {
             Ok(self.next_response("POST", url, body))
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // From header parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_from_quoted_name_with_angle() {
-        let (name, email) = parse_from_header(r#""Acme Newsletter" <news@acme.com>"#);
-        assert_eq!(name, "Acme Newsletter");
-        assert_eq!(email, "news@acme.com");
-    }
-
-    #[test]
-    fn parse_from_unquoted_name_with_angle() {
-        let (name, email) = parse_from_header("Acme Newsletter <news@acme.com>");
-        assert_eq!(name, "Acme Newsletter");
-        assert_eq!(email, "news@acme.com");
-    }
-
-    #[test]
-    fn parse_from_angle_only() {
-        let (name, email) = parse_from_header("<news@acme.com>");
-        assert_eq!(name, "");
-        assert_eq!(email, "news@acme.com");
-    }
-
-    #[test]
-    fn parse_from_plain_email() {
-        let (name, email) = parse_from_header("news@acme.com");
-        assert_eq!(name, "");
-        assert_eq!(email, "news@acme.com");
     }
 
     // -----------------------------------------------------------------------
