@@ -7,8 +7,8 @@ use mail_parser::MessageParser;
 use native_tls::TlsStream;
 
 use unsubscribe_core::{
-    domain_from_email, parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId,
-    ScanProgress, ScanResult, SenderInfo,
+    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, Folder,
+    FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
 };
 
 /// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
@@ -240,12 +240,14 @@ fn scan_folder(
 
             let has_one_click = parsed.header_raw("List-Unsubscribe-Post").is_some();
 
-            let Some(from) = parsed.from() else { continue };
-            let Some(first) = from.clone().into_list().into_iter().next() else {
+            let from_raw = parsed
+                .header_raw("From")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let (sender_name, sender_email) = parse_from_header(&from_raw);
+            if sender_email.is_empty() {
                 continue;
-            };
-            let sender_name = first.name().unwrap_or("").to_string();
-            let sender_email = first.address().unwrap_or("unknown").to_string();
+            }
 
             let parsed_unsub = parse_list_unsubscribe(&unsub_header, &sender_email);
             if let Some(w) = parsed_unsub.warning {
