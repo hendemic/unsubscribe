@@ -35,17 +35,30 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: cargo build --release --target ${{ matrix.target }} -p unsubscribe-cli
 
       - name: Package
         run: |
           cp target/${{ matrix.target }}/release/unsubscribe ${{ matrix.asset }}
           chmod +x ${{ matrix.asset }}
 
+      - name: Generate checksum
+        run: |
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          else
+            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   release:
     needs: build
