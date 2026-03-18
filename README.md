@@ -92,4 +92,4 @@ Any provider with IMAP support on port 993 should work. See [config.toml.example
 
 ## License
 
-MIT
+GPL-3.0-only
