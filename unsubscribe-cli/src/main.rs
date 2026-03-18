@@ -4,7 +4,8 @@ mod progress;
 mod tui;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 
 #[derive(Parser)]
-#[command(name = "unsubscribe", about = "Bulk unsubscribe from email lists")]
+#[command(name = "unsubscribe", about = "Bulk unsubscribe from email lists", version)]
 struct Cli {
     /// Path to config file (default: ~/.config/email-unsubscribe/config.toml)
     #[arg(short, long)]
@@ -70,6 +71,12 @@ enum Commands {
     Reauth,
     /// Remove config, data, keychain entry, and binary
     Uninstall,
+    /// Generate shell completion script
+    Completions {
+        /// Shell to generate completions for (bash, zsh, fish)
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 fn main() -> Result<()> {
@@ -88,6 +95,7 @@ fn main() -> Result<()> {
         Commands::Init => return cmd_init(&config_dir),
         Commands::Reauth => return cmd_reauth(&config_dir),
         Commands::Uninstall => return cmd_uninstall(&config_dir),
+        Commands::Completions { shell } => return cmd_completions(*shell),
         _ => {}
     }
 
@@ -112,7 +120,8 @@ fn main() -> Result<()> {
         | Commands::Update
         | Commands::Init
         | Commands::Reauth
-        | Commands::Uninstall => unreachable!(),
+        | Commands::Uninstall
+        | Commands::Completions { .. } => unreachable!(),
     }
 }
 
@@ -540,6 +549,16 @@ fn cmd_uninstall(config_dir: &Path) -> Result<()> {
     }
 
     eprintln!("\n{GREEN}Uninstalled.{RESET}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Completions command
+// ---------------------------------------------------------------------------
+
+fn cmd_completions(shell: Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "unsubscribe", &mut std::io::stdout());
     Ok(())
 }
 
