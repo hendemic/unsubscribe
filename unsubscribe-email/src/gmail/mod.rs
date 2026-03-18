@@ -309,10 +309,10 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
                 }
             });
 
-            for u in urls {
-                if !entry.unsubscribe_urls.contains(&u) {
-                    entry.unsubscribe_urls.push(u);
-                }
+            // Gmail returns messages newest-first. The first URLs we encounter
+            // for a sender are the freshest — preserve them and skip older ones.
+            if entry.unsubscribe_urls.is_empty() && !urls.is_empty() {
+                entry.unsubscribe_urls = urls;
             }
             for m in mailtos {
                 if !entry.unsubscribe_mailto.contains(&m) {
@@ -669,22 +669,25 @@ mod tests {
 
     #[test]
     fn scan_aggregates_senders() {
+        // Gmail returns messages newest-first. msg1 is newer (first in list).
+        // The URL from msg1 should be preserved; msg2's different URL is older
+        // and should not overwrite the fresh one.
         let http = MockHttpClient::new();
 
-        // First page: two messages
+        // First page: two messages — msg1 is newer (newest-first order)
         http.push(200, make_list_response(&["msg1", "msg2"], None));
         // Batch metadata response for both messages
         let batch = make_batch_response(&[
             make_metadata_response(
                 "msg1",
                 "Newsletter <news@example.com>",
-                "<https://example.com/unsub>",
+                "<https://example.com/unsub?t=fresh>",
                 false,
             ),
             make_metadata_response(
                 "msg2",
                 "Newsletter <news@example.com>",
-                "<https://example.com/unsub>",
+                "<https://example.com/unsub?t=old>",
                 true,
             ),
         ]);
@@ -699,8 +702,52 @@ mod tests {
         assert_eq!(sender.display_name, "Newsletter");
         assert_eq!(sender.email_count, 2);
         assert!(sender.one_click);
-        assert_eq!(sender.unsubscribe_urls, vec!["https://example.com/unsub"]);
+        // The first-encountered (newest) URL wins
+        assert_eq!(sender.unsubscribe_urls, vec!["https://example.com/unsub?t=fresh"]);
         assert_eq!(sender.messages.len(), 2);
+    }
+
+    #[test]
+    fn scan_most_recently_encountered_url_wins() {
+        // Gmail returns newest-first. The URL from the first message we process
+        // is the freshest and must not be overwritten by older messages.
+        let http = MockHttpClient::new();
+
+        http.push(200, make_list_response(&["newest", "middle", "oldest"], None));
+        let batch = make_batch_response(&[
+            make_metadata_response(
+                "newest",
+                "Sender <sender@example.com>",
+                "<https://example.com/unsub?t=3>",
+                false,
+            ),
+            make_metadata_response(
+                "middle",
+                "Sender <sender@example.com>",
+                "<https://example.com/unsub?t=2>",
+                false,
+            ),
+            make_metadata_response(
+                "oldest",
+                "Sender <sender@example.com>",
+                "<https://example.com/unsub?t=1>",
+                false,
+            ),
+        ]);
+        http.push(200, batch);
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        assert_eq!(result.senders.len(), 1);
+        let sender = &result.senders[0];
+        // t=3 is from the newest message and should win
+        assert_eq!(
+            sender.unsubscribe_urls,
+            vec!["https://example.com/unsub?t=3"],
+            "newest (first-encountered) URL should be preserved"
+        );
+        assert_eq!(sender.email_count, 3);
     }
 
     #[test]

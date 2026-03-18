@@ -277,11 +277,11 @@ fn scan_folder(
                 }
             });
 
-            // Merge URLs (dedup)
-            for u in urls {
-                if !entry.unsubscribe_urls.contains(&u) {
-                    entry.unsubscribe_urls.push(u);
-                }
+            // Replace URLs with the most recently encountered set. IMAP sequences
+            // are in chronological order (oldest first), so the last-seen URLs are
+            // the freshest and least likely to be expired.
+            if !urls.is_empty() {
+                entry.unsubscribe_urls = urls;
             }
             for m in mailtos {
                 if !entry.unsubscribe_mailto.contains(&m) {
@@ -328,10 +328,10 @@ fn merge_folder_result(
             messages: Vec::new(),
         });
 
-        for u in &sender.unsubscribe_urls {
-            if !entry.unsubscribe_urls.contains(u) {
-                entry.unsubscribe_urls.push(u.clone());
-            }
+        // Incoming folder's URLs replace existing ones. When merging across
+        // folders there is no reliable timestamp ordering, so last-merged wins.
+        if !sender.unsubscribe_urls.is_empty() {
+            entry.unsubscribe_urls = sender.unsubscribe_urls;
         }
         for m in &sender.unsubscribe_mailto {
             if !entry.unsubscribe_mailto.contains(m) {
@@ -576,7 +576,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_deduplicates_urls_and_mailtos() {
+    fn merge_replaces_urls_with_later_folder_and_deduplicates_mailtos() {
+        // The second folder's URLs replace the first (last-merged wins).
+        // Mailtos are still deduped across folders.
         let mut combined: HashMap<String, SenderInfo> = HashMap::new();
 
         let folder1 = FolderResult {
@@ -584,7 +586,7 @@ mod tests {
                 "a@test.com".to_string(),
                 make_sender(
                     "a@test.com", 1,
-                    vec!["https://test.com/unsub"],
+                    vec!["https://test.com/unsub?token=old"],
                     vec!["mailto:unsub@test.com"],
                     false, "", vec![],
                 ),
@@ -597,7 +599,7 @@ mod tests {
                 "a@test.com".to_string(),
                 make_sender(
                     "a@test.com", 1,
-                    vec!["https://test.com/unsub", "https://test.com/unsub2"],
+                    vec!["https://test.com/unsub?token=new"],
                     vec!["mailto:unsub@test.com"],
                     false, "", vec![],
                 ),
@@ -609,8 +611,53 @@ mod tests {
         merge_folder_result(&mut combined, folder2);
 
         let sender = &combined["a@test.com"];
-        assert_eq!(sender.unsubscribe_urls.len(), 2);
+        // folder2's URL replaces folder1's
+        assert_eq!(sender.unsubscribe_urls, vec!["https://test.com/unsub?token=new"]);
+        // mailtos are still deduped
         assert_eq!(sender.unsubscribe_mailto.len(), 1);
+    }
+
+    #[test]
+    fn merge_most_recent_url_wins_across_folders() {
+        // Verify the specific scenario: a sender with different URLs per folder —
+        // the last-merged folder's URL is the one that wins.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let old_folder = FolderResult {
+            senders: HashMap::from([(
+                "news@example.com".to_string(),
+                make_sender(
+                    "news@example.com", 1,
+                    vec!["https://example.com/unsub?t=expired"],
+                    vec![],
+                    false, "Example", vec![],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        let new_folder = FolderResult {
+            senders: HashMap::from([(
+                "news@example.com".to_string(),
+                make_sender(
+                    "news@example.com", 1,
+                    vec!["https://example.com/unsub?t=fresh"],
+                    vec![],
+                    false, "Example", vec![],
+                ),
+            )]),
+            warnings: vec![],
+        };
+
+        merge_folder_result(&mut combined, old_folder);
+        merge_folder_result(&mut combined, new_folder);
+
+        let sender = &combined["news@example.com"];
+        assert_eq!(
+            sender.unsubscribe_urls,
+            vec!["https://example.com/unsub?t=fresh"],
+            "most recently merged folder's URL should win"
+        );
     }
 
     #[test]
