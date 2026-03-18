@@ -182,8 +182,11 @@ fn make_provider(
                            Run `unsubscribe init` to reconfigure your account.")
                 }
             };
+            let host = account.host.as_deref().context(
+                "IMAP account is missing a host. Run `unsubscribe init` to reconfigure."
+            )?;
             Ok(Box::new(unsubscribe_email::ImapProvider::new(
-                account.host.clone(),
+                host.to_string(),
                 account.port.unwrap_or(993),
                 account.username.clone(),
                 password,
@@ -308,11 +311,9 @@ fn init_gmail(config_dir: &Path) -> Result<()> {
     credential_store.store_credential(&username, &credential)?;
     eprintln!("  {GREEN}OAuth tokens stored in OS keychain{RESET}");
 
-    // Gmail API does not use host/port, but the config schema requires them.
-    // Use placeholders that make it clear they are unused.
     config_store.write_init(
-        "gmail.googleapis.com",
-        443,
+        None,
+        None,
         &username,
         &ProviderType::Gmail,
         &AuthType::OAuth,
@@ -361,8 +362,8 @@ fn init_imap(config_dir: &Path) -> Result<()> {
 
     // Write config file (without password)
     config_store.write_init(
-        &host,
-        port,
+        Some(&host),
+        Some(port),
         &username,
         &ProviderType::Imap,
         &AuthType::Password,
@@ -437,7 +438,8 @@ fn reauth_imap(config_dir: &Path, account: &AccountConfig) -> Result<()> {
     eprintln!("{BOLD}Update IMAP credentials{RESET}");
     eprintln!("{DIM}Press Enter to keep current value{RESET}\n");
 
-    let host = prompt("IMAP host", &account.host)?;
+    let host_default = account.host.as_deref().unwrap_or("imap.zoho.com");
+    let host = prompt("IMAP host", host_default)?;
     let port_default = account.port.unwrap_or(993).to_string();
     let port = prompt("IMAP port", &port_default)?;
     let username = prompt("Email address", &account.username)?;
@@ -466,8 +468,8 @@ fn reauth_imap(config_dir: &Path, account: &AccountConfig) -> Result<()> {
 
     new_credential_store.store_credential(&username, &Credential::Password(password))?;
     config_store.write_init(
-        &host,
-        port,
+        Some(&host),
+        Some(port),
         &username,
         &ProviderType::Imap,
         &AuthType::Password,
