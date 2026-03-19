@@ -365,6 +365,8 @@ username = "id@example.com"
             auth_type: AuthType::Password,
             scan_folders: vec!["INBOX".into(), "Bulk Mail".into()],
             archive_folder: "Archive".into(),
+            smtp_host: None,
+            smtp_port: None,
         };
 
         store.write_config(&original).unwrap();
@@ -400,6 +402,8 @@ password = "s3cret"
             auth_type: AuthType::Password,
             scan_folders: vec!["INBOX".into()],
             archive_folder: "Unsubscribed".into(),
+            smtp_host: None,
+            smtp_port: None,
         };
         store.write_config(&config).unwrap();
 
@@ -422,6 +426,8 @@ password = "s3cret"
             auth_type: AuthType::Password,
             scan_folders: vec!["INBOX".into()],
             archive_folder: "Unsubscribed".into(),
+            smtp_host: None,
+            smtp_port: None,
         };
         store.write_config(&config).unwrap();
         assert!(nested.join("config.toml").exists());
@@ -443,6 +449,8 @@ password = "s3cret"
                 &AuthType::Password,
                 vec!["INBOX".into()],
                 "Unsubscribed",
+                None,
+                None,
             )
             .unwrap();
 
@@ -480,6 +488,8 @@ password = "s3cret"
                 &AuthType::OAuth,
                 vec!["INBOX".into()],
                 "Unsubscribed",
+                None,
+                None,
             )
             .unwrap();
 
@@ -504,6 +514,8 @@ password = "s3cret"
                 &AuthType::Password,
                 vec!["INBOX".into()],
                 "Unsubscribed",
+                None,
+                None,
             )
             .unwrap();
 

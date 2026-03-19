@@ -1205,15 +1205,15 @@ mod tests {
         assert_eq!(id_a, "msg_a");
         assert_eq!(id_b, "msg_b");
 
-        let err_a = result_a.as_ref().unwrap_err().to_string();
-        let err_b = result_b.as_ref().unwrap_err().to_string();
-
-        // The status code must appear in the error message so callers can inspect it
-        assert!(err_a.contains("429"), "429 error should contain status code, got: {err_a}");
-        assert!(err_b.contains("404"), "404 error should contain status code, got: {err_b}");
-
-        // The two errors must not be identical — callers must be able to tell them apart
-        assert_ne!(err_a, err_b, "429 and 404 errors should produce distinct messages");
+        // 429 should produce RateLimited, 404 should produce Err
+        assert!(
+            matches!(result_a, BatchItemResult::RateLimited),
+            "429 should produce RateLimited variant"
+        );
+        assert!(
+            matches!(result_b, BatchItemResult::Err(_)),
+            "404 should produce Err variant, not RateLimited"
+        );
     }
 
     #[test]
@@ -1236,10 +1236,8 @@ mod tests {
         let results = parse_batch_response(&body, &ids).unwrap();
 
         assert_eq!(results.len(), 2, "both parts must be present in results");
-        assert!(results[0].1.is_ok(), "200 part should parse successfully");
-        assert!(results[1].1.is_err(), "429 part should be an error");
-        let err = results[1].1.as_ref().unwrap_err().to_string();
-        assert!(err.contains("429"), "error should include the 429 status code");
+        assert!(matches!(results[0].1, BatchItemResult::Ok(_)), "200 part should parse successfully");
+        assert!(matches!(results[1].1, BatchItemResult::RateLimited), "429 part should be RateLimited");
     }
 
     #[test]
@@ -1254,9 +1252,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let (id, result) = &results[0];
         assert_eq!(id, "missing_id");
-        assert!(result.is_err());
-        let err = result.as_ref().unwrap_err().to_string();
-        assert!(err.contains("404"), "404 error should name the status code, got: {err}");
+        assert!(matches!(result, BatchItemResult::Err(_)), "404 should produce Err variant");
     }
 
     #[test]
@@ -1267,11 +1263,9 @@ mod tests {
 
         let result = parse_single_batch_part(part_without_status);
 
-        assert!(result.is_err(), "part without HTTP status line should be an error");
-        let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("HTTP status line") || err.contains("HTTP/"),
-            "error message should mention the missing status line, got: {err}"
+            matches!(result, BatchItemResult::Err(_)),
+            "part without HTTP status line should be an error"
         );
     }
 
@@ -1283,7 +1277,10 @@ mod tests {
 
         let result = parse_single_batch_part(no_body_separator);
 
-        assert!(result.is_err(), "part without body separator should be an error");
+        assert!(
+            matches!(result, BatchItemResult::Err(_)),
+            "part without body separator should be an error"
+        );
     }
 
     #[test]
@@ -1319,7 +1316,7 @@ mod tests {
         // Only the paired entry should be present; msg2 is dropped
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "msg1");
-        assert!(results[0].1.is_ok());
+        assert!(matches!(results[0].1, BatchItemResult::Ok(_)));
     }
 
     #[test]

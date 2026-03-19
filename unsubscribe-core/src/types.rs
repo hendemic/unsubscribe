@@ -106,6 +106,7 @@ mod tests {
             one_click,
             email_count: 1,
             messages: Vec::new(),
+            last_seen: None,
         }
     }
 
