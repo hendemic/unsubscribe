@@ -194,6 +194,61 @@ pub fn parse_from_header(from: &str) -> (String, String) {
     (String::new(), from.to_string())
 }
 
+/// Parsed components from an RFC 6068 mailto URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct ParsedMailto {
+    /// Recipient email address
+    pub to: String,
+    /// Subject line (may be empty)
+    pub subject: String,
+    /// Message body (may be empty)
+    pub body: String,
+}
+
+/// Parse an RFC 6068 mailto URI into its components.
+///
+/// Handles the common formats found in List-Unsubscribe headers:
+/// - `mailto:unsub@example.com`
+/// - `mailto:unsub@example.com?subject=Unsubscribe`
+/// - `mailto:unsub@example.com?subject=Unsubscribe&body=Please%20remove%20me`
+///
+/// Query parameters are percent-decoded. Unknown parameters are ignored.
+#[must_use]
+pub fn parse_mailto(uri: &str) -> Option<ParsedMailto> {
+    let addr_and_query = uri.strip_prefix("mailto:")?;
+
+    let (to, query) = match addr_and_query.split_once('?') {
+        Some((to, q)) => (to, Some(q)),
+        None => (addr_and_query, None),
+    };
+
+    let to = url::form_urlencoded::parse(to.as_bytes())
+        .map(|(k, v)| if v.is_empty() { k } else { v })
+        .next()
+        .unwrap_or_else(|| to.into())
+        .into_owned();
+
+    if to.is_empty() {
+        return None;
+    }
+
+    let mut subject = String::new();
+    let mut body = String::new();
+
+    if let Some(query) = query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "subject" => subject = value.into_owned(),
+                "body" => body = value.into_owned(),
+                _ => {}
+            }
+        }
+    }
+
+    Some(ParsedMailto { to, subject, body })
+}
+
 /// Extract the domain from an email address, lowercased.
 ///
 /// Returns the full input lowercased if no `@` is found.
@@ -610,5 +665,67 @@ mod tests {
     #[test]
     fn domain_from_email_empty_input() {
         assert_eq!(domain_from_email(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_mailto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_mailto_simple() {
+        let result = parse_mailto("mailto:unsub@example.com").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "");
+        assert_eq!(result.body, "");
+    }
+
+    #[test]
+    fn parse_mailto_with_subject() {
+        let result = parse_mailto("mailto:unsub@example.com?subject=Unsubscribe").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsubscribe");
+        assert_eq!(result.body, "");
+    }
+
+    #[test]
+    fn parse_mailto_with_subject_and_body() {
+        let result = parse_mailto(
+            "mailto:unsub@example.com?subject=Unsubscribe&body=Please%20remove%20me",
+        )
+        .unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsubscribe");
+        assert_eq!(result.body, "Please remove me");
+    }
+
+    #[test]
+    fn parse_mailto_percent_encoded_subject() {
+        let result =
+            parse_mailto("mailto:unsub@example.com?subject=Please%20Unsubscribe%20Me").unwrap();
+        assert_eq!(result.subject, "Please Unsubscribe Me");
+    }
+
+    #[test]
+    fn parse_mailto_not_mailto_returns_none() {
+        assert!(parse_mailto("https://example.com").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_empty_address_returns_none() {
+        assert!(parse_mailto("mailto:").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_empty_address_with_query_returns_none() {
+        assert!(parse_mailto("mailto:?subject=Test").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_unknown_params_ignored() {
+        let result =
+            parse_mailto("mailto:unsub@example.com?subject=Unsub&cc=other@example.com").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsub");
+        assert_eq!(result.body, "");
     }
 }

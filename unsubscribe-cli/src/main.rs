@@ -45,6 +45,9 @@ enum Commands {
         /// Only include senders with at least this many emails
         #[arg(short, long, default_value = "3")]
         min_emails: u32,
+        /// Send unsubscribe emails for mailto-only senders
+        #[arg(long)]
+        mailto: bool,
     },
     /// Only scan and list senders with unsubscribe links
     Scan {
@@ -113,8 +116,8 @@ fn main() -> Result<()> {
     let (account, credential) = load_account(&config_dir)?;
 
     match cli.command {
-        Commands::Run { dry_run, min_emails } => {
-            cmd_run(&account, &credential, dry_run, min_emails)
+        Commands::Run { dry_run, min_emails, mailto } => {
+            cmd_run(&account, &credential, dry_run, min_emails, mailto)
         }
         Commands::Scan { min_emails } => cmd_scan(&account, &credential, min_emails),
         Commands::Export { output, min_emails } => {
@@ -223,6 +226,60 @@ fn make_provider(
                 access_token,
                 http_client,
                 &account.archive_folder,
+            )))
+        }
+    }
+}
+
+/// Create the appropriate email sender for mailto unsubscribe based on provider type.
+///
+/// Gmail users get `GmailSender` (sends via Gmail API). IMAP users get `SmtpSender`
+/// once SMTP support is added. Until then, IMAP users cannot use `--mailto`.
+fn make_email_sender(
+    account: &AccountConfig,
+    credential: &Credential,
+) -> Result<Box<dyn unsubscribe_core::EmailSender>> {
+    match account.provider_type {
+        ProviderType::Gmail => {
+            let access_token = match credential {
+                Credential::OAuthToken { access_token, .. } => access_token.clone(),
+                Credential::Password(_) => {
+                    bail!(
+                        "Gmail provider requires OAuth authentication for sending emails.\n\
+                         Run `unsubscribe reauth` to re-authenticate."
+                    )
+                }
+            };
+            let http_client = http::ReqwestHttpClient::new()?;
+            Ok(Box::new(unsubscribe_email::GmailSender::new(
+                &account.username,
+                access_token,
+                http_client,
+            )))
+        }
+        ProviderType::Imap => {
+            let password = match credential {
+                Credential::Password(p) => p.clone(),
+                Credential::OAuthToken { .. } => {
+                    bail!(
+                        "IMAP provider requires a password for SMTP sending.\n\
+                         Run `unsubscribe reauth` to reconfigure your account."
+                    )
+                }
+            };
+            let imap_host = account.host.as_deref().unwrap_or("localhost");
+            let smtp_host = account
+                .smtp_host
+                .clone()
+                .unwrap_or_else(|| unsubscribe_email::SmtpSender::derive_smtp_host(imap_host));
+            let smtp_port = account.smtp_port.unwrap_or(465);
+
+            Ok(Box::new(unsubscribe_email::SmtpSender::new(
+                &account.username,
+                smtp_host,
+                smtp_port,
+                &account.username,
+                password,
             )))
         }
     }
@@ -338,6 +395,8 @@ fn init_gmail(config_dir: &Path) -> Result<()> {
         &AuthType::OAuth,
         vec!["INBOX".to_string()],
         &archive,
+        None,
+        None,
     )?;
 
     eprintln!(
@@ -364,7 +423,13 @@ fn init_imap(config_dir: &Path) -> Result<()> {
     let folders = prompt("Folders to scan (comma-separated)", "INBOX")?;
     let archive = prompt("Archive folder", "Unsubscribed")?;
 
+    // Derive SMTP defaults from IMAP host
+    let smtp_default = host.replace("imap.", "smtp.");
+    let smtp_host_input = prompt("SMTP host (for mailto unsubscribe)", &smtp_default)?;
+    let smtp_port_input = prompt("SMTP port", "465")?;
+
     let port: u16 = port.parse().context("Invalid port number")?;
+    let smtp_port: u16 = smtp_port_input.parse().context("Invalid SMTP port number")?;
 
     let folders_vec: Vec<String> = folders
         .split(',')
@@ -388,6 +453,8 @@ fn init_imap(config_dir: &Path) -> Result<()> {
         &AuthType::Password,
         folders_vec,
         &archive,
+        Some(&smtp_host_input),
+        Some(smtp_port),
     )?;
 
     eprintln!(
@@ -494,6 +561,8 @@ fn reauth_imap(config_dir: &Path, account: &AccountConfig) -> Result<()> {
         &AuthType::Password,
         folders,
         &archive,
+        account.smtp_host.as_deref(),
+        account.smtp_port,
     )?;
 
     eprintln!("\n{GREEN}Credentials updated.{RESET}");
@@ -797,6 +866,7 @@ fn cmd_run(
     credential: &Credential,
     dry_run: bool,
     min_emails: u32,
+    mailto: bool,
 ) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
@@ -866,6 +936,13 @@ fn cmd_run(
             .collect()
     } else {
         let http_client = http::ReqwestHttpClient::new()?;
+
+        let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> = if mailto {
+            Some(make_email_sender(account, credential)?)
+        } else {
+            None
+        };
+
         let pb = ProgressBar::new(to_unsub.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -877,7 +954,11 @@ fn cmd_run(
         let results: Vec<UnsubscribeResult> = to_unsub
             .iter()
             .map(|sender| {
-                let result = unsubscribe_core::unsubscribe(&[sender], &http_client);
+                let result = unsubscribe_core::unsubscribe(
+                    &[sender],
+                    &http_client,
+                    email_sender.as_deref(),
+                );
                 pb.inc(1);
                 result.into_iter().next().expect("one sender produces one result")
             })
