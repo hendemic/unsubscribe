@@ -2409,6 +2409,7 @@ dependencies = [
  "semver",
  "serde_json",
  "sha2",
+ "tempfile",
  "unsubscribe-core",
  "unsubscribe-email",
  "unsubscribe-persistence",
@@ -2448,6 +2449,7 @@ dependencies = [
  "keyring",
  "log",
  "serde",
+ "tempfile",
  "toml",
  "unsubscribe-core",
 ]
