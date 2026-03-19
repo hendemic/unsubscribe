@@ -85,6 +85,88 @@ impl SenderInfo {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sender(urls: Vec<&str>, mailtos: Vec<&str>, one_click: bool) -> SenderInfo {
+        SenderInfo {
+            display_name: "Test Sender".to_string(),
+            email: "sender@example.com".to_string(),
+            domain: "example.com".to_string(),
+            unsubscribe_urls: urls.into_iter().map(str::to_string).collect(),
+            unsubscribe_mailto: mailtos.into_iter().map(str::to_string).collect(),
+            one_click,
+            email_count: 1,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn best_url_prefers_http_over_mailto() {
+        let sender = make_sender(
+            vec!["https://example.com/unsub"],
+            vec!["mailto:unsub@example.com"],
+            false,
+        );
+        assert_eq!(
+            sender.best_unsubscribe_url(),
+            Some("https://example.com/unsub")
+        );
+    }
+
+    #[test]
+    fn best_url_returns_first_http_when_multiple() {
+        let sender = make_sender(
+            vec!["https://first.example.com/unsub", "https://second.example.com/unsub"],
+            vec![],
+            false,
+        );
+        assert_eq!(
+            sender.best_unsubscribe_url(),
+            Some("https://first.example.com/unsub")
+        );
+    }
+
+    #[test]
+    fn best_url_falls_back_to_mailto_when_no_http() {
+        let sender = make_sender(vec![], vec!["mailto:unsub@example.com"], false);
+        assert_eq!(
+            sender.best_unsubscribe_url(),
+            Some("mailto:unsub@example.com")
+        );
+    }
+
+    #[test]
+    fn best_url_returns_none_when_both_empty() {
+        let sender = make_sender(vec![], vec![], false);
+        assert_eq!(sender.best_unsubscribe_url(), None);
+    }
+
+    #[test]
+    fn best_url_one_click_true_still_returns_http() {
+        // one_click only affects how the URL is used, not which URL is selected
+        let sender = make_sender(
+            vec!["https://example.com/unsub"],
+            vec!["mailto:unsub@example.com"],
+            true,
+        );
+        assert_eq!(
+            sender.best_unsubscribe_url(),
+            Some("https://example.com/unsub")
+        );
+    }
+
+    #[test]
+    fn best_url_one_click_false_with_only_http() {
+        let sender = make_sender(vec!["https://example.com/unsub"], vec![], false);
+        assert_eq!(
+            sender.best_unsubscribe_url(),
+            Some("https://example.com/unsub")
+        );
+    }
+}
+
 /// Result of scanning one or more folders.
 #[derive(Debug)]
 #[must_use]

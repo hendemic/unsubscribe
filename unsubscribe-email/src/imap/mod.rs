@@ -32,6 +32,26 @@ impl ImapProvider {
         Self { host, port, username, password }
     }
 
+    /// List all available mailbox names on the IMAP server.
+    ///
+    /// This is IMAP-specific and is not part of the `EmailProvider` trait — it exists
+    /// to help users discover valid folder names for use in `scan_folders` config.
+    pub fn list_folders(&self) -> Result<Vec<String>> {
+        let mut session = self.connect()?;
+
+        let names = session
+            .list(None, Some("*"))
+            .context("Failed to list IMAP folders")?;
+
+        let folders: Vec<String> = names
+            .iter()
+            .map(|name| name.name().to_string())
+            .collect();
+
+        session.logout().ok();
+        Ok(folders)
+    }
+
     fn connect(&self) -> Result<Session<TlsStream<TcpStream>>> {
         let tls = native_tls::TlsConnector::builder().build()?;
         let client = imap::connect(
