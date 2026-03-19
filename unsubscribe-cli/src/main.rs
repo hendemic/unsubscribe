@@ -994,12 +994,14 @@ fn cmd_run(
     }
 
     // Phase 1: Scan (or load from cache)
-    let (senders, warnings) = if cached {
+    let (senders, warnings, scan_timestamp) = if cached {
         let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
         eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
-        (senders, Vec::new())
+        (senders, Vec::new(), Some(timestamp))
     } else {
-        do_scan(account, credential, store, min_emails)?
+        let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
+        let timestamp = now_iso8601();
+        (senders, warnings, Some(timestamp))
     };
 
     if senders.is_empty() {
@@ -1017,7 +1019,7 @@ fn cmd_run(
 
     // Phase 2: TUI selection
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders)? {
+    let selections = match tui::select_senders(senders, scan_timestamp.as_deref())? {
         Some(s) => s,
         None => {
             eprintln!("{YELLOW}Cancelled.{RESET}");

@@ -55,6 +55,8 @@ struct App {
     cursor: usize,
     scroll_offset: usize,
     cancelled: bool,
+    /// Optional scan timestamp (ISO 8601) for display.
+    scan_timestamp: Option<String>,
 }
 
 impl App {
@@ -78,6 +80,7 @@ impl App {
             cursor: 1, // start on SelectAllActive, skip the header
             scroll_offset: 0,
             cancelled: false,
+            scan_timestamp: None,
         }
     }
 
@@ -86,12 +89,13 @@ impl App {
         self.active.len() + self.stale.len()
     }
 
-    /// Total rows including section headers:
+    /// Total rows including section headers and spacer:
     ///   ActiveHeader + SelectAllActive + active senders
-    ///   + StaleHeader + SelectAllStale + stale senders (if any)
+    ///   + Spacer + StaleHeader + SelectAllStale + stale senders (if any)
     fn total_rows(&self) -> usize {
         let active_section = 2 + self.active.len(); // header + select-all + senders
-        let stale_section = if self.stale.is_empty() { 0 } else { 2 + self.stale.len() };
+        // spacer + header + select-all + senders
+        let stale_section = if self.stale.is_empty() { 0 } else { 3 + self.stale.len() };
         active_section + stale_section
     }
 
@@ -110,12 +114,15 @@ impl App {
         let after_active = idx - self.active.len();
         if !self.stale.is_empty() {
             if after_active == 0 {
-                return RowKind::StaleHeader;
+                return RowKind::Spacer;
             }
             if after_active == 1 {
+                return RowKind::StaleHeader;
+            }
+            if after_active == 2 {
                 return RowKind::SelectAllStale;
             }
-            let stale_idx = after_active - 2;
+            let stale_idx = after_active - 3;
             if stale_idx < self.stale.len() {
                 return RowKind::Stale(stale_idx);
             }
@@ -137,7 +144,7 @@ impl App {
             }
             RowKind::Active(idx) => self.active_selected[idx] = !self.active_selected[idx],
             RowKind::Stale(idx) => self.stale_selected[idx] = !self.stale_selected[idx],
-            RowKind::ActiveHeader | RowKind::StaleHeader => {}
+            RowKind::ActiveHeader | RowKind::StaleHeader | RowKind::Spacer => {}
         }
     }
 
@@ -151,14 +158,14 @@ impl App {
         self.stale_selected.fill(false);
     }
 
-    fn is_header(&self, row: usize) -> bool {
-        matches!(self.row_kind(row), RowKind::ActiveHeader | RowKind::StaleHeader)
+    fn is_non_selectable(&self, row: usize) -> bool {
+        matches!(self.row_kind(row), RowKind::ActiveHeader | RowKind::StaleHeader | RowKind::Spacer)
     }
 
     fn move_up(&mut self) {
         if self.cursor > 1 {
             self.cursor -= 1;
-            if self.is_header(self.cursor) && self.cursor > 1 {
+            while self.is_non_selectable(self.cursor) && self.cursor > 1 {
                 self.cursor -= 1;
             }
         }
@@ -168,7 +175,7 @@ impl App {
         let max = self.total_rows().saturating_sub(1);
         if self.cursor < max {
             self.cursor += 1;
-            if self.is_header(self.cursor) && self.cursor < max {
+            while self.is_non_selectable(self.cursor) && self.cursor < max {
                 self.cursor += 1;
             }
         }
@@ -206,6 +213,7 @@ enum RowKind {
     ActiveHeader,
     SelectAllActive,
     Active(usize),
+    Spacer,
     StaleHeader,
     SelectAllStale,
     Stale(usize),
@@ -213,7 +221,10 @@ enum RowKind {
 
 /// Run the TUI selection screen. Returns the senders with their selection state.
 /// Selected = true means the user wants to unsubscribe (or archive-only for stale senders).
-pub fn select_senders(senders: Vec<SenderInfo>) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
+pub fn select_senders(
+    senders: Vec<SenderInfo>,
+    scan_timestamp: Option<&str>,
+) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
     enable_raw_mode()?;
     let _guard = TerminalGuard; // restores terminal on drop, even on error/panic
     let mut stdout = io::stdout();
@@ -222,6 +233,7 @@ pub fn select_senders(senders: Vec<SenderInfo>) -> anyhow::Result<Option<Vec<(Se
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(senders);
+    app.scan_timestamp = scan_timestamp.map(String::from);
 
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
@@ -472,18 +484,18 @@ mod tests {
     fn select_all_stale_row_is_navigable() {
         // With 1 active + 1 stale, rows are:
         //   ActiveHeader(0), SelectAllActive(1), Active(2),
-        //   StaleHeader(3), SelectAllStale(4), Stale(5)
+        //   Spacer(3), StaleHeader(4), SelectAllStale(5), Stale(6)
         let senders = vec![
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
         let mut app = App::new(senders);
         app.move_down(); // 2 (active sender)
-        app.move_down(); // 4 (select all stale — skips StaleHeader at 3)
-        assert_eq!(app.cursor, 4);
-        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllStale));
-        app.move_down(); // 5 (stale sender)
+        app.move_down(); // 5 (select all stale — skips Spacer+StaleHeader)
         assert_eq!(app.cursor, 5);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllStale));
+        app.move_down(); // 6 (stale sender)
+        assert_eq!(app.cursor, 6);
         assert!(matches!(app.row_kind(app.cursor), RowKind::Stale(0)));
     }
 
@@ -494,7 +506,7 @@ mod tests {
             make_stale_sender("stale@test.com", 3),
         ];
         let mut app = App::new(senders);
-        app.cursor = 4; // SelectAllStale
+        app.cursor = 5; // SelectAllStale
         app.toggle();
         assert!(app.stale_selected[0], "stale sender should be selected");
         assert!(!app.active_selected[0], "active sender should remain unselected");
@@ -556,13 +568,15 @@ mod tests {
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    let has_timestamp = app.scan_timestamp.is_some();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Min(5),   // list
-            Constraint::Length(3), // status bar
-            Constraint::Length(2), // help
+            Constraint::Length(3),                                  // title
+            Constraint::Length(if has_timestamp { 1 } else { 0 }), // scan timestamp
+            Constraint::Min(5),                                    // list
+            Constraint::Length(3),                                  // status bar
+            Constraint::Length(2),                                  // help
         ])
         .split(area);
 
@@ -573,8 +587,26 @@ fn draw(f: &mut Frame, app: &mut App) {
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(title, chunks[0]);
 
+    // Scan timestamp
+    if let Some(ts) = &app.scan_timestamp {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Parse ISO 8601 timestamp to check age
+        let is_stale_scan = parse_iso8601_age_secs(ts)
+            .map(|scan_secs| now_secs.saturating_sub(scan_secs) > 7 * 24 * 3600)
+            .unwrap_or(false);
+        let color = if is_stale_scan { Color::Red } else { Color::DarkGray };
+        let label = format!(" Last scanned: {ts}");
+        f.render_widget(
+            Paragraph::new(label).style(Style::default().fg(color)),
+            chunks[1],
+        );
+    }
+
     // Scrollable list
-    let visible_height = chunks[1].height as usize;
+    let visible_height = chunks[2].height as usize;
     let total_rows = app.total_rows();
 
     // Adjust scroll to keep cursor visible
@@ -614,6 +646,9 @@ fn draw(f: &mut Frame, app: &mut App) {
                 let selected = app.active_selected[idx];
                 items.push(sender_row(sender, selected, is_cursor));
             }
+            RowKind::Spacer => {
+                items.push(Line::raw(""));
+            }
             RowKind::StaleHeader => {
                 items.push(Line::styled(
                     " ── Stale Senders (archive only — URLs may be expired) ──",
@@ -649,7 +684,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let list = Paragraph::new(items).block(
         Block::default().borders(Borders::ALL).title(title_str),
     );
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, chunks[2]);
 
     // Status bar
     let status = Paragraph::new(format!(
@@ -658,16 +693,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.total_senders(),
         app.total_emails_selected(),
     ))
-    .style(Style::default().fg(Color::Yellow))
+    .style(Style::default().fg(Color::Cyan))
     .block(Block::default().borders(Borders::ALL));
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 
     // Help line
     let help = Paragraph::new(
         " Space: toggle | a: select all | n: deselect all | j/k: move | Enter: confirm | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(help, chunks[3]);
+    f.render_widget(help, chunks[4]);
 }
 
 fn sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Line<'static> {
@@ -730,6 +765,29 @@ fn truncate_str(s: &str, max: usize) -> String {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
         None => s.to_string(),
     }
+}
+
+/// Parse an ISO 8601 timestamp (e.g., "2026-03-18T19:30:00Z") into Unix seconds.
+fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
+    // Minimal parser for the format produced by now_iso8601(): YYYY-MM-DDThh:mm:ssZ
+    let b = ts.as_bytes();
+    if b.len() < 19 { return None; }
+    let year: i64 = ts.get(0..4)?.parse().ok()?;
+    let month: u32 = ts.get(5..7)?.parse().ok()?;
+    let day: u32 = ts.get(8..10)?.parse().ok()?;
+    let hour: u64 = ts.get(11..13)?.parse().ok()?;
+    let min: u64 = ts.get(14..16)?.parse().ok()?;
+    let sec: u64 = ts.get(17..19)?.parse().ok()?;
+
+    // Convert civil date to days since epoch (inverse of days_to_civil)
+    let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let day_count = era * 146097 + doe as i64 - 719468;
+
+    Some(day_count as u64 * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 const MONTH_NAMES: [&str; 12] = [
