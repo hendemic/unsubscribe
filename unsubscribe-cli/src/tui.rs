@@ -593,12 +593,12 @@ fn draw(f: &mut Frame, app: &mut App) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // Parse ISO 8601 timestamp to check age
         let is_stale_scan = parse_iso8601_age_secs(ts)
             .map(|scan_secs| now_secs.saturating_sub(scan_secs) > 7 * 24 * 3600)
             .unwrap_or(false);
         let color = if is_stale_scan { Color::Red } else { Color::DarkGray };
-        let label = format!(" Last scanned: {ts}");
+        let display_ts = utc_to_local_display(ts).unwrap_or_else(|| ts.clone());
+        let label = format!(" Last scanned: {display_ts}");
         f.render_widget(
             Paragraph::new(label).style(Style::default().fg(color)),
             chunks[1],
@@ -788,6 +788,29 @@ fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     let day_count = era * 146097 + doe as i64 - 719468;
 
     Some(day_count as u64 * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Convert a UTC ISO 8601 timestamp to a local-time display string.
+/// Uses libc::localtime_r for timezone conversion.
+fn utc_to_local_display(utc_ts: &str) -> Option<String> {
+    let unix_secs = parse_iso8601_age_secs(utc_ts)? as i64;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time_t = unix_secs as libc::time_t;
+    let result = unsafe { libc::localtime_r(&time_t, &mut tm) };
+    if result.is_null() {
+        return None;
+    }
+
+    let month_name = MONTH_NAMES.get(tm.tm_mon as usize)?;
+    Some(format!(
+        "{} {:02}, {} {:02}:{:02}",
+        month_name,
+        tm.tm_mday,
+        1900 + tm.tm_year,
+        tm.tm_hour,
+        tm.tm_min,
+    ))
 }
 
 const MONTH_NAMES: [&str; 12] = [
