@@ -26,9 +26,13 @@ pub struct MessageRef {
 
 /// Response from GET /gmail/v1/users/me/messages/{id}?format=metadata
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageMetadata {
     pub id: String,
     pub payload: Option<MessagePayload>,
+    /// Milliseconds since Unix epoch, returned as a string by the Gmail API.
+    #[serde(default)]
+    pub internal_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +53,14 @@ impl MessageMetadata {
         self.payload.as_ref()?.headers.iter().find_map(|h| {
             h.name.eq_ignore_ascii_case(name).then(|| h.value.as_str())
         })
+    }
+
+    /// Returns the message timestamp as Unix seconds, or `None` if not available.
+    pub fn timestamp_secs(&self) -> Option<i64> {
+        self.internal_date
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|ms| ms / 1000)
     }
 }
 

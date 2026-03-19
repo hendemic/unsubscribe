@@ -156,7 +156,10 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
     ///
     /// Gmail's batch endpoint accepts up to 100 individual requests as
     /// `multipart/mixed`. This is ~100x faster than one-request-per-message.
-    fn fetch_message_metadata_batch(&self, ids: &[String]) -> Result<Vec<(String, Result<MessageMetadata>)>> {
+    ///
+    /// Returns results as `BatchItemResult` so the caller can distinguish
+    /// 429-rate-limited items (retry candidates) from permanent failures.
+    fn fetch_message_metadata_batch(&self, ids: &[String]) -> Result<Vec<(String, BatchItemResult)>> {
         let boundary = "batch_unsub";
         let mut body = String::new();
 
@@ -171,13 +174,15 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
                  &metadataHeaders=List-Unsubscribe\
                  &metadataHeaders=List-Unsubscribe-Post HTTP/1.1\r\n\
                  \r\n"
+                // Note: internalDate is returned in the message object itself,
+                // not as a metadata header — no need to request it via metadataHeaders.
             ));
         }
         body.push_str(&format!("--{boundary}--\r\n"));
 
         let content_type = format!("multipart/mixed; boundary={boundary}");
 
-        // Retry with exponential backoff on 429 rate limit errors
+        // Retry whole-batch 429 errors with exponential backoff
         let mut attempt = 0;
         let response = loop {
             let resp = self
@@ -252,6 +257,9 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
     /// Uses Gmail's `^unsub` system label to find messages Gmail has identified
     /// as bulk email. The `folders` parameter is ignored; Gmail's label covers
     /// all mail.
+    ///
+    /// Individual sub-request 429 errors are retried with exponential backoff
+    /// and reduced batch sizes. See acceptance criteria for retry bounds.
     fn scan(&self, _folders: &[Folder], progress: &dyn ScanProgress) -> Result<ScanResult> {
         let inbox = Folder::new("Gmail");
 
@@ -263,18 +271,26 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
         let mut senders: HashMap<String, SenderInfo> = HashMap::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        // Fetch metadata in batches of 50 with rate-limit delays.
+        // Fetch metadata in batches of 50 with adaptive rate-limit delays.
         // Gmail counts each sub-request against quota, so 50 per batch
         // with a pause between avoids 429 Too Many Requests errors.
+        let default_batch_size: usize = 50;
+        let min_retry_batch_size: usize = 10;
+        let max_retries: u32 = 3;
+        let retry_total_cap = Duration::from_secs(60);
+
         let mut delay = Duration::from_millis(250);
-        for (i, chunk) in message_ids.chunks(50).enumerate() {
+        let mut retry_start: Option<std::time::Instant> = None;
+
+        for (i, chunk) in message_ids.chunks(default_batch_size).enumerate() {
             if i > 0 {
                 thread::sleep(delay);
             }
+
             let batch_results = match self.fetch_message_metadata_batch(chunk) {
                 Ok(results) => results,
                 Err(e) => {
-                    // Escalate delay on batch-level failures (likely rate limit)
+                    // Whole-batch failure (network or batch-level 429 already retried)
                     delay = (delay * 2).min(Duration::from_secs(4));
                     warnings.push(format!("Batch fetch failed: {e}"));
                     progress.on_messages_scanned(&inbox, chunk.len() as u32);
@@ -282,96 +298,115 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
                 }
             };
 
-            // Check if any sub-requests hit rate limits and adjust delay
-            let had_errors = batch_results.iter().any(|(_, r)| r.is_err());
-            if had_errors {
-                delay = (delay * 2).min(Duration::from_secs(4));
-            } else if delay > Duration::from_millis(250) {
-                // Ease back down after a clean batch
-                delay = Duration::from_millis(250);
-            }
+            // Collect IDs that got per-message 429s for retry
+            let mut to_retry: Vec<String> = Vec::new();
+            let mut had_rate_limits = false;
 
             for (id, result) in batch_results {
-            let meta = match result {
-                Ok(m) => m,
-                Err(e) => {
-                    let w = format!("Failed to fetch message {id}: {e}");
-                    if !warnings.contains(&w) {
-                        warnings.push(w);
+                match result {
+                    BatchItemResult::Ok(meta) => {
+                        self.process_message_metadata(
+                            &id, meta, &mut senders, &mut warnings, &inbox, progress,
+                        );
                     }
-                    progress.on_messages_scanned(&inbox, 1);
-                    continue;
-                }
-            };
-
-            let Some(unsub_header) = meta.header("List-Unsubscribe") else {
-                progress.on_messages_scanned(&inbox, 1);
-                continue;
-            };
-            let unsub_header = unsub_header.to_string();
-
-            let has_one_click = meta.header("List-Unsubscribe-Post").is_some();
-
-            let Some(from_header) = meta.header("From") else {
-                progress.on_messages_scanned(&inbox, 1);
-                continue;
-            };
-
-            let (sender_name, sender_email) = parse_from_header(from_header);
-
-            let parsed_unsub = parse_list_unsubscribe(&unsub_header, &sender_email);
-            if let Some(w) = parsed_unsub.warning {
-                if !warnings.contains(&w) {
-                    warnings.push(w);
+                    BatchItemResult::RateLimited => {
+                        had_rate_limits = true;
+                        to_retry.push(id);
+                        // Do not report progress here — will be reported after retry
+                    }
+                    BatchItemResult::Err(e) => {
+                        let w = format!("Failed to fetch message {id}: {e}");
+                        if !warnings.contains(&w) {
+                            warnings.push(w);
+                        }
+                        progress.on_messages_scanned(&inbox, 1);
+                    }
                 }
             }
-            let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
 
-            // Gmail message IDs are opaque strings — use directly as MessageId
-            let message_id = MessageId::new(id.clone());
-
-            let sender_key = sender_email.to_lowercase();
-            let entry = senders.entry(sender_key).or_insert_with(|| {
-                let domain = domain_from_email(&sender_email);
-                SenderInfo {
-                    display_name: sender_name.clone(),
-                    email: sender_email.clone(),
-                    domain,
-                    unsubscribe_urls: Vec::new(),
-                    unsubscribe_mailto: Vec::new(),
-                    one_click: false,
-                    email_count: 0,
-                    messages: Vec::new(),
+            // Per-message retry loop for 429'd IDs
+            if !to_retry.is_empty() {
+                had_rate_limits = true;
+                if retry_start.is_none() {
+                    retry_start = Some(std::time::Instant::now());
                 }
-            });
 
-            // Gmail returns messages newest-first. The first URLs we encounter
-            // for a sender are the freshest — preserve them and skip older ones.
-            if entry.unsubscribe_urls.is_empty() && !urls.is_empty() {
-                entry.unsubscribe_urls = urls;
-            }
-            for m in mailtos {
-                if !entry.unsubscribe_mailto.contains(&m) {
-                    entry.unsubscribe_mailto.push(m);
+                let mut retry_batch_size = (default_batch_size / 2).max(min_retry_batch_size);
+                let mut attempt = 0u32;
+                let mut remaining = to_retry.clone();
+
+                while !remaining.is_empty() && attempt < max_retries {
+                    // Check total retry time budget
+                    if retry_start.map(|s| s.elapsed() > retry_total_cap).unwrap_or(false) {
+                        break;
+                    }
+
+                    let backoff = Duration::from_secs(2u64.pow(attempt));
+                    thread::sleep(backoff);
+                    attempt += 1;
+
+                    let mut still_failing: Vec<String> = Vec::new();
+
+                    for retry_chunk in remaining.chunks(retry_batch_size) {
+                        match self.fetch_message_metadata_batch(retry_chunk) {
+                            Ok(retry_results) => {
+                                for (id, result) in retry_results {
+                                    match result {
+                                        BatchItemResult::Ok(meta) => {
+                                            self.process_message_metadata(
+                                                &id, meta, &mut senders, &mut warnings,
+                                                &inbox, progress,
+                                            );
+                                        }
+                                        BatchItemResult::RateLimited => {
+                                            still_failing.push(id);
+                                        }
+                                        BatchItemResult::Err(e) => {
+                                            let w = format!("Failed to fetch message {id}: {e}");
+                                            if !warnings.contains(&w) {
+                                                warnings.push(w);
+                                            }
+                                            progress.on_messages_scanned(&inbox, 1);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Whole retry batch failed — treat all as still failing
+                                warnings.push(format!("Retry batch failed: {e}"));
+                                still_failing.extend_from_slice(retry_chunk);
+                            }
+                        }
+                    }
+
+                    remaining = still_failing;
+                    // Reduce retry batch size further on continued failures
+                    retry_batch_size = retry_batch_size.saturating_sub(10).max(min_retry_batch_size);
+                }
+
+                // Report any messages that exhausted retries
+                if !remaining.is_empty() {
+                    let n = remaining.len();
+                    let msg = format!(
+                        "{n} message(s) could not be fetched after {attempt} retries due to rate limiting"
+                    );
+                    if !warnings.contains(&msg) {
+                        warnings.push(msg);
+                    }
+                    // These messages were never counted in progress — count them now
+                    progress.on_messages_scanned(&inbox, n as u32);
                 }
             }
-            if has_one_click {
-                entry.one_click = true;
-            }
-            entry.email_count += 1;
-            entry.messages.push(FolderMessage {
-                // Gmail doesn't have IMAP-style folders; use a placeholder
-                folder: Folder::new("INBOX"),
-                message_id,
-            });
 
-            if entry.display_name.is_empty() && !sender_name.is_empty() {
-                entry.display_name = sender_name;
+            // Adjust inter-batch delay based on rate limit presence
+            if had_rate_limits {
+                delay = (delay * 2).min(Duration::from_secs(4));
+            } else {
+                // Ease back down after a clean batch
+                delay = Duration::from_millis(250);
+                retry_start = None; // reset retry budget window after a clean batch
             }
-
-            progress.on_messages_scanned(&inbox, 1);
-            } // end for (id, result) in batch_results
-        } // end for chunk in message_ids.chunks(50)
+        }
 
         progress.on_folder_done(&inbox);
 
@@ -416,6 +451,92 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
     }
 }
 
+impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
+    /// Process a successfully-fetched message metadata, updating sender aggregation maps.
+    fn process_message_metadata(
+        &self,
+        id: &str,
+        meta: MessageMetadata,
+        senders: &mut HashMap<String, SenderInfo>,
+        warnings: &mut Vec<String>,
+        inbox: &Folder,
+        progress: &dyn ScanProgress,
+    ) {
+        let Some(unsub_header) = meta.header("List-Unsubscribe") else {
+            progress.on_messages_scanned(inbox, 1);
+            return;
+        };
+        let unsub_header = unsub_header.to_string();
+
+        let has_one_click = meta.header("List-Unsubscribe-Post").is_some();
+
+        let Some(from_header) = meta.header("From") else {
+            progress.on_messages_scanned(inbox, 1);
+            return;
+        };
+
+        let (sender_name, sender_email) = parse_from_header(from_header);
+
+        let parsed_unsub = parse_list_unsubscribe(&unsub_header, &sender_email);
+        if let Some(w) = parsed_unsub.warning {
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+        let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
+
+        let message_id = MessageId::new(id.to_string());
+        let msg_timestamp = meta.timestamp_secs();
+
+        let sender_key = sender_email.to_lowercase();
+        let entry = senders.entry(sender_key).or_insert_with(|| {
+            let domain = domain_from_email(&sender_email);
+            SenderInfo {
+                display_name: sender_name.clone(),
+                email: sender_email.clone(),
+                domain,
+                unsubscribe_urls: Vec::new(),
+                unsubscribe_mailto: Vec::new(),
+                one_click: false,
+                email_count: 0,
+                messages: Vec::new(),
+                last_seen: None,
+            }
+        });
+
+        // Gmail returns messages newest-first. The first URLs we encounter
+        // for a sender are the freshest — preserve them and skip older ones.
+        if entry.unsubscribe_urls.is_empty() && !urls.is_empty() {
+            entry.unsubscribe_urls = urls;
+        }
+        for m in mailtos {
+            if !entry.unsubscribe_mailto.contains(&m) {
+                entry.unsubscribe_mailto.push(m);
+            }
+        }
+        if has_one_click {
+            entry.one_click = true;
+        }
+        entry.email_count += 1;
+        entry.messages.push(FolderMessage {
+            folder: Folder::new("INBOX"),
+            message_id,
+        });
+
+        entry.last_seen = match (entry.last_seen, msg_timestamp) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, ts) => ts,
+            (existing, None) => existing,
+        };
+
+        if entry.display_name.is_empty() && !sender_name.is_empty() {
+            entry.display_name = sender_name;
+        }
+
+        progress.on_messages_scanned(inbox, 1);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------
@@ -441,15 +562,26 @@ fn percent_encode_label(label: &str) -> String {
 // Batch response parsing
 // ---------------------------------------------------------------------------
 
+/// The outcome of a single sub-request within a Gmail batch response.
+enum BatchItemResult {
+    /// Successfully parsed message metadata.
+    Ok(MessageMetadata),
+    /// Sub-request was rate-limited (HTTP 429). Caller should retry this message ID.
+    RateLimited,
+    /// Other error (4xx or 5xx that is not 429, or a parse failure). Do not retry.
+    Err(anyhow::Error),
+}
+
 /// Parse a Gmail batch API `multipart/mixed` response into individual results.
 ///
 /// Each part contains an HTTP response with status line, headers, and a JSON body.
 /// We extract the status code and body, then deserialize successful responses
-/// into `MessageMetadata`.
+/// into `MessageMetadata`. 429 sub-request errors are represented as
+/// `BatchItemResult::RateLimited` so the caller can retry them separately.
 fn parse_batch_response(
     body: &str,
     ids: &[String],
-) -> Result<Vec<(String, Result<MessageMetadata>)>> {
+) -> Result<Vec<(String, BatchItemResult)>> {
     // Extract boundary from the response body — find the first line starting
     // with "--". Google may include leading whitespace or blank lines.
     let boundary = body
@@ -476,8 +608,6 @@ fn parse_batch_response(
             None => break,
         };
 
-        // Find the JSON body — everything after the blank line that follows
-        // the inner HTTP response headers
         let result = parse_single_batch_part(part);
         results.push((id, result));
     }
@@ -485,7 +615,7 @@ fn parse_batch_response(
     Ok(results)
 }
 
-/// Parse a single part from a batch response into a `MessageMetadata`.
+/// Parse a single part from a batch response.
 ///
 /// Each part has the structure:
 /// ```text
@@ -496,10 +626,27 @@ fn parse_batch_response(
 /// <blank line>
 /// <JSON body>
 /// ```
-fn parse_single_batch_part(part: &str) -> Result<MessageMetadata> {
-    // Split on double newline to separate headers from body sections.
+///
+/// Returns `BatchItemResult::RateLimited` for 429 status codes so the
+/// caller knows to retry the affected message ID.
+fn parse_single_batch_part(part: &str) -> BatchItemResult {
+    let result = parse_single_batch_part_inner(part);
+    match result {
+        Ok(meta) => BatchItemResult::Ok(meta),
+        Err(e) => {
+            // Check if the error message indicates a 429
+            let msg = format!("{e}");
+            if msg.contains("HTTP 429") {
+                BatchItemResult::RateLimited
+            } else {
+                BatchItemResult::Err(e)
+            }
+        }
+    }
+}
+
+fn parse_single_batch_part_inner(part: &str) -> Result<MessageMetadata> {
     // The part has: MIME headers \n\n HTTP response (status + headers \n\n body)
-    // Find the HTTP status line
     let http_start = part
         .find("HTTP/")
         .context("No HTTP status line in batch part")?;

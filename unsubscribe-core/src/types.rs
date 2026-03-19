@@ -74,6 +74,12 @@ pub struct SenderInfo {
     pub email_count: u32,
     /// All messages from this sender, each tagged with its folder
     pub messages: Vec<FolderMessage>,
+    /// Unix timestamp (seconds) of the most recent message from this sender.
+    ///
+    /// `None` when the adapter did not provide date information. Consumers use
+    /// this to decide whether to treat the sender as stale — core imposes no
+    /// staleness threshold.
+    pub last_seen: Option<i64>,
 }
 
 impl SenderInfo {
