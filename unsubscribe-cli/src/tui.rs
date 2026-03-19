@@ -651,7 +651,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             }
             RowKind::StaleHeader => {
                 items.push(Line::styled(
-                    " ── Stale Senders (archive only — URLs may be expired) ──",
+                    " ── Stale Senders ──",
                     Style::default().fg(Color::Yellow).bold(),
                 ));
             }
@@ -676,9 +676,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let title_str = if app.stale.is_empty() {
-        " Senders (checked = unsubscribe) "
+        " Senders (checked = unsubscribe and archive) "
     } else {
-        " Senders (checked = unsubscribe / archive-only for stale) "
+        " Senders (checked = unsubscribe and archive / archive-only for stale) "
     };
 
     let list = Paragraph::new(items).block(
@@ -753,7 +753,7 @@ fn stale_sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Lin
     let style = if is_cursor {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     } else if selected {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::DarkGray)
     };
