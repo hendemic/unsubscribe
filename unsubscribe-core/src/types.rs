@@ -262,6 +262,10 @@ pub struct AccountConfig {
     pub scan_folders: Vec<String>,
     /// Folder to move archived messages into
     pub archive_folder: String,
+    /// SMTP host for sending unsubscribe emails (optional, derived from IMAP host if absent)
+    pub smtp_host: Option<String>,
+    /// SMTP port for sending unsubscribe emails (optional, defaults to 465 for SMTPS)
+    pub smtp_port: Option<u16>,
 }
 
 /// A stored credential, supporting passwords today and OAuth tokens in the future.

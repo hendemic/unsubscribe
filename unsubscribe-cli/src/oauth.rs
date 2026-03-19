@@ -35,8 +35,8 @@ const EXPIRY_BUFFER_SECS: u64 = 60;
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// Scope for reading message headers and modifying labels (archive).
-const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// Scope for reading message headers, modifying labels (archive), and sending emails (mailto unsubscribe).
+const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
 
 /// The result of a successful OAuth authorization code flow.
 #[derive(Debug)]

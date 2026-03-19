@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use unsubscribe_core::{
-    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, Folder,
-    FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
+    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, EmailSender,
+    Folder, FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
 };
 
 use api::{
@@ -534,6 +534,80 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
         }
 
         progress.on_messages_scanned(inbox, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GmailSender — EmailSender via users.messages.send
+// ---------------------------------------------------------------------------
+
+/// Gmail API adapter for the `EmailSender` trait.
+///
+/// Sends emails via the Gmail `users.messages.send` endpoint. Requires an
+/// OAuth2 access token with the `gmail.send` scope. Existing users who only
+/// have `gmail.modify` will need to re-authenticate to gain send permission.
+pub struct GmailSender<C: unsubscribe_core::HttpClient> {
+    /// The `From` address used in outgoing messages.
+    from_address: String,
+    access_token: String,
+    http: C,
+}
+
+impl<C: unsubscribe_core::HttpClient> GmailSender<C> {
+    pub fn new(
+        from_address: impl Into<String>,
+        access_token: impl Into<String>,
+        http: C,
+    ) -> Self {
+        Self {
+            from_address: from_address.into(),
+            access_token: access_token.into(),
+            http,
+        }
+    }
+
+    /// Build a minimal RFC 2822 message and base64url-encode it for the Gmail API.
+    fn build_raw_message(&self, to: &str, subject: &str, body: &str) -> String {
+        let message = format!(
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{}",
+            self.from_address, to, subject, body
+        );
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(message.as_bytes())
+    }
+}
+
+impl<C: unsubscribe_core::HttpClient> EmailSender for GmailSender<C> {
+    fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<()> {
+        let raw = self.build_raw_message(to, subject, body);
+        let request_body = format!(r#"{{"raw":"{}"}}"#, raw);
+
+        let url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
+        let response = self
+            .http
+            .post_body_with_headers(
+                url,
+                "application/json",
+                &request_body,
+                &[("Authorization", &format!("Bearer {}", self.access_token))],
+            )
+            .context("Failed to send email via Gmail API")?;
+
+        if response.status == 401 {
+            bail!(
+                "Gmail API returned 401 Unauthorized — your access token may not include \
+                 the gmail.send scope. Run `unsubscribe reauth` to re-authenticate."
+            );
+        }
+        if response.status >= 400 {
+            bail!(
+                "Gmail API send error {}: {}",
+                response.status,
+                response.body
+            );
+        }
+
+        Ok(())
     }
 }
 

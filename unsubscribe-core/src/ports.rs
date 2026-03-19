@@ -70,6 +70,21 @@ pub trait HttpClient {
     ) -> Result<HttpResponse>;
 }
 
+/// Port for sending emails on behalf of the user.
+///
+/// Used for mailto-based unsubscribe flows where the unsubscribe mechanism
+/// requires sending an email rather than visiting a URL. Adapters implement
+/// this trait separately from `EmailProvider` because sending is a distinct
+/// concern from scanning/archiving.
+///
+/// Gmail provides this via `users.messages.send`. IMAP users provide this
+/// via SMTP. The trait is optional in the unsubscribe flow -- when absent,
+/// mailto-only senders are skipped as before.
+pub trait EmailSender {
+    /// Send an email with the given recipient, subject, and body.
+    fn send_email(&self, to: &str, subject: &str, body: &str) -> Result<()>;
+}
+
 /// Port for reading and writing account configuration.
 ///
 /// CLI implements this with TOML files. iOS will use CoreData/SwiftData.

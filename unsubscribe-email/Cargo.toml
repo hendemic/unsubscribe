@@ -6,9 +6,10 @@ license = "GPL-3.0-only"
 authors = ["Mike Henderson"]
 
 [features]
-default = ["imap", "gmail"]
+default = ["imap", "gmail", "smtp"]
 imap = ["dep:imap", "dep:native-tls", "dep:openssl", "dep:mail-parser", "dep:chrono"]
-gmail = ["dep:serde_json"]
+gmail = ["dep:serde_json", "dep:base64"]
+smtp = ["dep:lettre"]
 
 [dependencies]
 unsubscribe-core = { path = "../unsubscribe-core" }
@@ -24,3 +25,7 @@ chrono = { version = "0.4", optional = true, default-features = false }
 
 # gmail feature deps
 serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# smtp feature deps
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }

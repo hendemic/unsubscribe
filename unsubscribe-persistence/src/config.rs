@@ -36,6 +36,12 @@ struct FileAccountConfig {
     /// Existing configs without this field default to "imap" for backwards compatibility.
     #[serde(default = "default_provider")]
     provider: String,
+    /// SMTP host for sending unsubscribe emails (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    smtp_host: Option<String>,
+    /// SMTP port for sending unsubscribe emails (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    smtp_port: Option<u16>,
 }
 
 fn default_provider() -> String {
@@ -142,6 +148,8 @@ impl TomlConfigStore {
         auth_type: &AuthType,
         folders: Vec<String>,
         archive_folder: &str,
+        smtp_host: Option<&str>,
+        smtp_port: Option<u16>,
     ) -> Result<()> {
         let auth_type_str = match auth_type {
             AuthType::OAuth => "oauth".to_string(),
@@ -162,6 +170,8 @@ impl TomlConfigStore {
                 password_command: None,
                 auth_type: auth_type_str,
                 provider: provider_str,
+                smtp_host: smtp_host.map(str::to_string),
+                smtp_port,
             },
             scan: FileScanConfig {
                 folders,
@@ -540,6 +550,8 @@ impl ConfigStore for TomlConfigStore {
             auth_type,
             scan_folders: file.scan.folders,
             archive_folder: file.scan.archive_folder,
+            smtp_host: file.account.smtp_host,
+            smtp_port: file.account.smtp_port,
         }))
     }
 
@@ -583,6 +595,8 @@ impl ConfigStore for TomlConfigStore {
                 password_command: existing_command,
                 auth_type: auth_type_str,
                 provider: provider_str,
+                smtp_host: config.smtp_host.clone(),
+                smtp_port: config.smtp_port,
             },
             scan: FileScanConfig {
                 folders: config.scan_folders.clone(),

@@ -1,7 +1,8 @@
 use scraper::{Html, Selector};
 use url::{Url, form_urlencoded};
 
-use crate::ports::HttpClient;
+use crate::parsing::parse_mailto;
+use crate::ports::{EmailSender, HttpClient};
 use crate::types::{SenderInfo, UnsubscribeResult};
 
 // ---------------------------------------------------------------------------
@@ -24,16 +25,28 @@ const UNSUB_KEYWORDS: &[&str] = &[
 /// Tries methods in priority order for each sender:
 /// 1. RFC 8058 one-click POST (if supported)
 /// 2. HTTP GET on the unsubscribe URL, with confirmation page follow-through
-/// 3. Reports mailto-only senders as skipped (sending email is a consumer concern)
+/// 3. Mailto via `EmailSender` (if provided)
+/// 4. Reports mailto-only senders as skipped when no `EmailSender` is available
 ///
 /// Core always executes -- dry-run filtering belongs in the consumer.
 #[must_use]
-pub fn unsubscribe(senders: &[&SenderInfo], http: &dyn HttpClient) -> Vec<UnsubscribeResult> {
-    senders.iter().map(|sender| unsubscribe_one(sender, http)).collect()
+pub fn unsubscribe(
+    senders: &[&SenderInfo],
+    http: &dyn HttpClient,
+    email_sender: Option<&dyn EmailSender>,
+) -> Vec<UnsubscribeResult> {
+    senders
+        .iter()
+        .map(|sender| unsubscribe_one(sender, http, email_sender))
+        .collect()
 }
 
 /// Run the unsubscribe flow for a single sender.
-fn unsubscribe_one(sender: &SenderInfo, http: &dyn HttpClient) -> UnsubscribeResult {
+fn unsubscribe_one(
+    sender: &SenderInfo,
+    http: &dyn HttpClient,
+    email_sender: Option<&dyn EmailSender>,
+) -> UnsubscribeResult {
     let fallback_url = sender
         .best_unsubscribe_url()
         .unwrap_or_default()
@@ -111,8 +124,41 @@ fn unsubscribe_one(sender: &SenderInfo, http: &dyn HttpClient) -> UnsubscribeRes
         }
     }
 
-    // Strategy 3: mailto-only senders
-    if !sender.unsubscribe_mailto.is_empty() {
+    // Strategy 3: mailto via EmailSender (if available)
+    if let Some(mailto_uri) = sender.unsubscribe_mailto.first() {
+        if let Some(sender_impl) = email_sender {
+            if let Some(parsed) = parse_mailto(mailto_uri) {
+                let subject = if parsed.subject.is_empty() {
+                    "Unsubscribe".to_string()
+                } else {
+                    parsed.subject
+                };
+                let body = if parsed.body.is_empty() {
+                    "Please unsubscribe this email address.".to_string()
+                } else {
+                    parsed.body
+                };
+
+                return match sender_impl.send_email(&parsed.to, &subject, &body) {
+                    Ok(()) => UnsubscribeResult {
+                        email: sender.email.clone(),
+                        method: "mailto (sent)".to_string(),
+                        success: true,
+                        detail: format!("Email sent to {}", parsed.to),
+                        url: fallback_url,
+                    },
+                    Err(e) => UnsubscribeResult {
+                        email: sender.email.clone(),
+                        method: "mailto (failed)".to_string(),
+                        success: false,
+                        detail: format!("Send failed: {e}"),
+                        url: fallback_url,
+                    },
+                };
+            }
+        }
+
+        // No EmailSender provided or mailto URI unparseable
         return UnsubscribeResult {
             email: sender.email.clone(),
             method: "mailto (skipped)".to_string(),
@@ -409,7 +455,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, "one-click POST");
         assert_eq!(result.detail, "HTTP 200");
@@ -426,7 +472,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, "one-click POST");
     }
@@ -449,7 +495,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         // POST errored, fell through to GET, GET also errored
         assert!(!result.success);
         assert_eq!(result.method, "GET");
@@ -467,7 +513,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, "GET");
         assert_eq!(result.detail, "HTTP 200");
@@ -491,7 +537,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, "form POST");
         assert!(result.detail.contains("confirmation form"));
@@ -512,7 +558,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, "confirm link");
     }
@@ -528,7 +574,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, "GET");
     }
@@ -544,7 +590,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         // 304 is in 300..400 range, so treated as success
         assert!(result.success);
     }
@@ -560,7 +606,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.detail, "HTTP 404");
     }
@@ -576,7 +622,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.detail, "HTTP 500");
     }
@@ -592,7 +638,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, "GET");
         assert!(result.detail.contains("DNS resolution failed"));
@@ -608,7 +654,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, "mailto (skipped)");
         assert!(result.detail.contains("mailto"));
@@ -619,7 +665,7 @@ mod tests {
         let http = MockHttpClient::new();
         let sender = make_sender("news@example.com", vec![], vec![], false);
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, "none");
         assert!(result.detail.contains("No unsubscribe URL found"));
@@ -637,7 +683,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http);
+        let result = unsubscribe_one(&sender, &http, None);
         assert_eq!(result.method, "one-click POST");
         assert!(result.success);
     }
@@ -651,7 +697,7 @@ mod tests {
         let sender_b = make_sender("b@b.com", vec!["https://b.com/unsub"], vec![], false);
         let senders: Vec<&SenderInfo> = vec![&sender_a, &sender_b];
 
-        let results = unsubscribe(&senders, &http);
+        let results = unsubscribe(&senders, &http, None);
         assert_eq!(results.len(), 2);
         assert!(results[0].success);
         assert!(results[1].success);

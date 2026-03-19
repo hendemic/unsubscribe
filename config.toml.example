@@ -12,6 +12,10 @@ username = "you@sample.com"
 auth_type = "password"
 # password_command = "pass show email/zoho"
 # password = "fallback-plaintext-password"  # not recommended
+# SMTP settings for mailto unsubscribe (used with --mailto flag)
+# If omitted, derived from IMAP host (imap.X -> smtp.X, port 465)
+# smtp_host = "smtp.sample.com"
+# smtp_port = 465
 
 [scan]
 # Folders to scan for unsubscribe links
