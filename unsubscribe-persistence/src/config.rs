@@ -202,6 +202,310 @@ pub struct PasswordResolutionInfo {
     pub password_command: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, ProviderType};
+
+    /// Write a config.toml with the given content into the tempdir and return the store.
+    fn store_with_content(dir: &TempDir, toml: &str) -> TomlConfigStore {
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml).unwrap();
+        TomlConfigStore::new(dir.path())
+    }
+
+    // ─── read_config ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_config_returns_none_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+        let result = store.read_config("irrelevant").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn read_config_parses_full_toml() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+auth_type = "password"
+provider = "imap"
+
+[scan]
+folders = ["INBOX", "Promotions"]
+archive_folder = "Done"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+
+        assert_eq!(config.host.as_deref(), Some("imap.example.com"));
+        assert_eq!(config.port, Some(993));
+        assert_eq!(config.username, "user@example.com");
+        assert_eq!(config.auth_type, AuthType::Password);
+        assert_eq!(config.provider_type, ProviderType::Imap);
+        assert_eq!(config.scan_folders, vec!["INBOX", "Promotions"]);
+        assert_eq!(config.archive_folder, "Done");
+    }
+
+    #[test]
+    fn read_config_applies_defaults_for_minimal_toml() {
+        let dir = TempDir::new().unwrap();
+        // Only required field is username; everything else should default.
+        let toml = r#"
+[account]
+username = "minimal@example.com"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+
+        assert_eq!(config.host, None);
+        assert_eq!(config.port, None);
+        assert_eq!(config.auth_type, AuthType::Password);
+        assert_eq!(config.provider_type, ProviderType::Imap);
+        assert_eq!(config.scan_folders, vec!["INBOX"]);
+        assert_eq!(config.archive_folder, "Unsubscribed");
+    }
+
+    #[test]
+    fn read_config_accepts_legacy_imap_section_alias() {
+        // Configs written before the [account] rename used [imap].
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[imap]
+username = "legacy@example.com"
+host = "imap.legacy.net"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+
+        assert_eq!(config.username, "legacy@example.com");
+        assert_eq!(config.host.as_deref(), Some("imap.legacy.net"));
+    }
+
+    #[test]
+    fn read_config_maps_oauth_auth_type() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[account]
+username = "oauth@example.com"
+auth_type = "oauth"
+provider = "gmail"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+
+        assert_eq!(config.auth_type, AuthType::OAuth);
+        assert_eq!(config.provider_type, ProviderType::Gmail);
+    }
+
+    #[test]
+    fn read_config_unknown_auth_type_falls_back_to_password() {
+        // Any unrecognised auth_type string should default to Password, not panic.
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[account]
+username = "x@example.com"
+auth_type = "xoauth2_future_value"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+        assert_eq!(config.auth_type, AuthType::Password);
+    }
+
+    #[test]
+    fn read_config_returns_error_for_malformed_toml() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_content(&dir, "this is not [ valid toml !!!");
+        let result = store.read_config("any");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_config_sets_account_id_to_username() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[account]
+username = "id@example.com"
+"#;
+        let store = store_with_content(&dir, toml);
+        let config = store.read_config("any").unwrap().unwrap();
+        // account_id is derived from username, not from the argument.
+        assert_eq!(config.account_id, "id@example.com");
+    }
+
+    // ─── write_config / round-trip ───────────────────────────────────────────────
+
+    #[test]
+    fn write_then_read_config_produces_identical_values() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+
+        let original = AccountConfig {
+            account_id: "rt@example.com".into(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.rt.com".into()),
+            port: Some(993),
+            username: "rt@example.com".into(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".into(), "Bulk Mail".into()],
+            archive_folder: "Archive".into(),
+        };
+
+        store.write_config(&original).unwrap();
+        let read_back = store.read_config("rt@example.com").unwrap().unwrap();
+
+        assert_eq!(read_back.host, original.host);
+        assert_eq!(read_back.port, original.port);
+        assert_eq!(read_back.username, original.username);
+        assert_eq!(read_back.auth_type, original.auth_type);
+        assert_eq!(read_back.provider_type, original.provider_type);
+        assert_eq!(read_back.scan_folders, original.scan_folders);
+        assert_eq!(read_back.archive_folder, original.archive_folder);
+    }
+
+    #[test]
+    fn write_config_preserves_existing_plaintext_password() {
+        // write_config must not strip a password field already in the file.
+        let dir = TempDir::new().unwrap();
+        let initial_toml = r#"
+[account]
+username = "pw@example.com"
+password = "s3cret"
+"#;
+        let store = store_with_content(&dir, initial_toml);
+
+        // Overwrite with write_config (which has no password field).
+        let config = AccountConfig {
+            account_id: "pw@example.com".into(),
+            provider_type: ProviderType::Imap,
+            host: None,
+            port: None,
+            username: "pw@example.com".into(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".into()],
+            archive_folder: "Unsubscribed".into(),
+        };
+        store.write_config(&config).unwrap();
+
+        let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(raw.contains("s3cret"), "password should be preserved after write_config");
+    }
+
+    #[test]
+    fn write_config_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        let store = TomlConfigStore::new(&nested);
+
+        let config = AccountConfig {
+            account_id: "mkdir@example.com".into(),
+            provider_type: ProviderType::Imap,
+            host: None,
+            port: None,
+            username: "mkdir@example.com".into(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".into()],
+            archive_folder: "Unsubscribed".into(),
+        };
+        store.write_config(&config).unwrap();
+        assert!(nested.join("config.toml").exists());
+    }
+
+    // ─── write_init ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn write_init_produces_valid_toml_with_imap_header() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+
+        store
+            .write_init(
+                Some("imap.example.com"),
+                Some(993),
+                "init@example.com",
+                &ProviderType::Imap,
+                &AuthType::Password,
+                vec!["INBOX".into()],
+                "Unsubscribed",
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        // Header comment should mention the keyring service.
+        assert!(raw.contains(KEYRING_SERVICE), "header should mention keyring service name");
+
+        // Should be parseable as valid TOML.
+        let parsed: FileConfig = toml::from_str(
+            // Strip leading comment lines so toml parser accepts it cleanly.
+            &raw.lines()
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write_init should produce valid TOML");
+
+        assert_eq!(parsed.account.username, "init@example.com");
+        assert_eq!(parsed.account.host.as_deref(), Some("imap.example.com"));
+        assert_eq!(parsed.account.port, Some(993));
+    }
+
+    #[test]
+    fn write_init_produces_gmail_header_for_gmail_provider() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+
+        store
+            .write_init(
+                None,
+                None,
+                "gmail@example.com",
+                &ProviderType::Gmail,
+                &AuthType::OAuth,
+                vec!["INBOX".into()],
+                "Unsubscribed",
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            raw.contains("Gmail"),
+            "IMAP header should not appear for Gmail provider"
+        );
+    }
+
+    #[test]
+    fn write_init_does_not_include_password_field() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+
+        store
+            .write_init(
+                Some("imap.example.com"),
+                Some(993),
+                "nopw@example.com",
+                &ProviderType::Imap,
+                &AuthType::Password,
+                vec!["INBOX".into()],
+                "Unsubscribed",
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        // password is skipped when None (skip_serializing_if).
+        assert!(
+            !raw.contains("password ="),
+            "write_init must not write a password field"
+        );
+    }
+}
+
 impl ConfigStore for TomlConfigStore {
     fn read_config(&self, account_id: &str) -> Result<Option<AccountConfig>> {
         let path = self.config_path(account_id);
