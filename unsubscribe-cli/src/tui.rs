@@ -34,14 +34,14 @@ impl Drop for TerminalGuard {
 
 /// State for the TUI selection screen.
 ///
-/// Senders are split into two sections: active senders (any) followed by stale
-/// senders (last message >12 months ago). A section header row separates them
-/// when both sections are non-empty.
+/// Senders are split into two sections: active senders followed by stale
+/// senders (last message >12 months ago). Each section has its own select-all
+/// toggle row.
 ///
 /// Row layout (0-indexed):
-///   0              — "Select All" row
+///   0              — "Select All Active" row
 ///   1..=n_active   — active sender rows
-///   n_active+1     — stale section header (only when n_stale > 0)
+///   n_active+1     — "Select All Stale" row (only when n_stale > 0)
 ///   n_active+2..   — stale sender rows
 struct App {
     /// Active senders (last_seen within 12 months, or unknown).
@@ -86,16 +86,17 @@ impl App {
         self.active.len() + self.stale.len()
     }
 
-    /// Total navigable rows: "Select All" + active senders + stale header (if any) + stale senders.
+    /// Total navigable rows:
+    ///   "Select All Active" + active senders + "Select All Stale" (if any) + stale senders.
     fn total_rows(&self) -> usize {
-        let header = if self.stale.is_empty() { 0 } else { 1 };
-        1 + self.active.len() + header + self.stale.len()
+        let stale_section = if self.stale.is_empty() { 0 } else { 1 + self.stale.len() };
+        1 + self.active.len() + stale_section
     }
 
     /// Resolve a visible row index into what it represents.
     fn row_kind(&self, row: usize) -> RowKind {
         if row == 0 {
-            return RowKind::SelectAll;
+            return RowKind::SelectAllActive;
         }
         let idx = row - 1;
         if idx < self.active.len() {
@@ -104,28 +105,30 @@ impl App {
         let after_active = idx - self.active.len();
         if !self.stale.is_empty() {
             if after_active == 0 {
-                return RowKind::StaleHeader;
+                return RowKind::SelectAllStale;
             }
             let stale_idx = after_active - 1;
             if stale_idx < self.stale.len() {
                 return RowKind::Stale(stale_idx);
             }
         }
-        RowKind::SelectAll // fallback, shouldn't happen
+        RowKind::SelectAllActive // fallback, shouldn't happen
     }
 
     fn toggle(&mut self) {
         match self.row_kind(self.cursor) {
-            RowKind::SelectAll => {
-                // Toggle all: if everything is selected, deselect; otherwise select all
+            RowKind::SelectAllActive => {
                 let all_sel = self.active_selected.iter().all(|&s| s)
-                    && self.stale_selected.iter().all(|&s| s);
+                    && !self.active_selected.is_empty();
                 self.active_selected.fill(!all_sel);
+            }
+            RowKind::SelectAllStale => {
+                let all_sel = self.stale_selected.iter().all(|&s| s)
+                    && !self.stale_selected.is_empty();
                 self.stale_selected.fill(!all_sel);
             }
             RowKind::Active(idx) => self.active_selected[idx] = !self.active_selected[idx],
             RowKind::Stale(idx) => self.stale_selected[idx] = !self.stale_selected[idx],
-            RowKind::StaleHeader => {} // section header is not selectable
         }
     }
 
@@ -142,10 +145,6 @@ impl App {
     fn move_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            // Skip over the stale section header (not selectable)
-            if matches!(self.row_kind(self.cursor), RowKind::StaleHeader) && self.cursor > 0 {
-                self.cursor -= 1;
-            }
         }
     }
 
@@ -153,14 +152,6 @@ impl App {
         let max = self.total_rows().saturating_sub(1);
         if self.cursor < max {
             self.cursor += 1;
-            // Skip over the stale section header (not selectable)
-            if matches!(self.row_kind(self.cursor), RowKind::StaleHeader) {
-                if self.cursor < max {
-                    self.cursor += 1;
-                } else {
-                    self.cursor -= 1;
-                }
-            }
         }
     }
 
@@ -193,9 +184,9 @@ impl App {
 
 #[derive(Debug, PartialEq)]
 enum RowKind {
-    SelectAll,
+    SelectAllActive,
     Active(usize),
-    StaleHeader,
+    SelectAllStale,
     Stale(usize),
 }
 
@@ -342,7 +333,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn toggle_on_row_zero_selects_all_when_any_unselected() {
+    fn toggle_select_all_active_selects_when_any_unselected() {
         let mut app = App::new(three_active_senders());
         assert_eq!(app.cursor, 0);
         app.toggle();
@@ -350,16 +341,16 @@ mod tests {
     }
 
     #[test]
-    fn toggle_on_row_zero_deselects_all_when_all_selected() {
+    fn toggle_select_all_active_deselects_when_all_selected() {
         let mut app = App::new(three_active_senders());
-        app.select_all();
+        app.active_selected.fill(true);
         assert_eq!(app.cursor, 0);
         app.toggle();
         assert!(app.active_selected.iter().all(|&s| !s));
     }
 
     #[test]
-    fn toggle_on_row_zero_selects_all_when_partially_selected() {
+    fn toggle_select_all_active_selects_when_partially_selected() {
         let mut app = App::new(three_active_senders());
         app.active_selected[0] = true;
         assert_eq!(app.cursor, 0);
@@ -457,34 +448,47 @@ mod tests {
     }
 
     #[test]
-    fn stale_header_row_is_skipped_by_navigation() {
-        // With 1 active + 1 stale, rows are: SelectAll(0), Active(1), StaleHeader(2), Stale(3)
+    fn select_all_stale_row_is_navigable() {
+        // With 1 active + 1 stale, rows are:
+        //   SelectAllActive(0), Active(1), SelectAllStale(2), Stale(3)
         let senders = vec![
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
         let mut app = App::new(senders);
-        // Navigate down past SelectAll, Active, then past StaleHeader (should skip it)
-        app.move_down(); // cursor=1 (active)
-        app.move_down(); // cursor should skip header to 3 (stale)
-        assert_eq!(app.cursor, 3, "stale header at row 2 should be skipped");
+        app.move_down(); // 1 (active sender)
+        app.move_down(); // 2 (select all stale)
+        assert_eq!(app.cursor, 2);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllStale));
+        app.move_down(); // 3 (stale sender)
+        assert_eq!(app.cursor, 3);
         assert!(matches!(app.row_kind(app.cursor), RowKind::Stale(0)));
     }
 
     #[test]
-    fn stale_header_row_is_skipped_when_navigating_up() {
+    fn toggle_select_all_stale_toggles_only_stale() {
         let senders = vec![
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
         let mut app = App::new(senders);
-        // Get to stale row
-        app.move_down(); // 1
-        app.move_down(); // 3 (skipped header at 2)
-        assert_eq!(app.cursor, 3);
-        // Navigate up — should skip the header again
-        app.move_up(); // should skip header to 1 (active)
-        assert_eq!(app.cursor, 1, "stale header should be skipped when moving up");
+        app.cursor = 2; // SelectAllStale
+        app.toggle();
+        assert!(app.stale_selected[0], "stale sender should be selected");
+        assert!(!app.active_selected[0], "active sender should remain unselected");
+    }
+
+    #[test]
+    fn toggle_select_all_active_toggles_only_active() {
+        let senders = vec![
+            make_sender("active@test.com", 5),
+            make_stale_sender("stale@test.com", 3),
+        ];
+        let mut app = App::new(senders);
+        app.cursor = 0; // SelectAllActive
+        app.toggle();
+        assert!(app.active_selected[0], "active sender should be selected");
+        assert!(!app.stale_selected[0], "stale sender should remain unselected");
     }
 
     #[test]
@@ -564,12 +568,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         let is_cursor = row == app.cursor;
 
         match app.row_kind(row) {
-            RowKind::SelectAll => {
+            RowKind::SelectAllActive => {
                 let all_selected = app.active_selected.iter().all(|&s| s)
-                    && app.stale_selected.iter().all(|&s| s)
                     && !app.active_selected.is_empty();
                 let checkbox = if all_selected { "[x]" } else { "[ ]" };
-                let text = format!(" {checkbox} Select All");
+                let label = if app.stale.is_empty() { "Select All" } else { "Select All Active" };
+                let text = format!(" {checkbox} {label}");
                 let style = if is_cursor {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
@@ -582,9 +586,17 @@ fn draw(f: &mut Frame, app: &mut App) {
                 let selected = app.active_selected[idx];
                 items.push(sender_row(sender, selected, is_cursor));
             }
-            RowKind::StaleHeader => {
-                let text = " ── Stale senders (archive only — unsubscribe URLs may be expired) ──";
-                items.push(Line::styled(text, Style::default().fg(Color::DarkGray)));
+            RowKind::SelectAllStale => {
+                let all_selected = app.stale_selected.iter().all(|&s| s)
+                    && !app.stale_selected.is_empty();
+                let checkbox = if all_selected { "[x]" } else { "[ ]" };
+                let text = format!(" {checkbox} Select All Stale (archive only — URLs may be expired)");
+                let style = if is_cursor {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                items.push(Line::styled(text, style));
             }
             RowKind::Stale(idx) => {
                 let sender = &app.stale[idx];
@@ -638,10 +650,11 @@ fn sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Line<'sta
     } else {
         "mailto"
     };
-    let name_trunc = truncate_str(&name, 40);
-    let email_trunc = truncate_str(&sender.email, 30);
+    let last_email = format_last_seen(sender.last_seen);
+    let name_trunc = truncate_str(&name, 35);
+    let email_trunc = truncate_str(&sender.email, 28);
     let text = format!(
-        " {checkbox} {name_trunc:<40} ({email_trunc:<30}) [{method:>7}] ({} emails)",
+        " {checkbox} {name_trunc:<35} ({email_trunc:<28}) {last_email:>8}  [{method:>7}] ({} emails)",
         sender.email_count,
     );
     let style = if is_cursor {
@@ -661,10 +674,11 @@ fn stale_sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Lin
     } else {
         sender.display_name.clone()
     };
-    let name_trunc = truncate_str(&name, 40);
-    let email_trunc = truncate_str(&sender.email, 30);
+    let last_email = format_last_seen(sender.last_seen);
+    let name_trunc = truncate_str(&name, 35);
+    let email_trunc = truncate_str(&sender.email, 28);
     let text = format!(
-        " {checkbox} {name_trunc:<40} ({email_trunc:<30}) [archive ] ({} emails)",
+        " {checkbox} {name_trunc:<35} ({email_trunc:<28}) {last_email:>8}  [archive ] ({} emails)",
         sender.email_count,
     );
     let style = if is_cursor {
@@ -682,4 +696,30 @@ fn truncate_str(s: &str, max: usize) -> String {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
         None => s.to_string(),
     }
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Format a Unix timestamp as "Mon YYYY" (e.g., "Mar 2025"), or "-" if None.
+fn format_last_seen(last_seen: Option<i64>) -> String {
+    let ts = match last_seen {
+        Some(ts) => ts,
+        None => return "-".to_string(),
+    };
+
+    // Convert Unix timestamp to civil date using the same algorithm as main.rs
+    let days = ts / 86400;
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = (days - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let month_name = MONTH_NAMES.get((m - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {y}")
 }
