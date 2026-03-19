@@ -2393,7 +2393,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unsubscribe-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "unsubscribe-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "unsubscribe-email"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "imap",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "unsubscribe-persistence"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "keyring",
