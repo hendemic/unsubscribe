@@ -223,13 +223,18 @@ fn scan_folder(
         let end = total.min(start + batch_size - 1);
         let sequence = format!("{start}:{end}");
         let messages = session
-            .fetch(&sequence, "(UID BODY.PEEK[HEADER])")
+            .fetch(&sequence, "(UID INTERNALDATE BODY.PEEK[HEADER])")
             .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
 
         for msg in messages.iter() {
             progress.on_messages_scanned(folder, 1);
 
             let Some(uid) = msg.uid else { continue };
+            // Extract the message timestamp (Unix seconds) from INTERNALDATE.
+            let internal_date_ts: Option<i64> = msg
+                .internal_date()
+                .map(|dt| dt.timestamp());
+
             let Some(header_bytes) = msg.header() else { continue };
             let Some(parsed) = parser.parse(header_bytes) else { continue };
 
@@ -276,6 +281,7 @@ fn scan_folder(
                     one_click: false,
                     email_count: 0,
                     messages: Vec::new(),
+                    last_seen: None,
                 }
             });
 
@@ -298,6 +304,13 @@ fn scan_folder(
                 folder: folder.clone(),
                 message_id,
             });
+
+            // Track the most recent message date for staleness detection.
+            entry.last_seen = match (entry.last_seen, internal_date_ts) {
+                (Some(existing), Some(new)) => Some(existing.max(new)),
+                (None, ts) => ts,
+                (existing, None) => existing,
+            };
 
             // Update display name if we got a better one
             if entry.display_name.is_empty() && !sender_name.is_empty() {
@@ -328,6 +341,7 @@ fn merge_folder_result(
             one_click: false,
             email_count: 0,
             messages: Vec::new(),
+            last_seen: None,
         });
 
         // Incoming folder's URLs replace existing ones. When merging across
@@ -345,6 +359,13 @@ fn merge_folder_result(
         }
         entry.email_count += sender.email_count;
         entry.messages.extend(sender.messages);
+
+        // Take the most recent date seen across all folders.
+        entry.last_seen = match (entry.last_seen, sender.last_seen) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (None, b) => b,
+            (a, None) => a,
+        };
 
         if entry.display_name.is_empty() && !sender.display_name.is_empty() {
             entry.display_name = sender.display_name.clone();
@@ -456,6 +477,7 @@ mod tests {
             one_click,
             email_count,
             messages,
+            last_seen: None,
         }
     }
 

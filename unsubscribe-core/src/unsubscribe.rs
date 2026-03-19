@@ -390,6 +390,7 @@ mod tests {
             one_click,
             email_count: 1,
             messages: vec![],
+            last_seen: None,
         }
     }
 

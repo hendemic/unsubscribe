@@ -2431,6 +2431,7 @@ name = "unsubscribe-email"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "imap",
  "mail-parser",
  "native-tls",

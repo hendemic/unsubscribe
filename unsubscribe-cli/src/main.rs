@@ -764,6 +764,7 @@ fn cmd_scan(account: &AccountConfig, credential: &Credential, min_emails: u32) -
         } else {
             &s.display_name
         };
+        let stale_marker = if is_stale(s) { " [stale]" } else { "" };
         let (method, method_color) = if s.one_click {
             ("1-click", GREEN)
         } else if !s.unsubscribe_urls.is_empty() {
@@ -772,7 +773,7 @@ fn cmd_scan(account: &AccountConfig, credential: &Credential, min_emails: u32) -
             ("mailto", YELLOW)
         };
         println!(
-            " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}",
+            " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}{DIM}{stale_marker}{RESET}",
             truncate(name, 44),
             truncate(&s.email, 34),
             method,
@@ -781,8 +782,14 @@ fn cmd_scan(account: &AccountConfig, credential: &Credential, min_emails: u32) -
     }
 
     let total_emails: u32 = senders.iter().map(|s| s.email_count).sum();
+    let stale_count = senders.iter().filter(|s| is_stale(s)).count();
+    let stale_note = if stale_count > 0 {
+        format!(" ({stale_count} stale)")
+    } else {
+        String::new()
+    };
     println!(
-        "\n{BOLD}Total:{RESET} {} senders, {} emails",
+        "\n{BOLD}Total:{RESET} {} senders{stale_note}, {} emails",
         senders.len(),
         total_emails
     );
@@ -826,28 +833,56 @@ fn cmd_run(
         }
     };
 
-    let to_unsub: Vec<&SenderInfo> = selections
+    // Partition selected senders: active ones get HTTP unsubscribe + archive,
+    // stale ones (last message >12 months ago) get archive-only.
+    let selected: Vec<&SenderInfo> = selections
         .iter()
         .filter(|(_, selected)| *selected)
         .map(|(sender, _)| sender)
         .collect();
 
-    if to_unsub.is_empty() {
-        eprintln!("{YELLOW}No senders selected for unsubscribe.{RESET}");
+    if selected.is_empty() {
+        eprintln!("{YELLOW}No senders selected.{RESET}");
         return Ok(());
     }
 
-    let total_emails: u32 = to_unsub.iter().map(|s| s.email_count).sum();
-    eprintln!(
-        "Will unsubscribe from {BOLD}{}{RESET} senders ({} emails).\n",
-        to_unsub.len(),
-        total_emails
-    );
+    let (to_unsub, to_archive_only): (Vec<&SenderInfo>, Vec<&SenderInfo>) =
+        selected.iter().partition(|s| !is_stale(s));
 
-    // Phase 3: Unsubscribe
-    eprintln!("{BOLD}Unsubscribing...{RESET}\n");
+    let total_emails: u32 = selected.iter().map(|s| s.email_count).sum();
+    if !to_unsub.is_empty() {
+        eprintln!(
+            "Will unsubscribe from {BOLD}{}{RESET} active senders ({} emails).",
+            to_unsub.len(),
+            to_unsub.iter().map(|s| s.email_count).sum::<u32>()
+        );
+    }
+    if !to_archive_only.is_empty() {
+        eprintln!(
+            "Will archive {BOLD}{}{RESET} stale senders without unsubscribing ({} emails).",
+            to_archive_only.len(),
+            to_archive_only.iter().map(|s| s.email_count).sum::<u32>()
+        );
+    }
+    eprintln!("Total: {total_emails} emails.\n");
 
-    let results: Vec<UnsubscribeResult> = if dry_run {
+    // Phase 3: Unsubscribe — only active (non-stale) senders get HTTP unsubscribe.
+    // Results are written incrementally so a later archive failure does not lose
+    // the record of which senders were already unsubscribed.
+    let log_path = data_dir().join("unsubscribe_log.csv");
+    std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
+
+    // Remove any previous run's log to start fresh.
+    if log_path.exists() {
+        std::fs::remove_file(&log_path)
+            .with_context(|| format!("Failed to clear previous action log: {}", log_path.display()))?;
+    }
+
+    let results: Vec<UnsubscribeResult> = if to_unsub.is_empty() {
+        // All selected senders are stale — skip unsubscribe entirely.
+        Vec::new()
+    } else if dry_run {
+        eprintln!("{BOLD}Unsubscribing...{RESET}\n");
         to_unsub
             .iter()
             .map(|s| {
@@ -865,6 +900,7 @@ fn cmd_run(
             })
             .collect()
     } else {
+        eprintln!("{BOLD}Unsubscribing...{RESET}\n");
         let http_client = http::ReqwestHttpClient::new()?;
         let pb = ProgressBar::new(to_unsub.len() as u64);
         pb.set_style(
@@ -877,9 +913,17 @@ fn cmd_run(
         let results: Vec<UnsubscribeResult> = to_unsub
             .iter()
             .map(|sender| {
-                let result = unsubscribe_core::unsubscribe(&[sender], &http_client);
+                let result = unsubscribe_core::unsubscribe(&[sender], &http_client)
+                    .into_iter()
+                    .next()
+                    .expect("one sender produces one result");
                 pb.inc(1);
-                result.into_iter().next().expect("one sender produces one result")
+                // Best-effort incremental write — a write failure is warned but
+                // does not abort the unsubscribe run.
+                if let Err(e) = append_log_entry(&result, &log_path) {
+                    eprintln!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
+                }
+                result
             })
             .collect();
 
@@ -887,26 +931,39 @@ fn cmd_run(
         results
     };
 
-    let success_count = results.iter().filter(|r| r.success).count();
-    let fail_count = results.iter().filter(|r| !r.success).count();
+    if !results.is_empty() {
+        let success_count = results.iter().filter(|r| r.success).count();
+        let fail_count = results.iter().filter(|r| !r.success).count();
 
-    eprintln!(
-        "\n{BOLD}Results:{RESET} {GREEN}{success_count} succeeded{RESET}, {RED}{fail_count} failed{RESET}\n"
-    );
+        eprintln!(
+            "\n{BOLD}Results:{RESET} {GREEN}{success_count} succeeded{RESET}, {RED}{fail_count} failed{RESET}\n"
+        );
 
-    for r in &results {
-        if r.success {
-            eprintln!("  {GREEN}[OK]{RESET}   {:<40} {DIM}{}{RESET}", r.email, r.detail);
-        } else {
-            eprintln!("  {RED}[FAIL]{RESET} {:<40} {DIM}{}{RESET}", r.email, r.detail);
+        for r in &results {
+            if r.success {
+                eprintln!("  {GREEN}[OK]{RESET}   {:<40} {DIM}{}{RESET}", r.email, r.detail);
+            } else {
+                eprintln!("  {RED}[FAIL]{RESET} {:<40} {DIM}{}{RESET}", r.email, r.detail);
+            }
+        }
+
+        if !dry_run {
+            eprintln!("{DIM}Action log written to {}{RESET}", log_path.display());
         }
     }
 
-    // Phase 4: Archive
+    // Phase 4: Archive — includes both unsubscribed senders and archive-only (stale) senders.
+    // Failures are reported with the log path so the user knows their unsubscribe results
+    // are preserved.
     eprintln!("\n{BOLD}Archiving emails...{RESET}\n");
 
+    // Combine all selected senders for archiving: those unsubscribed and stale-archive-only.
+    let all_to_archive: Vec<&SenderInfo> = to_unsub.iter().copied()
+        .chain(to_archive_only.iter().copied())
+        .collect();
+
     let archived: u32 = if dry_run {
-        let total: u32 = to_unsub.iter().map(|s| s.email_count).sum();
+        let total: u32 = all_to_archive.iter().map(|s| s.email_count).sum();
         eprintln!(
             "Dry run: would archive {total} emails to '{}'",
             account.archive_folder
@@ -914,21 +971,28 @@ fn cmd_run(
         total
     } else {
         let provider = make_provider(account, credential)?;
-        let messages: Vec<_> = to_unsub.iter().flat_map(|s| s.messages.clone()).collect();
+        let messages: Vec<_> = all_to_archive.iter().flat_map(|s| s.messages.clone()).collect();
         let destination = Folder::new(&account.archive_folder);
-        provider.archive(&messages, &destination)?
+        match provider.archive(&messages, &destination) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("{RED}Archive failed:{RESET} {e}");
+                if !to_unsub.is_empty() {
+                    eprintln!(
+                        "{YELLOW}Unsubscribe results are preserved in:{RESET} {}",
+                        log_path.display()
+                    );
+                }
+                eprintln!("{DIM}You may archive manually or re-run after resolving the issue.{RESET}");
+                return Err(e);
+            }
+        }
     };
 
     eprintln!(
         "{GREEN}Archived {archived} emails{RESET} to '{}'.",
         account.archive_folder
     );
-
-    // Write action log to XDG data dir
-    let log_path = data_dir().join("unsubscribe_log.csv");
-    std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
-    write_log(&results, &log_path)?;
-    eprintln!("{DIM}Action log written to {}{RESET}", log_path.display());
 
     print_warnings_summary(&warnings);
 
@@ -946,7 +1010,7 @@ fn cmd_export(
     let mut wtr =
         csv::Writer::from_path(output).context("Failed to create CSV")?;
 
-    wtr.write_record(["name", "email", "domain", "method", "emails", "url"])?;
+    wtr.write_record(["name", "email", "domain", "method", "emails", "url", "stale"])?;
 
     for s in &senders {
         let method = if s.one_click {
@@ -960,6 +1024,7 @@ fn cmd_export(
             .best_unsubscribe_url()
             .unwrap_or_default()
             .to_string();
+        let stale = is_stale(s).to_string();
 
         wtr.write_record([
             &s.display_name,
@@ -968,6 +1033,7 @@ fn cmd_export(
             method,
             &s.email_count.to_string(),
             &url,
+            &stale,
         ])?;
     }
 
@@ -980,6 +1046,22 @@ fn cmd_export(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// A sender is considered stale if their most recent message is older than 12 months.
+///
+/// Stale senders receive archive-only treatment: their messages are moved but
+/// no HTTP unsubscribe request is made (stale tokens are likely expired).
+fn is_stale(sender: &SenderInfo) -> bool {
+    const STALE_THRESHOLD_SECS: i64 = 365 * 24 * 60 * 60;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match sender.last_seen {
+        Some(ts) => now - ts > STALE_THRESHOLD_SECS,
+        None => false,
+    }
+}
+
 fn data_dir() -> PathBuf {
     let dir = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -991,12 +1073,30 @@ fn data_dir() -> PathBuf {
     dir.join("email-unsubscribe")
 }
 
-fn write_log(results: &[UnsubscribeResult], path: &Path) -> Result<()> {
-    let mut wtr = csv::Writer::from_path(path)?;
-    wtr.write_record(["email", "method", "success", "detail", "url"])?;
-    for r in results {
-        wtr.write_record([&r.email, &r.method, &r.success.to_string(), &r.detail, &r.url])?;
+/// Append a single result row to the action log CSV.
+///
+/// The header row is written only when the file is newly created. Subsequent
+/// calls append data rows without re-writing the header.
+fn append_log_entry(result: &UnsubscribeResult, path: &Path) -> Result<()> {
+    let is_new = !path.exists();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Failed to open action log: {}", path.display()))?;
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(file);
+    if is_new {
+        wtr.write_record(["email", "method", "success", "detail", "url"])?;
     }
+    wtr.write_record([
+        &result.email,
+        &result.method,
+        &result.success.to_string(),
+        &result.detail,
+        &result.url,
+    ])?;
     wtr.flush()?;
     Ok(())
 }

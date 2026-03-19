@@ -7,7 +7,7 @@ authors = ["Mike Henderson"]
 
 [features]
 default = ["imap", "gmail"]
-imap = ["dep:imap", "dep:native-tls", "dep:openssl", "dep:mail-parser"]
+imap = ["dep:imap", "dep:native-tls", "dep:openssl", "dep:mail-parser", "dep:chrono"]
 gmail = ["dep:serde_json"]
 
 [dependencies]
@@ -20,6 +20,7 @@ imap = { version = "2", optional = true }
 mail-parser = { version = "0.9", optional = true }
 native-tls = { version = "0.2", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
+chrono = { version = "0.4", optional = true, default-features = false }
 
 # gmail feature deps
 serde_json = { version = "1", optional = true }
