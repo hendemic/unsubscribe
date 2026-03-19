@@ -1,6 +1,11 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::types::{AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult};
+use crate::types::{
+    AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult, SenderInfo,
+    UnsubscribeResult,
+};
 
 /// Port for scan progress reporting.
 ///
@@ -90,4 +95,60 @@ pub trait CredentialStore {
 
     /// Delete the credential for the given account. No-op if not stored.
     fn delete_credential(&self, account_id: &str) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// DataStore: scan warnings, action logs, and cached scan results
+// ---------------------------------------------------------------------------
+
+/// Watermark for tracking scan position per adapter.
+/// Stored alongside cached results for future incremental scanning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanWatermark {
+    /// Per-folder highest UID seen (IMAP adapter)
+    pub highest_uid: HashMap<String, u32>,
+    /// Per-folder UIDVALIDITY (IMAP adapter)
+    pub uid_validity: HashMap<String, u32>,
+    /// Adapter-specific opaque state (e.g., Gmail historyId)
+    pub adapter_state: Option<String>,
+}
+
+/// Metadata about a cached scan (persistence-layer concern, not a domain type).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheMeta {
+    /// ISO 8601 timestamp of when the scan was performed
+    pub scanned_at: String,
+    /// Cache format version for future migration support
+    pub format_version: u32,
+    /// Account identifier to prevent cross-account stale reads
+    pub account: String,
+}
+
+/// Cached scan data: results + metadata + watermark.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedScan {
+    pub meta: CacheMeta,
+    pub senders: Vec<SenderInfo>,
+    pub watermark: ScanWatermark,
+}
+
+/// Port for persisting scan data, warnings, action logs, and cached results.
+///
+/// CLI implements this with XDG data dir files. iOS would use CoreData/SwiftData.
+/// The persistence crate (`unsubscribe-persistence`) provides the CLI implementation.
+pub trait DataStore {
+    /// Persist scan warnings, replacing any previous warnings.
+    fn write_warnings(&self, warnings: &[String]) -> Result<()>;
+
+    /// Read previously persisted scan warnings.
+    fn read_warnings(&self) -> Result<Vec<String>>;
+
+    /// Persist unsubscribe action log entries.
+    fn write_action_log(&self, results: &[UnsubscribeResult]) -> Result<()>;
+
+    /// Write cached scan results after a successful scan.
+    fn write_scan_cache(&self, cache: &CachedScan) -> Result<()>;
+
+    /// Read cached scan results for the given account, if any exist.
+    fn read_scan_cache(&self, account: &str) -> Result<Option<CachedScan>>;
 }
