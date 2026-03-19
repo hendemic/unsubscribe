@@ -940,4 +940,344 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(provider.http.calls().len(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Batch response parsing — edge cases (Issue #70)
+    // -----------------------------------------------------------------------
+
+    /// Build a raw batch body where each entry can have an arbitrary HTTP status.
+    /// This lets tests construct mixed success/failure batches directly.
+    fn make_raw_batch_response(parts: &[(u16, &str, &str)]) -> String {
+        // Each tuple: (status_code, status_text, body_json)
+        let boundary = "batch_boundary";
+        let mut body = String::new();
+        for (status, status_text, json) in parts {
+            body.push_str(&format!(
+                "--{boundary}\r\n\
+                 Content-Type: application/http\r\n\
+                 \r\n\
+                 HTTP/1.1 {status} {status_text}\r\n\
+                 Content-Type: application/json\r\n\
+                 \r\n\
+                 {json}\r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body
+    }
+
+    #[test]
+    fn batch_part_429_produces_error_distinguishable_from_404() {
+        // 429 and 404 must produce distinct error messages so retry logic can
+        // tell them apart — 429 is retriable, 404 is permanent.
+        let ids: Vec<String> = vec!["msg_a".to_string(), "msg_b".to_string()];
+        let body = make_raw_batch_response(&[
+            (429, "Too Many Requests", r#"{"error":{"code":429,"message":"Rate Limit Exceeded"}}"#),
+            (404, "Not Found", r#"{"error":{"code":404,"message":"Not Found"}}"#),
+        ]);
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let (id_a, result_a) = &results[0];
+        let (id_b, result_b) = &results[1];
+        assert_eq!(id_a, "msg_a");
+        assert_eq!(id_b, "msg_b");
+
+        let err_a = result_a.as_ref().unwrap_err().to_string();
+        let err_b = result_b.as_ref().unwrap_err().to_string();
+
+        // The status code must appear in the error message so callers can inspect it
+        assert!(err_a.contains("429"), "429 error should contain status code, got: {err_a}");
+        assert!(err_b.contains("404"), "404 error should contain status code, got: {err_b}");
+
+        // The two errors must not be identical — callers must be able to tell them apart
+        assert_ne!(err_a, err_b, "429 and 404 errors should produce distinct messages");
+    }
+
+    #[test]
+    fn batch_mixed_success_and_failure_only_errors_on_failed_parts() {
+        // A batch with some OK and some rate-limited sub-requests: the successful
+        // ones must parse cleanly, the failed ones must yield errors, and all
+        // must be returned (no silent drops).
+        let good_json = make_metadata_response(
+            "msg_ok",
+            "Good Sender <ok@example.com>",
+            "<https://ok.example.com/unsub>",
+            false,
+        );
+        let ids: Vec<String> = vec!["msg_ok".to_string(), "msg_429".to_string()];
+        let body = make_raw_batch_response(&[
+            (200, "OK", &good_json),
+            (429, "Too Many Requests", r#"{"error":{"code":429}}"#),
+        ]);
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+
+        assert_eq!(results.len(), 2, "both parts must be present in results");
+        assert!(results[0].1.is_ok(), "200 part should parse successfully");
+        assert!(results[1].1.is_err(), "429 part should be an error");
+        let err = results[1].1.as_ref().unwrap_err().to_string();
+        assert!(err.contains("429"), "error should include the 429 status code");
+    }
+
+    #[test]
+    fn batch_404_sub_request_becomes_per_message_error() {
+        let ids: Vec<String> = vec!["missing_id".to_string()];
+        let body = make_raw_batch_response(&[
+            (404, "Not Found", r#"{"error":{"code":404,"message":"Requested entity was not found."}}"#),
+        ]);
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let (id, result) = &results[0];
+        assert_eq!(id, "missing_id");
+        assert!(result.is_err());
+        let err = result.as_ref().unwrap_err().to_string();
+        assert!(err.contains("404"), "404 error should name the status code, got: {err}");
+    }
+
+    #[test]
+    fn batch_part_missing_http_status_line_is_an_error() {
+        // A part with no HTTP/1.1 status line should produce a parse error,
+        // not a panic or silent success.
+        let part_without_status = "Content-Type: application/http\r\n\r\n{\"id\":\"x\"}\r\n";
+
+        let result = parse_single_batch_part(part_without_status);
+
+        assert!(result.is_err(), "part without HTTP status line should be an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP status line") || err.contains("HTTP/"),
+            "error message should mention the missing status line, got: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_part_missing_body_separator_is_an_error() {
+        // A malformed part where there is no blank line separating HTTP headers
+        // from the JSON body. The parser must not silently return empty/wrong data.
+        let no_body_separator = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{\"id\":\"x\"}";
+
+        let result = parse_single_batch_part(no_body_separator);
+
+        assert!(result.is_err(), "part without body separator should be an error");
+    }
+
+    #[test]
+    fn batch_empty_response_returns_empty_results() {
+        // A batch response with no parts (just the opening and closing boundary)
+        // should return an empty vec, not an error.
+        let boundary = "batch_boundary";
+        let body = format!("--{boundary}\r\n--{boundary}--\r\n");
+        let ids: Vec<String> = Vec::new();
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+
+        assert!(results.is_empty(), "empty batch should yield no results");
+    }
+
+    #[test]
+    fn batch_fewer_parts_than_ids_returns_only_matched_pairs() {
+        // If the batch response has fewer parts than the ID list, only the
+        // paired entries should appear. The unpaired IDs must be silently
+        // omitted — no panic, no index out of bounds.
+        let good_json = make_metadata_response(
+            "msg1",
+            "Sender <s@example.com>",
+            "<https://example.com/unsub>",
+            false,
+        );
+        // Two IDs but only one batch part
+        let ids: Vec<String> = vec!["msg1".to_string(), "msg2".to_string()];
+        let body = make_batch_response(&[good_json]);
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+
+        // Only the paired entry should be present; msg2 is dropped
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "msg1");
+        assert!(results[0].1.is_ok());
+    }
+
+    #[test]
+    fn batch_more_parts_than_ids_stops_at_id_count() {
+        // If the batch response has more parts than the ID list, parsing should
+        // stop at the number of IDs — no panic, no extra entries.
+        let good_json = make_metadata_response(
+            "msg1",
+            "Sender <s@example.com>",
+            "<https://example.com/unsub>",
+            false,
+        );
+        let extra_json = make_metadata_response(
+            "msg2",
+            "Extra <extra@example.com>",
+            "<https://extra.com/unsub>",
+            false,
+        );
+        // One ID but two batch parts
+        let ids: Vec<String> = vec!["msg1".to_string()];
+        let body = make_batch_response(&[good_json, extra_json]);
+
+        let results = parse_batch_response(&body, &ids).unwrap();
+
+        assert_eq!(results.len(), 1, "should stop at ID count, not part count");
+        assert_eq!(results[0].0, "msg1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan-level behavior with batch sub-request errors (Issue #70 + #71 overlap)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_records_warning_for_failed_sub_requests_and_continues() {
+        // When some batch sub-requests fail (e.g. 404), the scan should not
+        // abort — it should record a warning and move on to the remaining messages.
+        let http = MockHttpClient::new();
+
+        http.push(200, make_list_response(&["msg_ok", "msg_404"], None));
+        let good_json = make_metadata_response(
+            "msg_ok",
+            "Good <good@example.com>",
+            "<https://example.com/unsub>",
+            false,
+        );
+        let body = make_raw_batch_response(&[
+            (200, "OK", &good_json),
+            (404, "Not Found", r#"{"error":{"code":404}}"#),
+        ]);
+        http.push(200, body);
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        // The valid message should still produce a sender
+        assert_eq!(result.senders.len(), 1);
+        assert_eq!(result.senders[0].email, "good@example.com");
+
+        // The 404 failure should be recorded as a warning
+        assert!(
+            result.warnings.iter().any(|w| w.contains("msg_404")),
+            "expected warning for msg_404, got: {:?}",
+            result.warnings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gmail API error handling — api_get / api_post_json (Issue #71)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_401_response_produces_token_expired_error() {
+        // A 401 from the messages list endpoint should produce a specific error
+        // mentioning the expired/revoked token — not a generic HTTP error.
+        let http = MockHttpClient::new();
+        http.push(401, r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let err = provider.scan(&[], &NoopProgress).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("401") || msg.contains("expired") || msg.contains("token"),
+            "401 error should mention token expiry, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_403_response_produces_api_error() {
+        // A 403 Forbidden from the messages list endpoint should be a hard error.
+        let http = MockHttpClient::new();
+        http.push(403, r#"{"error":{"code":403,"message":"Forbidden"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let err = provider.scan(&[], &NoopProgress).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403"),
+            "403 error should include status code, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_500_response_produces_api_error() {
+        // A 500 Internal Server Error should propagate as a hard failure.
+        let http = MockHttpClient::new();
+        http.push(500, r#"{"error":{"code":500,"message":"Internal Error"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let err = provider.scan(&[], &NoopProgress).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("500"),
+            "500 error should include status code, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_401_on_second_page_propagates_as_error() {
+        // Pagination must not swallow auth failures: if the first page succeeds
+        // but the second page returns 401, the scan must fail with a clear error.
+        let http = MockHttpClient::new();
+
+        // First page succeeds with a next_page_token
+        http.push(200, make_list_response(&["msg1"], Some("page2-token")));
+        // Second page returns 401
+        http.push(401, r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let err = provider.scan(&[], &NoopProgress).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("401") || msg.contains("expired") || msg.contains("token"),
+            "401 on second page should propagate as a clear auth error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn archive_401_on_batch_modify_propagates_as_error() {
+        // If the batchModify call returns 401, archive() must surface the error
+        // rather than silently claiming success.
+        let http = MockHttpClient::new();
+
+        // find_label: existing label
+        http.push(200, r#"{"labels":[{"id":"Label_1","name":"Unsubscribed"}]}"#);
+        // batchModify returns 401
+        http.push(401, r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let messages = vec![make_folder_message("msg1")];
+        let err = provider.archive(&messages, &Folder::new("Unsubscribed")).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("401") || msg.contains("expired") || msg.contains("token"),
+            "archive 401 should produce token-expired error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn archive_500_on_batch_modify_propagates_as_error() {
+        // A 500 from batchModify must not be swallowed — the caller needs to
+        // know that the archive operation failed.
+        let http = MockHttpClient::new();
+
+        http.push(200, r#"{"labels":[{"id":"Label_1","name":"Unsubscribed"}]}"#);
+        http.push(500, r#"{"error":{"code":500,"message":"Internal Error"}}"#);
+
+        let provider = GmailProvider::new("test-token", http);
+        let messages = vec![make_folder_message("msg1")];
+        let err = provider.archive(&messages, &Folder::new("Unsubscribed")).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("500"),
+            "archive 500 should propagate with status code, got: {msg}"
+        );
+    }
 }
