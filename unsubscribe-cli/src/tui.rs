@@ -573,7 +573,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),                                  // title
-            Constraint::Length(if has_timestamp { 1 } else { 0 }), // scan timestamp
+            Constraint::Length(if has_timestamp { 2 } else { 0 }), // scan timestamp + spacer
             Constraint::Min(5),                                    // list
             Constraint::Length(3),                                  // status bar
             Constraint::Length(2),                                  // help
@@ -627,7 +627,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 } else {
                     " ── Active Senders ──"
                 };
-                items.push(Line::styled(label, Style::default().fg(Color::Cyan).bold()));
+                items.push(Line::styled(label, Style::default().fg(Color::Yellow).bold()));
             }
             RowKind::SelectAllActive => {
                 let all_selected = app.active_selected.iter().all(|&s| s)
@@ -637,7 +637,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 let style = if is_cursor {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(Color::Yellow)
                 };
                 items.push(Line::styled(text, style));
             }
