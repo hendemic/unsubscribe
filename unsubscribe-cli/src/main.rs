@@ -629,7 +629,12 @@ fn cmd_update(pre: bool) -> Result<()> {
         .context("No tag_name in release")?;
     let latest_version = latest_tag.trim_start_matches('v');
 
-    if latest_version == current {
+    let current_semver =
+        semver::Version::parse(current).context("Failed to parse current version")?;
+    let latest_semver =
+        semver::Version::parse(latest_version).context("Failed to parse release version")?;
+
+    if latest_semver <= current_semver {
         eprintln!("{GREEN}Already up to date (v{current}).{RESET}");
         return Ok(());
     }

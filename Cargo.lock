@@ -2406,6 +2406,7 @@ dependencies = [
  "rand",
  "ratatui",
  "reqwest",
+ "semver",
  "serde_json",
  "sha2",
  "unsubscribe-core",
