@@ -1,10 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Opaque identifier for an email message within a folder.
 ///
 /// Adapters produce these; core never interprets the contents.
 /// For IMAP this wraps a UID string, for Gmail API it might be a message ID, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(String);
 
 impl MessageId {
@@ -27,7 +28,7 @@ impl fmt::Display for MessageId {
 ///
 /// Adapters produce these; core never interprets the contents.
 /// For IMAP this is the mailbox name, for Gmail API it might be a label ID, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Folder(String);
 
 impl Folder {
@@ -47,7 +48,7 @@ impl fmt::Display for Folder {
 }
 
 /// A message located in a specific folder.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderMessage {
     pub folder: Folder,
     pub message_id: MessageId,
@@ -55,7 +56,7 @@ pub struct FolderMessage {
 
 /// A sender discovered during scanning, with unsubscribe information
 /// and references to their messages across folders.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SenderInfo {
     /// Display name (e.g. "Acme Newsletter")
     pub display_name: String,
@@ -96,7 +97,7 @@ pub struct ScanResult {
 }
 
 /// Outcome of an unsubscribe attempt for a single sender.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use]
 pub struct UnsubscribeResult {
     /// Sender email address

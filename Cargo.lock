@@ -2423,6 +2423,7 @@ dependencies = [
  "base64 0.22.1",
  "encoding_rs",
  "scraper",
+ "serde",
  "url",
 ]
 
@@ -2445,9 +2446,11 @@ name = "unsubscribe-persistence"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "csv",
  "keyring",
  "log",
  "serde",
+ "serde_json",
  "toml",
  "unsubscribe-core",
 ]

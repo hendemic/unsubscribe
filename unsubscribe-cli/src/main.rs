@@ -10,10 +10,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{
-    AccountConfig, AuthType, ConfigStore, Credential, CredentialStore, EmailProvider, Folder,
-    ProviderType, SenderInfo, UnsubscribeResult,
+    AccountConfig, AuthType, CacheMeta, CachedScan, ConfigStore, Credential, CredentialStore,
+    DataStore, EmailProvider, Folder, ProviderType, ScanWatermark, SenderInfo, UnsubscribeResult,
 };
-use unsubscribe_persistence::{KeyringCredentialStore, TomlConfigStore};
+use unsubscribe_persistence::{FileDataStore, KeyringCredentialStore, TomlConfigStore};
 
 // ANSI color helpers
 const BOLD: &str = "\x1b[1m";
@@ -45,6 +45,9 @@ enum Commands {
         /// Only include senders with at least this many emails
         #[arg(short, long, default_value = "3")]
         min_emails: u32,
+        /// Use cached scan results instead of rescanning
+        #[arg(long)]
+        cached: bool,
     },
     /// Only scan and list senders with unsubscribe links
     Scan {
@@ -60,6 +63,9 @@ enum Commands {
         /// Only include senders with at least this many emails
         #[arg(long, default_value = "3")]
         min_emails: u32,
+        /// Use cached scan results instead of rescanning
+        #[arg(long)]
+        cached: bool,
     },
     /// Show recent scan warnings (unparseable headers)
     Warnings,
@@ -111,15 +117,20 @@ fn main() -> Result<()> {
     }
 
     let (account, credential) = load_account(&config_dir)?;
+    let store = FileDataStore::new();
 
     match cli.command {
-        Commands::Run { dry_run, min_emails } => {
-            cmd_run(&account, &credential, dry_run, min_emails)
-        }
-        Commands::Scan { min_emails } => cmd_scan(&account, &credential, min_emails),
-        Commands::Export { output, min_emails } => {
-            cmd_export(&account, &credential, &output, min_emails)
-        }
+        Commands::Run {
+            dry_run,
+            min_emails,
+            cached,
+        } => cmd_run(&account, &credential, &store, dry_run, min_emails, cached),
+        Commands::Scan { min_emails } => cmd_scan(&account, &credential, &store, min_emails),
+        Commands::Export {
+            output,
+            min_emails,
+            cached,
+        } => cmd_export(&account, &credential, &store, &output, min_emails, cached),
         Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
@@ -235,6 +246,7 @@ fn make_provider(
 fn do_scan(
     account: &AccountConfig,
     credential: &Credential,
+    store: &dyn DataStore,
     min_emails: u32,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
@@ -243,12 +255,47 @@ fn do_scan(
     let progress = progress::CliScanProgress::new();
     let scan_result = provider.scan(&folders, &progress)?;
 
-    // Save warnings to log
-    if !scan_result.warnings.is_empty() {
-        let warnings_path = data_dir().join("warnings.log");
-        std::fs::create_dir_all(warnings_path.parent().expect("path has parent"))?;
-        std::fs::write(&warnings_path, scan_result.warnings.join("\n") + "\n")?;
+    // Persist warnings via DataStore
+    store.write_warnings(&scan_result.warnings)?;
+
+    // Build watermark from scan results.
+    // MessageId format for IMAP: "folder:uid:uidvalidity"
+    // MessageId format for Gmail: opaque string (watermark via adapter_state instead)
+    let mut highest_uid = std::collections::HashMap::new();
+    let mut uid_validity_map = std::collections::HashMap::new();
+    for sender in &scan_result.senders {
+        for msg in &sender.messages {
+            let folder_key = msg.folder.as_str().to_string();
+            // Try to parse IMAP-style message IDs for watermark
+            let parts: Vec<&str> = msg.message_id.as_str().rsplitn(3, ':').collect();
+            if parts.len() == 3 {
+                if let (Ok(validity), Ok(uid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                {
+                    let current = highest_uid.entry(folder_key.clone()).or_insert(0u32);
+                    if uid > *current {
+                        *current = uid;
+                    }
+                    uid_validity_map.insert(folder_key, validity);
+                }
+            }
+        }
     }
+
+    // Cache results for --cached use
+    let cache = CachedScan {
+        meta: CacheMeta {
+            scanned_at: now_iso8601(),
+            format_version: 1,
+            account: account.account_id.clone(),
+        },
+        senders: scan_result.senders.clone(),
+        watermark: ScanWatermark {
+            highest_uid,
+            uid_validity: uid_validity_map,
+            adapter_state: None,
+        },
+    };
+    store.write_scan_cache(&cache)?;
 
     let senders: Vec<_> = scan_result
         .senders
@@ -257,6 +304,27 @@ fn do_scan(
         .collect();
 
     Ok((senders, scan_result.warnings))
+}
+
+/// Load cached scan results, applying min_emails filter.
+fn load_cached_scan(
+    store: &dyn DataStore,
+    account: &str,
+    min_emails: u32,
+) -> Result<(Vec<SenderInfo>, String)> {
+    let cache = store
+        .read_scan_cache(account)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("No cached scan results found. Run `unsubscribe scan` first.")
+        })?;
+
+    let senders: Vec<_> = cache
+        .senders
+        .into_iter()
+        .filter(|s| s.email_count >= min_emails)
+        .collect();
+
+    Ok((senders, cache.meta.scanned_at))
 }
 
 fn print_warnings_summary(warnings: &[String]) {
@@ -505,9 +573,10 @@ fn reauth_imap(config_dir: &Path, account: &AccountConfig) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_uninstall(config_dir: &Path) -> Result<()> {
+    let data_store = FileDataStore::new();
     eprintln!("{BOLD}This will remove:{RESET}");
     eprintln!("  - Config:  {}", config_dir.display());
-    eprintln!("  - Data:    {}", data_dir().display());
+    eprintln!("  - Data:    {}", data_store.data_dir().display());
     eprintln!("  - Keychain entry");
     eprintln!(
         "  - Binary:  {}",
@@ -538,7 +607,7 @@ fn cmd_uninstall(config_dir: &Path) -> Result<()> {
     }
 
     // Remove data directory
-    let data = data_dir();
+    let data = data_store.data_dir().to_path_buf();
     if data.exists() {
         std::fs::remove_dir_all(&data)?;
         eprintln!("  {GREEN}Removed {}{RESET}", data.display());
@@ -571,16 +640,14 @@ fn cmd_completions(shell: Shell) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_warnings() -> Result<()> {
-    let warnings_path = data_dir().join("warnings.log");
-    match std::fs::read_to_string(&warnings_path) {
-        Ok(contents) if !contents.trim().is_empty() => {
-            println!("{BOLD}Unparseable List-Unsubscribe headers from last scan:{RESET}\n");
-            for line in contents.lines() {
-                println!("  {YELLOW}{line}{RESET}");
-            }
-        }
-        _ => {
-            println!("{GREEN}No warnings from last scan.{RESET}");
+    let store = FileDataStore::new();
+    let warnings = store.read_warnings()?;
+    if warnings.is_empty() {
+        println!("{GREEN}No warnings from last scan.{RESET}");
+    } else {
+        println!("{BOLD}Unparseable List-Unsubscribe headers from last scan:{RESET}\n");
+        for line in &warnings {
+            println!("  {YELLOW}{line}{RESET}");
         }
     }
     Ok(())
@@ -739,8 +806,13 @@ fn cmd_update(pre: bool) -> Result<()> {
 // Scan / Run / Export commands
 // ---------------------------------------------------------------------------
 
-fn cmd_scan(account: &AccountConfig, credential: &Credential, min_emails: u32) -> Result<()> {
-    let (senders, warnings) = do_scan(account, credential, min_emails)?;
+fn cmd_scan(
+    account: &AccountConfig,
+    credential: &Credential,
+    store: &dyn DataStore,
+    min_emails: u32,
+) -> Result<()> {
+    let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -795,19 +867,29 @@ fn cmd_scan(account: &AccountConfig, credential: &Credential, min_emails: u32) -
 fn cmd_run(
     account: &AccountConfig,
     credential: &Credential,
+    store: &dyn DataStore,
     dry_run: bool,
     min_emails: u32,
+    cached: bool,
 ) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
     }
 
-    // Phase 1: Scan
-    let (senders, warnings) = do_scan(account, credential, min_emails)?;
+    // Phase 1: Scan (or load from cache)
+    let (senders, warnings) = if cached {
+        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
+        (senders, Vec::new())
+    } else {
+        do_scan(account, credential, store, min_emails)?
+    };
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
-        print_warnings_summary(&warnings);
+        if !cached {
+            print_warnings_summary(&warnings);
+        }
         return Ok(());
     }
 
@@ -924,13 +1006,13 @@ fn cmd_run(
         account.archive_folder
     );
 
-    // Write action log to XDG data dir
-    let log_path = data_dir().join("unsubscribe_log.csv");
-    std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
-    write_log(&results, &log_path)?;
-    eprintln!("{DIM}Action log written to {}{RESET}", log_path.display());
+    // Write action log via DataStore
+    store.write_action_log(&results)?;
+    eprintln!("{DIM}Action log saved.{RESET}");
 
-    print_warnings_summary(&warnings);
+    if !cached {
+        print_warnings_summary(&warnings);
+    }
 
     Ok(())
 }
@@ -938,10 +1020,19 @@ fn cmd_run(
 fn cmd_export(
     account: &AccountConfig,
     credential: &Credential,
+    store: &dyn DataStore,
     output: &Path,
     min_emails: u32,
+    cached: bool,
 ) -> Result<()> {
-    let (senders, _) = do_scan(account, credential, min_emails)?;
+    let senders = if cached {
+        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        eprintln!("{DIM}Using cached scan from {timestamp}{RESET}");
+        senders
+    } else {
+        let (senders, _) = do_scan(account, credential, store, min_emails)?;
+        senders
+    };
 
     let mut wtr =
         csv::Writer::from_path(output).context("Failed to create CSV")?;
@@ -980,25 +1071,38 @@ fn cmd_export(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn data_dir() -> PathBuf {
-    let dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-            home.push(".local/share");
-            home
-        });
-    dir.join("email-unsubscribe")
+fn now_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let days = secs as i64 / 86400;
+    let time_of_day = secs as i64 % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let (year, month, day) = days_to_civil(days + 719468);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
-fn write_log(results: &[UnsubscribeResult], path: &Path) -> Result<()> {
-    let mut wtr = csv::Writer::from_path(path)?;
-    wtr.write_record(["email", "method", "success", "detail", "url"])?;
-    for r in results {
-        wtr.write_record([&r.email, &r.method, &r.success.to_string(), &r.detail, &r.url])?;
-    }
-    wtr.flush()?;
-    Ok(())
+/// Convert day count to civil date (algorithm from Howard Hinnant).
+fn days_to_civil(day_count: i64) -> (i64, u32, u32) {
+    let era = if day_count >= 0 {
+        day_count
+    } else {
+        day_count - 146096
+    } / 146097;
+    let doe = (day_count - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn truncate(s: &str, max: usize) -> &str {
