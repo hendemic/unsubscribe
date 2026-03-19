@@ -609,9 +609,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     let visible_height = chunks[2].height as usize;
     let total_rows = app.total_rows();
 
-    // Adjust scroll to keep cursor visible
-    if app.cursor < app.scroll_offset {
-        app.scroll_offset = app.cursor;
+    // Adjust scroll to keep cursor visible.
+    // When the cursor is on a row immediately after a non-selectable header,
+    // include the header in the visible area so it doesn't disappear.
+    let scroll_target = if app.cursor > 0 && app.is_non_selectable(app.cursor - 1) {
+        app.cursor - 1
+    } else {
+        app.cursor
+    };
+    if scroll_target < app.scroll_offset {
+        app.scroll_offset = scroll_target;
     } else if app.cursor >= app.scroll_offset + visible_height {
         app.scroll_offset = app.cursor - visible_height + 1;
     }
