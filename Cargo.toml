@@ -12,6 +12,3 @@ version = "0.1.2"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Mike Henderson"]
-
-# src-legacy/ contains the original monolith code for reference during migration.
-# Delete once all crates have feature parity.
