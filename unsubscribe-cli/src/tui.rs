@@ -605,8 +605,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    // Scrollable list
-    let visible_height = chunks[2].height as usize;
+    // Scrollable list — subtract 2 for the top/bottom borders of the Block
+    let visible_height = (chunks[2].height as usize).saturating_sub(2);
     let total_rows = app.total_rows();
 
     // Adjust scroll to keep cursor visible.
