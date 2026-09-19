@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unsubscribe_core::{
@@ -16,7 +15,8 @@ use unsubscribe_core::{
     UnsubscribeMethod, UnsubscribeOutcome,
 };
 
-use super::app::{Effect, Nav, Screen};
+use super::app::{Effect, Nav, SubView};
+use super::keys::{self, Action};
 use crate::time::format_unix_date;
 
 /// The listing: every sender with at least one recorded attempt.
@@ -62,20 +62,26 @@ impl HistoryScreen {
         self.visible.len().saturating_sub(1)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Nav {
+    /// Whether a text field has focus, so the shell leaves the keystroke alone.
+    #[must_use]
+    pub fn captures_text(&self) -> bool {
+        self.searching
+    }
+
+    pub fn on_action(&mut self, action: Action) -> Nav {
         if self.searching {
-            match key.code {
-                KeyCode::Char(c) => {
+            match action {
+                Action::Type(c) => {
                     self.filter.search.push(c);
                     self.refilter();
                 }
-                KeyCode::Backspace => {
+                Action::Erase => {
                     self.filter.search.pop();
                     self.refilter();
                 }
                 // Enter keeps the needle and leaves the field; Esc clears it.
-                KeyCode::Enter => self.searching = false,
-                KeyCode::Esc => {
+                Action::Activate => self.searching = false,
+                Action::Back => {
                     self.searching = false;
                     self.filter.search.clear();
                     self.refilter();
@@ -85,53 +91,45 @@ impl HistoryScreen {
             return Nav::Stay;
         }
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(self.last()),
-            KeyCode::PageUp => self.cursor = self.cursor.saturating_sub(10),
-            KeyCode::PageDown => self.cursor = (self.cursor + 10).min(self.last()),
-            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
-            KeyCode::End | KeyCode::Char('G') => self.cursor = self.last(),
-            KeyCode::Char('s') => {
+        if let Some(cursor) = keys::move_cursor(action, self.cursor, self.last()) {
+            self.cursor = cursor;
+            return Nav::Stay;
+        }
+        match action {
+            Action::Mnemonic('s') => {
                 self.filter.sort = self.filter.sort.next();
                 self.refilter();
             }
-            KeyCode::Char('r') => {
+            Action::Mnemonic('r') => {
                 self.filter.resumed_only = !self.filter.resumed_only;
                 self.refilter();
             }
-            KeyCode::Char('/') => self.searching = true,
-            KeyCode::Enter => {
+            Action::Search => self.searching = true,
+            Action::Activate => {
                 if let Some(view) = self.selected() {
-                    return Nav::Push(Screen::SenderHistory(Box::new(DetailScreen::new(
+                    return Nav::Push(SubView::SenderHistory(Box::new(DetailScreen::new(
                         view.clone(),
                     ))));
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Nav::Pop,
+            Action::Back => return Nav::Pop,
             _ => {}
         }
         Nav::Stay
     }
 
-    pub fn hints(&self) -> &'static str {
+    /// The actions this panel answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Action> {
         if self.searching {
-            " type to search | Enter: keep | Esc: clear"
-        } else {
-            " j/k: move | Enter: detail | s: sort | r: resumed only | /: search | Esc: back"
+            return vec![Action::Activate, Action::Back];
         }
-    }
-
-    pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("j / k / \u{2191}\u{2193}", "move"),
-            ("PgUp / PgDn", "move a page"),
-            ("Enter", "open the sender's timeline"),
-            ("s", "cycle sort: date, violations, sender"),
-            ("r", "show only senders that resumed"),
-            ("/", "search address, domain or list id"),
-            ("Esc / q", "back"),
-        ]
+        keys::list_actions(&[
+            Action::Activate,
+            Action::Mnemonic('s'),
+            Action::Mnemonic('r'),
+            Action::Search,
+        ])
     }
 
     fn scroll_into_view(&mut self, height: usize) {
@@ -204,38 +202,30 @@ impl DetailScreen {
         self.view.is_resumed() && self.view.in_current_scan()
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Nav {
+    pub fn on_action(&mut self, action: Action) -> Nav {
         let last = self.rows.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(last),
-            KeyCode::PageUp => self.cursor = self.cursor.saturating_sub(10),
-            KeyCode::PageDown => self.cursor = (self.cursor + 10).min(last),
-            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
-            KeyCode::End | KeyCode::Char('G') => self.cursor = last,
-            KeyCode::Char('u') if self.is_actionable() => {
-                return Nav::Effect(Effect::RunFromHistory);
+        if let Some(cursor) = keys::move_cursor(action, self.cursor, last) {
+            self.cursor = cursor;
+            return Nav::Stay;
+        }
+        match action {
+            Action::Mnemonic('u') if self.is_actionable() => {
+                Nav::Effect(Effect::RunFromHistory)
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Nav::Pop,
-            _ => {}
+            Action::Back => Nav::Pop,
+            _ => Nav::Stay,
         }
-        Nav::Stay
     }
 
-    pub fn hints(&self) -> &'static str {
-        if self.is_actionable() {
-            " j/k: move | u: unsubscribe again | Esc: back"
+    /// The actions this sub-view answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Action> {
+        let own: &[Action] = if self.is_actionable() {
+            &[Action::Mnemonic('u')]
         } else {
-            " j/k: move | Esc: back"
-        }
-    }
-
-    pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("j / k / \u{2191}\u{2193}", "scroll the timeline"),
-            ("u", "escalate this sender now (resumed senders in the scan)"),
-            ("Esc / q", "back"),
-        ]
+            &[]
+        };
+        keys::list_actions(own)
     }
 
     fn scroll_into_view(&mut self, height: usize) {
@@ -320,20 +310,19 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
             Paragraph::new(vec![
                 Line::raw(""),
                 Line::styled(
-                    "  Nothing here yet.",
+                    " Nothing here yet.",
                     Style::default().fg(Color::Cyan).bold(),
                 ),
                 Line::raw(""),
                 Line::styled(
-                    "  History starts with your first run: every unsubscribe attempt is",
+                    " History starts with your first run: every unsubscribe attempt is",
                     Style::default().fg(Color::DarkGray),
                 ),
                 Line::styled(
-                    "  recorded here, along with whether the mail actually stopped.",
+                    " recorded here, along with whether the mail actually stopped.",
                     Style::default().fg(Color::DarkGray),
                 ),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" History ")),
+            ]),
             area,
         );
         return;
@@ -341,10 +330,11 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(area);
 
-    let height = (chunks[0].height as usize).saturating_sub(2);
+    // The working area draws the border and the title; the rows fill it.
+    let height = chunks[0].height as usize;
     screen.scroll_into_view(height);
 
     let rows: Vec<Line> = screen
@@ -364,12 +354,7 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
             )]
         } else {
             rows
-        })
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " History \u{2014} {} of {} sender(s) ",
-            screen.visible.len(),
-            screen.views.len()
-        ))),
+        }),
         chunks[0],
     );
 
@@ -453,14 +438,21 @@ fn controls(screen: &HistoryScreen) -> Paragraph<'static> {
         ),
         Span::styled("   search ", Style::default().fg(Color::DarkGray)),
         Span::styled(search, Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!(
+                "   {} of {} sender(s)",
+                screen.visible.len(),
+                screen.views.len()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]))
-    .block(Block::default().borders(Borders::ALL))
 }
 
 pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(5)])
+        .constraints([Constraint::Length(4), Constraint::Min(3)])
         .split(area);
 
     let view = &screen.view;
@@ -486,9 +478,10 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
             ),
             Line::styled(
                 format!(
-                    " {}   {} violation(s)",
+                    " {}   {} violation(s)   {} event(s)",
                     outcome_label(view),
-                    view.violation_count
+                    view.violation_count,
+                    view.timeline.len()
                 ),
                 if view.is_resumed() {
                     Style::default().fg(Color::Red)
@@ -501,7 +494,7 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
         chunks[0],
     );
 
-    let height = (chunks[1].height as usize).saturating_sub(2);
+    let height = chunks[1].height as usize;
     screen.scroll_into_view(height);
 
     let rows: Vec<Line> = screen
@@ -520,22 +513,12 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " Timeline \u{2014} {} event(s) ",
-                    screen.view.timeline.len()
-                )),
-        ),
-        chunks[1],
-    );
+    f.render_widget(Paragraph::new(rows), chunks[1]);
 }
 
 /// The display name of a stored method id, falling back to the id itself so
 /// a record written by a newer build is never shown as blank.
-fn method_label(id: &str) -> &str {
+pub(crate) fn method_label(id: &str) -> &str {
     UnsubscribeMethod::from_id(id).map_or(id, |method| method.label())
 }
 
@@ -549,19 +532,14 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
     use unsubscribe_core::{Resumption, UnsubscribeAttempt};
 
     const DAY: i64 = 24 * 60 * 60;
     const T0: i64 = 1_700_000_000;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
     fn typed(screen: &mut HistoryScreen, text: &str) {
         for c in text.chars() {
-            screen.on_key(key(KeyCode::Char(c)));
+            screen.on_action(Action::Type(c));
         }
     }
 
@@ -569,7 +547,7 @@ mod tests {
     fn nav_name(nav: &Nav) -> &'static str {
         match nav {
             Nav::Stay => "stay",
-            Nav::Push(Screen::SenderHistory(_)) => "push detail",
+            Nav::Push(SubView::SenderHistory(_)) => "push detail",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
             Nav::Quit => "quit",
@@ -653,12 +631,12 @@ mod tests {
         let mut screen = listing();
 
         for _ in 0..10 {
-            screen.on_key(key(KeyCode::Down));
+            screen.on_action(Action::MoveDown);
         }
         assert_eq!(screen.cursor, 2);
 
         for _ in 0..10 {
-            screen.on_key(key(KeyCode::Char('k')));
+            screen.on_action(Action::MoveUp);
         }
         assert_eq!(screen.cursor, 0);
     }
@@ -671,31 +649,31 @@ mod tests {
                 .collect(),
         );
 
-        screen.on_key(key(KeyCode::PageDown));
+        screen.on_action(Action::PageDown);
         assert_eq!(screen.cursor, 10);
-        screen.on_key(key(KeyCode::PageDown));
-        screen.on_key(key(KeyCode::PageDown));
+        screen.on_action(Action::PageDown);
+        screen.on_action(Action::PageDown);
         assert_eq!(screen.cursor, 24);
-        screen.on_key(key(KeyCode::PageUp));
+        screen.on_action(Action::PageUp);
         assert_eq!(screen.cursor, 14);
     }
 
     #[test]
-    fn esc_and_q_go_back_to_the_screen_underneath() {
-        assert_eq!(nav_name(&listing().on_key(key(KeyCode::Esc))), "pop");
-        assert_eq!(nav_name(&listing().on_key(key(KeyCode::Char('q')))), "pop");
+    fn esc_goes_back_one_level_and_q_is_never_back() {
+        assert_eq!(nav_name(&listing().on_action(Action::Back)), "pop");
+        assert_eq!(nav_name(&listing().on_action(Action::Quit)), "stay");
     }
 
     #[test]
     fn enter_opens_the_timeline_of_the_highlighted_sender() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Down));
+        screen.on_action(Action::MoveDown);
 
-        let nav = screen.on_key(key(KeyCode::Enter));
+        let nav = screen.on_action(Action::Activate);
 
         assert_eq!(nav_name(&nav), "push detail");
         match nav {
-            Nav::Push(Screen::SenderHistory(detail)) => {
+            Nav::Push(SubView::SenderHistory(detail)) => {
                 assert_eq!(detail.sender().0, visible_addresses(&screen)[1]);
             }
             _ => unreachable!(),
@@ -706,9 +684,9 @@ mod tests {
     fn an_empty_history_offers_nothing_to_open_and_still_goes_back() {
         let mut screen = HistoryScreen::new(Vec::new());
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Enter))), "stay");
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Down))), "stay");
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::MoveDown)), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "pop");
     }
 
     // -- sorting and filtering -----------------------------------------------
@@ -720,10 +698,10 @@ mod tests {
 
         let mut seen = vec![start];
         for _ in 0..HistorySort::ALL.len() - 1 {
-            screen.on_key(key(KeyCode::Char('s')));
+            screen.on_action(Action::Mnemonic('s'));
             seen.push(screen.filter.sort);
         }
-        screen.on_key(key(KeyCode::Char('s')));
+        screen.on_action(Action::Mnemonic('s'));
 
         assert_eq!(screen.filter.sort, start, "the cycle closes");
         for order in HistorySort::ALL {
@@ -735,21 +713,21 @@ mod tests {
     fn r_shows_only_the_senders_that_ignored_an_unsubscribe() {
         let mut screen = listing();
 
-        screen.on_key(key(KeyCode::Char('r')));
+        screen.on_action(Action::Mnemonic('r'));
         assert!(screen.filter.resumed_only);
         assert_eq!(visible_addresses(&screen), ["bad@acme.example.com"]);
 
-        screen.on_key(key(KeyCode::Char('r')));
+        screen.on_action(Action::Mnemonic('r'));
         assert_eq!(visible_addresses(&screen).len(), 3);
     }
 
     #[test]
     fn a_filter_that_shrinks_the_list_pulls_the_cursor_back_into_it() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('G')));
+        screen.on_action(Action::Last);
         assert_eq!(screen.cursor, 2);
 
-        screen.on_key(key(KeyCode::Char('r')));
+        screen.on_action(Action::Mnemonic('r'));
 
         assert_eq!(screen.cursor, 0, "one row left, so the cursor is on it");
         assert!(screen.selected().is_some());
@@ -761,7 +739,7 @@ mod tests {
     fn slash_starts_a_search_and_the_keys_typed_become_the_needle() {
         let mut screen = listing();
 
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         assert!(screen.searching);
         typed(&mut screen, "beta");
 
@@ -773,7 +751,7 @@ mod tests {
     fn while_searching_the_list_keys_are_taken_as_text() {
         // `r`, `s` and `q` are filter keys outside the field and letters in it.
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
 
         typed(&mut screen, "rsq");
 
@@ -785,15 +763,15 @@ mod tests {
     #[test]
     fn backspace_takes_back_one_character_and_widens_the_list_again() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         typed(&mut screen, "beta");
 
-        screen.on_key(key(KeyCode::Backspace));
+        screen.on_action(Action::Erase);
 
         assert_eq!(screen.filter.search, "bet");
-        screen.on_key(key(KeyCode::Backspace));
-        screen.on_key(key(KeyCode::Backspace));
-        screen.on_key(key(KeyCode::Backspace));
+        screen.on_action(Action::Erase);
+        screen.on_action(Action::Erase);
+        screen.on_action(Action::Erase);
         assert_eq!(screen.filter.search, "");
         assert_eq!(visible_addresses(&screen).len(), 3);
     }
@@ -801,9 +779,9 @@ mod tests {
     #[test]
     fn backspace_on_an_empty_needle_does_nothing() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
 
-        screen.on_key(key(KeyCode::Backspace));
+        screen.on_action(Action::Erase);
 
         assert_eq!(screen.filter.search, "");
         assert!(screen.searching);
@@ -812,10 +790,10 @@ mod tests {
     #[test]
     fn enter_leaves_the_search_field_and_keeps_what_was_typed() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         typed(&mut screen, "beta");
 
-        screen.on_key(key(KeyCode::Enter));
+        screen.on_action(Action::Activate);
 
         assert!(!screen.searching);
         assert_eq!(screen.filter.search, "beta");
@@ -825,10 +803,10 @@ mod tests {
     #[test]
     fn esc_in_the_search_field_clears_the_needle_rather_than_leaving_the_screen() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         typed(&mut screen, "beta");
 
-        let nav = screen.on_key(key(KeyCode::Esc));
+        let nav = screen.on_action(Action::Back);
 
         assert_eq!(nav_name(&nav), "stay", "the screen stays open");
         assert!(!screen.searching);
@@ -839,7 +817,7 @@ mod tests {
     #[test]
     fn a_search_matches_the_list_id_as_well_as_the_address() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         typed(&mut screen, "deals.gamma");
 
         assert_eq!(visible_addresses(&screen), ["gone@gamma.example.net"]);
@@ -848,7 +826,7 @@ mod tests {
     #[test]
     fn a_needle_that_matches_nothing_leaves_no_row_selected() {
         let mut screen = listing();
-        screen.on_key(key(KeyCode::Char('/')));
+        screen.on_action(Action::Search);
         typed(&mut screen, "nobody");
 
         assert!(screen.visible.is_empty());
@@ -953,12 +931,12 @@ mod tests {
         let last = detail.rows.len() - 1;
 
         for _ in 0..10 {
-            detail.on_key(key(KeyCode::Down));
+            detail.on_action(Action::MoveDown);
         }
         assert_eq!(detail.cursor, last);
 
         for _ in 0..10 {
-            detail.on_key(key(KeyCode::Up));
+            detail.on_action(Action::MoveUp);
         }
         assert_eq!(detail.cursor, 0);
     }
@@ -967,8 +945,13 @@ mod tests {
     fn an_empty_timeline_does_not_panic() {
         let mut detail = detail_of(Vec::new());
 
-        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('G'), KeyCode::PageDown] {
-            detail.on_key(key(code));
+        for action in [
+            Action::MoveDown,
+            Action::MoveUp,
+            Action::Last,
+            Action::PageDown,
+        ] {
+            detail.on_action(action);
             assert_eq!(detail.cursor, 0);
         }
     }
@@ -981,10 +964,10 @@ mod tests {
 
         assert!(detail.is_actionable());
         assert_eq!(
-            nav_name(&detail.on_key(key(KeyCode::Char('u')))),
+            nav_name(&detail.on_action(Action::Mnemonic('u'))),
             "run from history"
         );
-        assert!(detail.hints().contains("unsubscribe again"));
+        assert!(detail.actions().contains(&Action::Mnemonic('u')));
     }
 
     #[test]
@@ -996,8 +979,8 @@ mod tests {
         });
 
         assert!(!detail.is_actionable());
-        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('u')))), "stay");
-        assert!(!detail.hints().contains("unsubscribe again"));
+        assert_eq!(nav_name(&detail.on_action(Action::Mnemonic('u'))), "stay");
+        assert!(!detail.actions().contains(&Action::Mnemonic('u')));
     }
 
     #[test]
@@ -1010,7 +993,7 @@ mod tests {
         });
 
         assert!(!detail.is_actionable());
-        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('u')))), "stay");
+        assert_eq!(nav_name(&detail.on_action(Action::Mnemonic('u'))), "stay");
     }
 
     #[test]
@@ -1024,8 +1007,8 @@ mod tests {
     fn esc_and_q_leave_a_timeline() {
         let mut detail = DetailScreen::new(view("bad@acme.example.com", None, 0));
 
-        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Esc))), "pop");
-        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('q')))), "pop");
+        assert_eq!(nav_name(&detail.on_action(Action::Back)), "pop");
+        assert_eq!(nav_name(&detail.on_action(Action::Quit)), "stay");
     }
 
     // -- wording -------------------------------------------------------------

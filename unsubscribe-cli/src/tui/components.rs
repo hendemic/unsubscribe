@@ -7,9 +7,11 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+
+use super::keys::{self, Action};
 
 /// Width of the key column in the help overlay: a right-aligned key, padded.
 const KEY_COLUMN: usize = 15;
@@ -104,25 +106,25 @@ impl Dialog {
     }
 
     /// Apply one keypress.
+    ///
+    /// The same key map every panel uses, so a question answers `y`/`Enter`
+    /// and `n`/`Esc` exactly as the footer says -- and `q` does nothing here,
+    /// because `q` is never "back".
     pub fn on_key(&mut self, key: KeyEvent) -> DialogOutcome {
-        match self.kind {
-            // Anything dismisses a notice, so there is no wrong key to press.
-            DialogKind::Error => DialogOutcome::Confirmed,
-            DialogKind::Confirm => match key.code {
-                KeyCode::Char('d') if self.toggle.is_some() => {
-                    if let Some(toggle) = self.toggle.as_mut() {
-                        toggle.on = !toggle.on;
-                    }
-                    DialogOutcome::Open
+        // Anything dismisses a notice, so there is no wrong key to press.
+        if self.kind == DialogKind::Error {
+            return DialogOutcome::Confirmed;
+        }
+        match keys::action(key, false) {
+            Some(Action::Mnemonic('d')) if self.toggle.is_some() => {
+                if let Some(toggle) = self.toggle.as_mut() {
+                    toggle.on = !toggle.on;
                 }
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    DialogOutcome::Confirmed
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
-                    DialogOutcome::Dismissed
-                }
-                _ => DialogOutcome::Open,
-            },
+                DialogOutcome::Open
+            }
+            Some(Action::Activate | Action::Mnemonic('y')) => DialogOutcome::Confirmed,
+            Some(Action::Back | Action::Mnemonic('n')) => DialogOutcome::Dismissed,
+            _ => DialogOutcome::Open,
         }
     }
 
@@ -313,7 +315,7 @@ mod tests {
 
     #[test]
     fn enter_and_y_confirm_a_question() {
-        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('Y')] {
+        for code in [KeyCode::Enter, KeyCode::Char('y')] {
             assert_eq!(
                 confirm().on_key(key(code)),
                 DialogOutcome::Confirmed,
@@ -323,13 +325,8 @@ mod tests {
     }
 
     #[test]
-    fn esc_n_and_q_decline_a_question() {
-        for code in [
-            KeyCode::Esc,
-            KeyCode::Char('n'),
-            KeyCode::Char('N'),
-            KeyCode::Char('q'),
-        ] {
+    fn esc_and_n_decline_a_question() {
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
             assert_eq!(
                 confirm().on_key(key(code)),
                 DialogOutcome::Dismissed,
@@ -340,8 +337,10 @@ mod tests {
 
     #[test]
     fn a_key_that_means_nothing_leaves_the_question_open() {
-        assert_eq!(confirm().on_key(key(KeyCode::Char('x'))), DialogOutcome::Open);
+        assert_eq!(confirm().on_key(key(KeyCode::Char('z'))), DialogOutcome::Open);
         assert_eq!(confirm().on_key(key(KeyCode::Down)), DialogOutcome::Open);
+        // q is never "back": it would be a silent cancel here.
+        assert_eq!(confirm().on_key(key(KeyCode::Char('q'))), DialogOutcome::Open);
     }
 
     #[test]

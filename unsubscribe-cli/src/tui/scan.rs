@@ -8,12 +8,12 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unsubscribe_core::ObtainedSenders;
 
 use super::app::{Effect, Nav};
+use super::keys::Action;
 use super::worker::{ScanOutcome, ScanShared};
 
 /// Where the scan has got to.
@@ -86,29 +86,34 @@ impl ScanScreen {
         Nav::Effect(Effect::ScanEnded)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Nav {
-        match key.code {
-            // Already stopping: asking again would change nothing.
-            KeyCode::Esc | KeyCode::Char('q') if self.state == ScanState::Running => {
+    pub fn on_action(&mut self, action: Action) -> Nav {
+        match action {
+            // Esc asks before throwing the work away; already stopping,
+            // asking again would change nothing.
+            Action::Back if self.state == ScanState::Running => {
                 Nav::Effect(Effect::ConfirmCancelScan)
             }
             _ => Nav::Stay,
         }
     }
 
-    pub fn hints(&self) -> &'static str {
+    /// The actions this sub-view answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Action> {
         match self.state {
-            ScanState::Running => " Esc: cancel the scan | ?: keys",
-            ScanState::Cancelling => " stopping at the next batch\u{2026}",
-            ScanState::Ended => " finishing\u{2026}",
+            ScanState::Running => vec![Action::Help, Action::Back],
+            _ => vec![Action::Help],
         }
     }
 
-    pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("Esc / q", "cancel the scan"),
-            ("?", "show this help"),
-        ]
+    /// A word for what the scan is doing, for the working area's title.
+    #[must_use]
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            ScanState::Running => "scanning",
+            ScanState::Cancelling => "stopping at the next batch",
+            ScanState::Ended => "finishing",
+        }
     }
 }
 
@@ -217,14 +222,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::mpsc;
 
     use super::super::app::Effect;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     /// What a `Nav` is, for asserting on without a shell.
     fn nav_name(nav: &Nav) -> &'static str {
@@ -287,8 +287,9 @@ mod tests {
     fn esc_while_scanning_asks_before_stopping() {
         let (mut screen, _tx) = running();
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "confirm cancel");
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Char('q')))), "confirm cancel");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "confirm cancel");
+        // q is never "back", so it cannot silently abandon a scan.
+        assert_eq!(nav_name(&screen.on_action(Action::Quit)), "stay");
     }
 
     #[test]
@@ -309,7 +310,7 @@ mod tests {
         let (mut screen, _tx) = running();
         screen.request_cancel();
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "stay");
         assert_eq!(screen.state, ScanState::Cancelling);
     }
 
@@ -385,11 +386,16 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_says_what_the_scan_is_doing() {
+    fn the_working_area_says_what_the_scan_is_doing() {
         let (mut screen, _tx) = running();
-        assert!(screen.hints().contains("cancel"));
+        assert_eq!(screen.state_label(), "scanning");
+        assert!(screen.actions().contains(&Action::Back), "cancel is offered");
 
         screen.request_cancel();
-        assert!(screen.hints().contains("stopping"));
+        assert!(screen.state_label().contains("stopping"));
+        assert!(
+            !screen.actions().contains(&Action::Back),
+            "asking again would change nothing"
+        );
     }
 }
