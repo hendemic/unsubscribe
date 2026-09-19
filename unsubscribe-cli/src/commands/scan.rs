@@ -7,7 +7,7 @@ use unsubscribe_core::{
     AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, ScanWatermark, SenderInfo,
 };
 
-use crate::terminal::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
+use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::time::{is_stale, now_iso8601};
 use crate::{make_provider, progress};
 
@@ -142,7 +142,7 @@ pub fn cmd_scan(
         } else if !s.unsubscribe_urls.is_empty() {
             ("http", CYAN)
         } else {
-            ("mailto", YELLOW)
+            ("mailto", BLUE)
         };
         println!(
             " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}{DIM}{stale_marker}{RESET}",

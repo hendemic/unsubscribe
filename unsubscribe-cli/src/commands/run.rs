@@ -18,7 +18,6 @@ pub fn cmd_run(
     dry_run: bool,
     min_emails: u32,
     cached: bool,
-    mailto: bool,
 ) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
@@ -128,11 +127,20 @@ pub fn cmd_run(
         eprintln!("{BOLD}Unsubscribing...{RESET}\n");
         let http_client = http::ReqwestHttpClient::new()?;
 
-        let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> = if mailto {
-            Some(make_email_sender(account, credential)?)
-        } else {
-            None
-        };
+        // Mailto unsubscribe is attempted automatically alongside HTTP. If a
+        // sender can't be constructed (e.g. SMTP not configured for this
+        // account), mailto-only senders are skipped in `unsubscribe_core::unsubscribe`
+        // rather than aborting the whole run.
+        let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> =
+            match make_email_sender(account, credential) {
+                Ok(sender) => Some(sender),
+                Err(e) => {
+                    eprintln!(
+                        "{YELLOW}Note: mailto unsubscribe unavailable ({e}). Mailto-only senders will be skipped.{RESET}"
+                    );
+                    None
+                }
+            };
 
         let pb = ProgressBar::new(to_unsub.len() as u64);
         pb.set_style(

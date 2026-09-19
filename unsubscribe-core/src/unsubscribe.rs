@@ -142,7 +142,7 @@ fn unsubscribe_one(
                 return match sender_impl.send_email(&parsed.to, &subject, &body) {
                     Ok(()) => UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "mailto (sent)".to_string(),
+                        method: "mailto".to_string(),
                         success: true,
                         detail: format!("Email sent to {}", parsed.to),
                         url: fallback_url,
