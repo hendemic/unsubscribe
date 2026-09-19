@@ -503,3 +503,147 @@ impl Default for Preferences {
         }
     }
 }
+
+#[cfg(test)]
+mod unsubscribe_method_tests {
+    use super::*;
+
+    /// The storage identifier of every variant, written out by hand.
+    ///
+    /// These strings are a storage contract: they are already in users'
+    /// `history.db`, so renaming one silently orphans their evidence. Any
+    /// change here has to be a deliberate edit of this table.
+    const PINNED_IDS: [(UnsubscribeMethod, &str); 10] = [
+        (UnsubscribeMethod::OneClickPost, "one_click_post"),
+        (UnsubscribeMethod::Get, "get"),
+        (UnsubscribeMethod::FormPost, "form_post"),
+        (UnsubscribeMethod::FormGet, "form_get"),
+        (UnsubscribeMethod::ConfirmLink, "confirm_link"),
+        (UnsubscribeMethod::MailtoSent, "mailto_sent"),
+        (UnsubscribeMethod::MailtoFailed, "mailto_failed"),
+        (UnsubscribeMethod::MailtoSkipped, "mailto_skipped"),
+        (UnsubscribeMethod::None, "none"),
+        (UnsubscribeMethod::DryRun, "dry_run"),
+    ];
+
+    #[test]
+    fn every_variant_is_listed_in_the_pinned_table() {
+        // Exhaustive on purpose: adding a variant makes this match fail to
+        // compile, which is the prompt to pin its id in `PINNED_IDS`.
+        fn accounted_for(method: UnsubscribeMethod) {
+            match method {
+                UnsubscribeMethod::OneClickPost
+                | UnsubscribeMethod::Get
+                | UnsubscribeMethod::FormPost
+                | UnsubscribeMethod::FormGet
+                | UnsubscribeMethod::ConfirmLink
+                | UnsubscribeMethod::MailtoSent
+                | UnsubscribeMethod::MailtoFailed
+                | UnsubscribeMethod::MailtoSkipped
+                | UnsubscribeMethod::None
+                | UnsubscribeMethod::DryRun => {}
+            }
+        }
+        for (method, _) in PINNED_IDS {
+            accounted_for(method);
+        }
+    }
+
+    #[test]
+    fn storage_ids_match_the_pinned_table() {
+        for (method, id) in PINNED_IDS {
+            assert_eq!(method.as_id(), id, "storage id changed for {method:?}");
+        }
+    }
+
+    #[test]
+    fn storage_ids_are_distinct() {
+        let mut ids: Vec<&str> = PINNED_IDS.iter().map(|(_, id)| *id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "two variants share a storage id");
+    }
+
+    #[test]
+    fn from_id_round_trips_every_storage_id() {
+        for (method, id) in PINNED_IDS {
+            assert_eq!(UnsubscribeMethod::from_id(id), Some(method));
+        }
+    }
+
+    #[test]
+    fn from_id_rejects_unknown_ids() {
+        assert_eq!(UnsubscribeMethod::from_id(""), None);
+        assert_eq!(UnsubscribeMethod::from_id("mailto"), None);
+        assert_eq!(UnsubscribeMethod::from_id("one-click-post"), None);
+    }
+
+    #[test]
+    fn from_id_is_case_sensitive() {
+        // History rows are written by `as_id`, which is always lowercase; an
+        // uppercase id is corrupt data, not a synonym.
+        assert_eq!(UnsubscribeMethod::from_id("Mailto_Sent"), None);
+        assert_eq!(UnsubscribeMethod::from_id("DRY_RUN"), None);
+    }
+
+    #[test]
+    fn mailto_sent_display_label_differs_from_its_storage_id() {
+        // The label was shortened to "mailto" for CLI output; the stored id
+        // must not have followed it.
+        assert_eq!(UnsubscribeMethod::MailtoSent.label(), "mailto");
+        assert_eq!(UnsubscribeMethod::MailtoSent.as_id(), "mailto_sent");
+    }
+
+    #[test]
+    fn display_renders_the_label_not_the_id() {
+        assert_eq!(UnsubscribeMethod::MailtoSent.to_string(), "mailto");
+        assert_eq!(UnsubscribeMethod::OneClickPost.to_string(), "one-click POST");
+        assert_eq!(UnsubscribeMethod::DryRun.to_string(), "dry-run");
+    }
+
+    #[test]
+    fn labels_are_distinct_so_cli_output_is_unambiguous() {
+        let mut labels: Vec<&str> = PINNED_IDS
+            .iter()
+            .map(|(method, _)| method.label())
+            .collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two variants share a display label");
+    }
+}
+
+#[cfg(test)]
+mod sender_info_compat_tests {
+    use super::*;
+
+    /// A `SenderInfo` as it was serialized before `list_id` and
+    /// `list_unsubscribe_raw` existed, typed out rather than round-tripped so
+    /// the old shape is fixed by the test rather than by today's struct.
+    const PRE_LIST_ID_SENDER: &str = r#"{
+        "display_name": "Acme Newsletter",
+        "email": "news@acme.example.com",
+        "domain": "acme.example.com",
+        "unsubscribe_urls": ["https://acme.example.com/unsub"],
+        "unsubscribe_mailto": [],
+        "one_click": true,
+        "email_count": 7,
+        "messages": [{"folder": "INBOX", "message_id": "INBOX:42:1"}],
+        "last_seen": 1700000000
+    }"#;
+
+    #[test]
+    fn sender_serialized_before_list_id_existed_still_deserializes() {
+        let sender: SenderInfo =
+            serde_json::from_str(PRE_LIST_ID_SENDER).expect("old sender shape must still load");
+
+        assert_eq!(sender.email, "news@acme.example.com");
+        assert_eq!(sender.email_count, 7);
+        assert_eq!(sender.messages.len(), 1);
+        assert_eq!(sender.last_seen, Some(1_700_000_000));
+        assert_eq!(sender.list_id, None);
+        assert_eq!(sender.list_unsubscribe_raw, None);
+    }
+}

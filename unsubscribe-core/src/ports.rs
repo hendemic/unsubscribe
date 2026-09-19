@@ -221,3 +221,60 @@ pub trait ScanCacheStore {
     /// senders are ignored; matching is case-insensitive.
     fn remove_cached_senders(&self, account: &str, sender_emails: &[String]) -> Result<()>;
 }
+
+#[cfg(test)]
+mod cached_scan_compat_tests {
+    use super::*;
+
+    /// A cached scan as the file-based cache wrote it before `list_id` and
+    /// `list_unsubscribe_raw` were added to `SenderInfo`.
+    ///
+    /// Typed out rather than produced by serializing today's struct: the point
+    /// is that a document written by an older build still loads.
+    const PRE_LIST_ID_CACHE: &str = r#"{
+        "meta": {
+            "scanned_at": "2026-03-18T19:30:00Z",
+            "format_version": 1,
+            "account": "user@example.com"
+        },
+        "senders": [
+            {
+                "display_name": "Acme Newsletter",
+                "email": "news@acme.example.com",
+                "domain": "acme.example.com",
+                "unsubscribe_urls": ["https://acme.example.com/unsub"],
+                "unsubscribe_mailto": ["mailto:unsub@acme.example.com"],
+                "one_click": true,
+                "email_count": 7,
+                "messages": [{"folder": "INBOX", "message_id": "INBOX:42:1"}],
+                "last_seen": null
+            }
+        ],
+        "watermark": {
+            "highest_uid": {"INBOX": 42},
+            "uid_validity": {"INBOX": 1},
+            "adapter_state": null
+        }
+    }"#;
+
+    #[test]
+    fn cache_written_before_list_id_existed_still_deserializes() {
+        let cache: CachedScan =
+            serde_json::from_str(PRE_LIST_ID_CACHE).expect("old cache shape must still load");
+
+        assert_eq!(cache.meta.account, "user@example.com");
+        assert_eq!(cache.meta.scanned_at, "2026-03-18T19:30:00Z");
+        assert_eq!(cache.senders.len(), 1);
+
+        let sender = &cache.senders[0];
+        assert_eq!(sender.email, "news@acme.example.com");
+        assert_eq!(sender.unsubscribe_urls, ["https://acme.example.com/unsub"]);
+        assert_eq!(sender.last_seen, None);
+        assert_eq!(sender.list_id, None);
+        assert_eq!(sender.list_unsubscribe_raw, None);
+
+        assert_eq!(cache.watermark.highest_uid.get("INBOX"), Some(&42));
+        assert_eq!(cache.watermark.uid_validity.get("INBOX"), Some(&1));
+        assert_eq!(cache.watermark.adapter_state, None);
+    }
+}

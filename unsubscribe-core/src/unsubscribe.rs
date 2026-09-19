@@ -398,6 +398,10 @@ mod tests {
         responses: Mutex<HashMap<String, (u16, String)>>,
         /// URLs that should return an error instead of a response.
         errors: Mutex<HashMap<String, String>>,
+        /// Where a request to a URL says it ended up, when it differs from the
+        /// URL that was requested. Lets a test tell the requested URL and the
+        /// reported landing URL apart.
+        landings: Mutex<HashMap<String, String>>,
     }
 
     impl MockHttpClient {
@@ -405,7 +409,17 @@ mod tests {
             Self {
                 responses: Mutex::new(HashMap::new()),
                 errors: Mutex::new(HashMap::new()),
+                landings: Mutex::new(HashMap::new()),
             }
+        }
+
+        /// Make requests to `url` report `final_url` as where they landed.
+        fn landing_at(self, url: &str, final_url: &str) -> Self {
+            self.landings
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), final_url.to_string());
+            self
         }
 
         fn on_url(self, url: &str, status: u16, body: &str) -> Self {
@@ -429,10 +443,17 @@ mod tests {
                 bail!("{msg}");
             }
             if let Some((status, body)) = self.responses.lock().unwrap().get(url) {
+                let final_url = self
+                    .landings
+                    .lock()
+                    .unwrap()
+                    .get(url)
+                    .cloned()
+                    .unwrap_or_else(|| url.to_string());
                 Ok(HttpResponse {
                     status: *status,
                     body: body.clone(),
-                    final_url: Some(url.to_string()),
+                    final_url: Some(final_url),
                 })
             } else {
                 bail!("No mock response configured for {url}");
@@ -1091,4 +1112,279 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Evidence fields: http_status and final_url
+    //
+    // These are what a later violation report quotes, so every flow has to
+    // carry them through from the HTTP response -- and the flows that never
+    // make a request have to leave them empty rather than inventing a value.
+    // -----------------------------------------------------------------------
+
+    /// A mailto target that reports success without touching the network.
+    struct StubEmailSender;
+
+    impl EmailSender for StubEmailSender {
+        fn send_email(&self, _to: &str, _subject: &str, _body: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A mailto target whose send always fails.
+    struct FailingEmailSender;
+
+    impl EmailSender for FailingEmailSender {
+        fn send_email(&self, _to: &str, _subject: &str, _body: &str) -> Result<()> {
+            bail!("SMTP refused");
+        }
+    }
+
+    #[test]
+    fn one_click_post_records_status_and_landing_url() {
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 202, "")
+            .landing_at("https://example.com/unsub", "https://cdn.example.net/done");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            true,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
+        assert_eq!(result.http_status, Some(202));
+        assert_eq!(result.final_url.as_deref(), Some("https://cdn.example.net/done"));
+    }
+
+    #[test]
+    fn one_click_post_records_status_of_a_failed_attempt() {
+        let http = MockHttpClient::new().on_url("https://example.com/unsub", 503, "");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            true,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert!(!result.success);
+        assert_eq!(result.http_status, Some(503));
+    }
+
+    #[test]
+    fn get_records_status_and_landing_url() {
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 200, "<html>You are unsubscribed.</html>")
+            .landing_at("https://example.com/unsub", "https://example.com/bye");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::Get);
+        assert_eq!(result.http_status, Some(200));
+        assert_eq!(result.final_url.as_deref(), Some("https://example.com/bye"));
+    }
+
+    #[test]
+    fn get_records_status_of_a_non_2xx_response() {
+        let http = MockHttpClient::new().on_url("https://example.com/unsub", 404, "");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert!(!result.success);
+        assert_eq!(result.http_status, Some(404));
+    }
+
+    #[test]
+    fn transport_error_leaves_status_and_landing_url_empty() {
+        let http = MockHttpClient::new().error_on("https://example.com/unsub", "connection reset");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::Get);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
+
+    #[test]
+    fn form_post_records_the_submit_response_not_the_page_response() {
+        let page = r#"<html><body>
+            <form method="POST" action="https://example.com/confirm">
+                <input type="submit" name="action" value="Unsubscribe">
+            </form>
+        </body></html>"#;
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 200, page)
+            .on_url("https://example.com/confirm", 201, "done")
+            .landing_at("https://example.com/confirm", "https://example.com/confirmed");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::FormPost);
+        assert_eq!(result.http_status, Some(201));
+        assert_eq!(
+            result.final_url.as_deref(),
+            Some("https://example.com/confirmed")
+        );
+    }
+
+    #[test]
+    fn form_get_records_the_submit_response() {
+        let page = r#"<html><body>
+            <form method="GET" action="https://example.com/confirm">
+                <input type="hidden" name="token" value="abc">
+                <input type="submit" name="action" value="Unsubscribe">
+            </form>
+        </body></html>"#;
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 200, page)
+            .on_url(
+                "https://example.com/confirm?token=abc&action=Unsubscribe",
+                200,
+                "done",
+            )
+            .landing_at(
+                "https://example.com/confirm?token=abc&action=Unsubscribe",
+                "https://example.com/confirmed",
+            );
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::FormGet);
+        assert_eq!(result.http_status, Some(200));
+        assert_eq!(
+            result.final_url.as_deref(),
+            Some("https://example.com/confirmed")
+        );
+    }
+
+    #[test]
+    fn form_submit_error_leaves_status_and_landing_url_empty() {
+        let page = r#"<html><body>
+            <form method="POST" action="https://example.com/confirm">
+                <input type="submit" name="action" value="Unsubscribe">
+            </form>
+        </body></html>"#;
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 200, page)
+            .error_on("https://example.com/confirm", "timed out");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::FormPost);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
+
+    #[test]
+    fn confirm_link_records_the_followed_response() {
+        let page = r#"<html><body>
+            <a href="https://example.com/confirm">Confirm unsubscribe</a>
+        </body></html>"#;
+        let http = MockHttpClient::new()
+            .on_url("https://example.com/unsub", 200, page)
+            .on_url("https://example.com/confirm", 204, "")
+            .landing_at("https://example.com/confirm", "https://example.com/gone");
+        let sender = make_sender(
+            "news@example.com",
+            vec!["https://example.com/unsub"],
+            vec![],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::ConfirmLink);
+        assert_eq!(result.http_status, Some(204));
+        assert_eq!(result.final_url.as_deref(), Some("https://example.com/gone"));
+    }
+
+    #[test]
+    fn mailto_sent_has_no_http_evidence() {
+        let http = MockHttpClient::new();
+        let sender = make_sender(
+            "news@example.com",
+            vec![],
+            vec!["mailto:unsub@example.com"],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, Some(&StubEmailSender));
+        assert_eq!(result.method, UnsubscribeMethod::MailtoSent);
+        assert!(result.success);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
+
+    #[test]
+    fn mailto_failed_has_no_http_evidence() {
+        let http = MockHttpClient::new();
+        let sender = make_sender(
+            "news@example.com",
+            vec![],
+            vec!["mailto:unsub@example.com"],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, Some(&FailingEmailSender));
+        assert_eq!(result.method, UnsubscribeMethod::MailtoFailed);
+        assert!(!result.success);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
+
+    #[test]
+    fn mailto_skipped_has_no_http_evidence() {
+        let http = MockHttpClient::new();
+        let sender = make_sender(
+            "news@example.com",
+            vec![],
+            vec!["mailto:unsub@example.com"],
+            false,
+        );
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::MailtoSkipped);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
+
+    #[test]
+    fn no_mechanism_at_all_has_no_http_evidence() {
+        let http = MockHttpClient::new();
+        let sender = make_sender("news@example.com", vec![], vec![], false);
+
+        let result = unsubscribe_one(&sender, &http, None);
+        assert_eq!(result.method, UnsubscribeMethod::None);
+        assert_eq!(result.http_status, None);
+        assert_eq!(result.final_url, None);
+    }
 }
