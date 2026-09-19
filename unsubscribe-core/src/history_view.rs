@@ -481,6 +481,203 @@ pub fn filter_histories(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The flat event log
+// ---------------------------------------------------------------------------
+
+/// One line of the account-wide event feed.
+///
+/// The same [`TimelineEvent`] a sender's timeline is made of, carrying the
+/// sender identity the flat feed needs in order to name who the event is
+/// about. Pure data: consumers choose the wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntry {
+    /// When the event happened, in Unix seconds (UTC).
+    pub at: i64,
+    pub sender_email: String,
+    pub sender_domain: String,
+    pub list_id: Option<String>,
+    pub event: TimelineEvent,
+    /// The attempt this one escalates from, when `follows_attempt_id` names a
+    /// row the feed also holds. Resolved here so the consumer never has to
+    /// index the attempts itself.
+    pub follows: Option<LogReference>,
+}
+
+impl LogEntry {
+    /// Whether the entry records something that did not work: a failed
+    /// attempt, or a sender that kept mailing.
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        match &self.event {
+            TimelineEvent::Attempt(attempt) => !attempt.success,
+            TimelineEvent::Resumption(_) => true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_resumption(&self) -> bool {
+        matches!(self.event, TimelineEvent::Resumption(_))
+    }
+}
+
+/// Enough of an earlier attempt to name it in the entry that escalates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogReference {
+    pub attempt_id: String,
+    /// Stable method id, not a display string.
+    pub method: String,
+    pub at: i64,
+}
+
+/// Which kinds of event a log listing is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogKind {
+    #[default]
+    All,
+    /// Failed attempts and resumptions -- everything that did not work.
+    Failures,
+    Resumptions,
+}
+
+impl LogKind {
+    pub const ALL: [LogKind; 3] = [Self::All, Self::Failures, Self::Resumptions];
+
+    /// The next kind in the cycle, for a consumer with one key for it.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Failures,
+            Self::Failures => Self::Resumptions,
+            Self::Resumptions => Self::All,
+        }
+    }
+
+    #[must_use]
+    pub fn matches(self, entry: &LogEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Failures => entry.is_failure(),
+            Self::Resumptions => entry.is_resumption(),
+        }
+    }
+}
+
+/// What a consumer is currently showing of the event log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    pub kind: LogKind,
+    /// Matched against address, domain, list id, method and detail.
+    pub search: String,
+    /// Only events at or after this Unix timestamp.
+    pub since: Option<i64>,
+}
+
+impl LogFilter {
+    #[must_use]
+    pub fn matches(&self, entry: &LogEntry) -> bool {
+        self.kind.matches(entry)
+            && self.since.is_none_or(|since| entry.at >= since)
+            && matches_log_search(entry, &self.search)
+    }
+}
+
+/// Every recorded event for an account, newest first.
+///
+/// The flat counterpart of [`sender_histories`]: no grouping and no verdicts,
+/// because a chronological feed answers "what happened, in order" rather than
+/// "what became of this sender". Ties are broken by address so the order never
+/// depends on how the rows came out of the store.
+#[must_use]
+pub fn event_log(attempts: &[UnsubscribeAttempt], resumptions: &[Resumption]) -> Vec<LogEntry> {
+    // Attempt id to what it was, for naming the attempt an escalation answers.
+    let by_id: HashMap<&str, &UnsubscribeAttempt> = attempts
+        .iter()
+        .map(|attempt| (attempt.id.as_str(), attempt))
+        .collect();
+
+    let mut entries: Vec<LogEntry> = attempts
+        .iter()
+        .map(|attempt| LogEntry {
+            at: attempt.attempted_at,
+            sender_email: attempt.sender_email.clone(),
+            sender_domain: attempt.sender_domain.clone(),
+            list_id: attempt.list_id.clone(),
+            follows: attempt
+                .follows_attempt_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+                .map(|earlier| LogReference {
+                    attempt_id: earlier.id.clone(),
+                    method: earlier.method.clone(),
+                    at: earlier.attempted_at,
+                }),
+            event: TimelineEvent::Attempt(attempt.clone()),
+        })
+        .chain(resumptions.iter().map(|resumption| LogEntry {
+            at: resumption.observed_at,
+            sender_email: resumption.sender_email.clone(),
+            // A resumption carries no domain of its own; the address does.
+            sender_domain: resumption
+                .sender_email
+                .split('@')
+                .nth(1)
+                .unwrap_or_default()
+                .to_string(),
+            list_id: resumption.list_id.clone(),
+            follows: None,
+            event: TimelineEvent::Resumption(resumption.clone()),
+        }))
+        .collect();
+
+    entries.sort_by(|a, b| {
+        b.at.cmp(&a.at)
+            .then_with(|| a.sender_email.cmp(&b.sender_email))
+    });
+    entries
+}
+
+/// Whether one entry matches a search needle.
+///
+/// An empty needle matches everything, so a consumer can call this while the
+/// user is still typing.
+#[must_use]
+pub fn matches_log_search(entry: &LogEntry, needle: &str) -> bool {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    let (method, detail) = match &entry.event {
+        TimelineEvent::Attempt(attempt) => (attempt.method.as_str(), attempt.detail.as_str()),
+        TimelineEvent::Resumption(_) => ("resumed", ""),
+    };
+    [
+        Some(entry.sender_email.as_str()),
+        Some(entry.sender_domain.as_str()),
+        entry.list_id.as_deref(),
+        Some(method),
+        Some(detail),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(&needle))
+}
+
+/// The entries a filter selects, as indices into `entries`.
+///
+/// Indices rather than references so a consumer can build the log once per
+/// screen entry and re-derive the visible list as the user types. The feed is
+/// already newest-first, so filtering never reorders it.
+#[must_use]
+pub fn visible_log(entries: &[LogEntry], filter: &LogFilter) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| filter.matches(entry))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
