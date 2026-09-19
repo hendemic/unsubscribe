@@ -1,19 +1,55 @@
 //! `run` command: scan, select, unsubscribe, and archive in one pass.
+//!
+//! The decisions all live in `unsubscribe_core::pipeline` and
+//! `unsubscribe_core::selection`; what is left here is the terminal: which
+//! phase headers to print, whether to open the selection screen or apply a
+//! policy, and how to explain a failure.
+//!
+//! Two ways in, one pipeline. With a selection flag the run is headless --
+//! no screen, no prompts, and an exit code a script can branch on. Without
+//! one, and with a terminal to ask at, it behaves exactly as it always has.
+
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::{json, Value};
 use unsubscribe_core::{
-    AccountConfig, Credential, DataStore, Folder, HistoryStore, Preferences, ScanCacheStore,
-    SenderInfo, UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
+    annotate_senders, decide_run_mode, execute_run, plan_run, record_resumptions, select_by_policy,
+    AccountConfig, AnnotatedSenders, Credential, DataStore, EmailSender, Folder, HistoryStore,
+    Preferences, RunContext, RunMode, RunOutcome, RunPlan, RunPolicy, ScanCacheStore, Selection,
+    SelectedSender, SelectionPolicy, SelectionReason, SenderInfo,
 };
+use unsubscribe_persistence::{LockOutcome, RunLock};
 
-use crate::action_log::append_log_entry;
 use crate::commands::load_history;
 use crate::commands::scan::{print_warnings_summary, resolve_scan};
-use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
-use crate::time::{is_stale, now_unix_secs};
+use crate::exit::{classify_provider_error, Exit, ExitError};
+use crate::json as json_out;
+use crate::note;
+use crate::output;
+use crate::progress::{CliRunObserver, CliWarningsOnly};
+use crate::terminal::{confirm, Tty, BOLD, DIM, RED, RESET, YELLOW};
+use crate::time::now_unix_secs;
 use crate::{http, make_email_sender, make_provider, tui};
 
+/// Everything `run` was asked to do, beyond the account and the stores.
+///
+/// One struct rather than nine positional flags, and the shape a future
+/// scheduler would fill in directly.
+#[derive(Debug, Clone)]
+pub struct RunRequest {
+    pub dry_run: bool,
+    pub cached: bool,
+    pub rescan: bool,
+    /// Answer every confirmation with yes. Required for an unattended run that
+    /// would otherwise have something to ask about.
+    pub yes: bool,
+    pub json: bool,
+    pub policy: SelectionPolicy,
+    pub tty: Tty,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_run(
     account: &AccountConfig,
     credential: &Credential,
@@ -21,512 +57,978 @@ pub fn cmd_run(
     cache_store: &dyn ScanCacheStore,
     history: Option<&dyn HistoryStore>,
     preferences: &Preferences,
-    dry_run: bool,
-    cached: bool,
-    rescan: bool,
-) -> Result<()> {
-    if dry_run {
-        eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
+    request: &RunRequest,
+) -> Result<Exit> {
+    let mode = decide_run_mode(&request.policy, request.tty.stdin);
+    if mode == RunMode::SelectionRequired {
+        return Err(ExitError::usage(SELECTION_REQUIRED).into());
     }
 
-    // Phase 1: Scan, or reuse a cached scan the user chose to keep
+    if request.dry_run {
+        note!("{BOLD}{YELLOW}=== DRY RUN MODE \u{2014} no changes will be made ==={RESET}\n");
+    }
+
+    // A dry run reads and writes nothing the archive cares about, so it is not
+    // worth blocking a real run for. Everything else takes the lock before it
+    // scans: two runs that both plan from the same cache will both try to move
+    // the same messages.
+    let _lock = if request.dry_run {
+        None
+    } else {
+        match RunLock::acquire(&account.account_id)? {
+            LockOutcome::Acquired(lock) => Some(lock),
+            LockOutcome::Held(held) => {
+                let who = held
+                    .pid
+                    .map(|pid| format!(" (process {pid})"))
+                    .unwrap_or_default();
+                return Err(ExitError::new(
+                    Exit::Locked,
+                    format!(
+                        "Another `unsubscribe run` is already working on {}{who}.\n\
+                         Lock file: {}",
+                        account.account_id,
+                        held.path.display()
+                    ),
+                )
+                .into());
+            }
+        }
+    };
+
+    let policy = RunPolicy {
+        min_emails: preferences.min_emails,
+        stale_after_months: preferences.stale_after_months,
+        grace_period_days: preferences.grace_period_days,
+        dry_run: request.dry_run,
+    };
+
+    // Phase 1: scan, or reuse a cached scan. A headless run is never asked
+    // about the cache; it takes a fresh one and rescans a stale one.
+    let prompts_allowed = request.tty.stdin && !request.yes && mode == RunMode::Interactive;
     let resolved = resolve_scan(
         account,
         credential,
         store,
         cache_store,
-        cached,
-        rescan,
+        request.cached,
+        request.rescan,
         preferences,
-    )?;
+        prompts_allowed,
+        request.tty,
+    )
+    .map_err(classify_provider_error)?;
     let from_cache = resolved.from_cache;
     let warnings = resolved.warnings;
     let senders = resolved.senders;
-    // The TUI header shows when the senders on screen were found, cached or not.
-    let scan_timestamp = Some(resolved.scanned_at);
 
     if from_cache {
-        eprintln!(
-            "{BOLD}Using cached scan from {}{RESET}\n",
-            scan_timestamp.as_deref().unwrap_or_default()
-        );
+        note!("{BOLD}Using cached scan from {}{RESET}\n", resolved.scanned_at);
     }
 
     if senders.is_empty() {
-        println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
+        note!("{YELLOW}No senders with unsubscribe links found.{RESET}");
         if !from_cache {
             print_warnings_summary(&warnings);
         }
-        return Ok(());
+        if request.json {
+            output::emit_json(&empty_document(account, &resolved.scanned_at, &warnings))?;
+        }
+        return Ok(Exit::NothingToDo);
     }
 
-    eprintln!(
+    note!(
         "\n{BOLD}Found {} senders{RESET} with unsubscribe links.\n",
         senders.len()
     );
 
-    // Phase 2: TUI selection. Senders we already unsubscribed from get their own
-    // section, so a sender that ignored an unsubscribe is the first thing seen.
-    let attempts = load_history(history, &account.account_id);
+    // Phase 2: annotate against history, then choose. Senders we already
+    // unsubscribed from get their own section, so a sender that ignored an
+    // unsubscribe is the first thing seen.
+    let history_view = load_history(history, &account.account_id);
+    let mut resumptions = history_view.resumptions;
+    let annotated = annotate_senders(
+        &account.account_id,
+        senders,
+        &history_view.attempts,
+        &resumptions,
+        &policy,
+        now_unix_secs(),
+    );
+    // Seeing a sender ignore an unsubscribe is evidence in its own right, so it
+    // is written before the user gets a chance to cancel out of the screen.
+    record_resumptions(&annotated, history, &policy, &CliWarningsOnly);
+    // Planning happens after selection, by which point these are part of the
+    // record -- and they are what makes the ignored rung spent.
+    resumptions.extend(annotated.new_resumptions.iter().cloned());
 
-    eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders, &attempts, scan_timestamp.as_deref(), preferences)? {
-        Some(s) => s,
-        None => {
-            eprintln!("{YELLOW}Cancelled.{RESET}");
-            return Ok(());
-        }
+    let Some(chosen) = choose_senders(annotated, request, &resolved.scanned_at, preferences)?
+    else {
+        note!("{YELLOW}Cancelled.{RESET}");
+        return Ok(Exit::NothingToDo);
     };
 
-    // Partition selected senders: active ones get HTTP unsubscribe + archive,
-    // stale ones (no message within `stale_after_months`) get archive-only.
-    let selected: Vec<&SenderInfo> = selections
+    if chosen.is_empty() {
+        note!("{YELLOW}No senders selected.{RESET}");
+        if request.json {
+            output::emit_json(&empty_document(account, &resolved.scanned_at, &warnings))?;
+        }
+        return Ok(Exit::NothingToDo);
+    }
+
+    // Phase 3: plan. Active senders get an unsubscribe attempt and an archive;
+    // stale ones (no message within `stale_after_months`) are archived only.
+    let reasons: HashMap<String, SelectionReason> = chosen
+        .selected
         .iter()
-        .filter(|(_, selected)| *selected)
-        .map(|(sender, _)| sender)
+        .map(|s| (s.sender.email.to_lowercase(), s.reason))
         .collect();
-
-    if selected.is_empty() {
-        eprintln!("{YELLOW}No senders selected.{RESET}");
-        return Ok(());
+    let plan = plan_run(
+        chosen.senders(),
+        &history_view.attempts,
+        &resumptions,
+        &policy,
+        now_unix_secs(),
+    );
+    announce_plan(&plan);
+    if request.dry_run {
+        report_dry_run(&plan, &reasons);
     }
 
-    let (to_unsub, to_archive_only): (Vec<&SenderInfo>, Vec<&SenderInfo>) =
-        selected
-            .iter()
-            .partition(|s| !is_stale(s, preferences.stale_after_months));
-
-    let total_emails: u32 = selected.iter().map(|s| s.email_count).sum();
-    if !to_unsub.is_empty() {
-        eprintln!(
-            "Will unsubscribe from {BOLD}{}{RESET} active senders ({} emails).",
-            to_unsub.len(),
-            to_unsub.iter().map(|s| s.email_count).sum::<u32>()
-        );
+    if !confirm_plan(&plan, request)? {
+        note!("{YELLOW}Cancelled.{RESET}");
+        return Ok(Exit::NothingToDo);
     }
-    if !to_archive_only.is_empty() {
-        eprintln!(
-            "Will archive {BOLD}{}{RESET} stale senders without unsubscribing ({} emails).",
-            to_archive_only.len(),
-            to_archive_only.iter().map(|s| s.email_count).sum::<u32>()
-        );
-    }
-    eprintln!("Total: {total_emails} emails.\n");
 
-    // Phase 3: Unsubscribe — only active (non-stale) senders get HTTP unsubscribe.
-    // Results are written incrementally so a later archive failure does not lose
-    // the record of which senders were already unsubscribed.
+    // Phase 4: execute. The action log starts fresh each run: it is a
+    // disposable view of this run, not the history.
     let log_path = unsubscribe_persistence::data_dir().join("unsubscribe_log.csv");
     std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
-
-    // Remove any previous run's log to start fresh.
     if log_path.exists() {
-        std::fs::remove_file(&log_path)
-            .with_context(|| format!("Failed to clear previous action log: {}", log_path.display()))?;
+        std::fs::remove_file(&log_path).with_context(|| {
+            format!("Failed to clear previous action log: {}", log_path.display())
+        })?;
     }
 
-    let results: Vec<UnsubscribeResult> = if to_unsub.is_empty() {
-        // All selected senders are stale — skip unsubscribe entirely.
-        Vec::new()
-    } else if dry_run {
-        eprintln!("{BOLD}Unsubscribing...{RESET}\n");
-        to_unsub
-            .iter()
-            .map(|s| {
-                let url = s
-                    .best_unsubscribe_url()
-                    .unwrap_or_default()
-                    .to_string();
-                UnsubscribeResult {
-                    email: s.email.clone(),
-                    method: UnsubscribeMethod::DryRun,
-                    success: true,
-                    detail: "Would unsubscribe".to_string(),
-                    url,
-                    http_status: None,
-                    final_url: None,
-                }
-            })
-            .collect()
+    let provider = make_provider(account, credential).map_err(classify_provider_error)?;
+    let http_client = http::ReqwestHttpClient::new()?;
+    // Mailto unsubscribe is attempted automatically alongside HTTP. If a sender
+    // cannot be constructed (e.g. SMTP not configured for this account),
+    // mailto-only senders are skipped inside the unsubscribe flow rather than
+    // aborting the whole run.
+    let email_sender: Option<Box<dyn EmailSender>> = if request.dry_run {
+        None
     } else {
-        eprintln!("{BOLD}Unsubscribing...{RESET}\n");
-        let http_client = http::ReqwestHttpClient::new()?;
-
-        // Mailto unsubscribe is attempted automatically alongside HTTP. If a
-        // sender can't be constructed (e.g. SMTP not configured for this
-        // account), mailto-only senders are skipped in `unsubscribe_core::unsubscribe`
-        // rather than aborting the whole run.
-        let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> =
-            match make_email_sender(account, credential) {
-                Ok(sender) => Some(sender),
-                Err(e) => {
-                    eprintln!(
-                        "{YELLOW}Note: mailto unsubscribe unavailable ({e}). Mailto-only senders will be skipped.{RESET}"
-                    );
-                    None
-                }
-            };
-
-        let pb = ProgressBar::new(to_unsub.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(" [{bar:40.cyan/dim}] \x1b[36m{pos}\x1b[0m/{len} unsubscribing")
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-
-        let results: Vec<UnsubscribeResult> = to_unsub
-            .iter()
-            .map(|sender| {
-                let result = unsubscribe_core::unsubscribe(
-                    &[sender],
-                    &http_client,
-                    email_sender.as_deref(),
-                )
-                .into_iter()
-                .next()
-                .expect("one sender produces one result");
-                pb.inc(1);
-                // Best-effort incremental write — a write failure is warned but
-                // does not abort the unsubscribe run.
-                if let Err(e) = append_log_entry(&result, &log_path) {
-                    eprintln!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
-                }
-                // Attempt records cannot be backfilled -- their timestamp is
-                // now -- so each one is written as soon as it is known.
-                // The history is evidence, not a prerequisite: an unavailable
-                // one costs the record, not the unsubscribe.
-                if let Some(history) = history {
-                    let attempt = attempt_from_result(&account.account_id, sender, &result);
-                    if let Err(e) = history.record_attempt(&attempt) {
-                        eprintln!(
-                            "{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}"
-                        );
-                    }
-                }
-                result
-            })
-            .collect();
-
-        pb.finish();
-        results
-    };
-
-    if !results.is_empty() {
-        let success_count = results.iter().filter(|r| r.success).count();
-        let fail_count = results.iter().filter(|r| !r.success).count();
-
-        eprintln!(
-            "\n{BOLD}Results:{RESET} {GREEN}{success_count} succeeded{RESET}, {RED}{fail_count} failed{RESET}\n"
-        );
-
-        for r in &results {
-            if r.success {
-                eprintln!("  {GREEN}[OK]{RESET}   {:<40} {DIM}{}{RESET}", r.email, r.detail);
-            } else {
-                eprintln!("  {RED}[FAIL]{RESET} {:<40} {DIM}{}{RESET}", r.email, r.detail);
-            }
-        }
-
-        if !dry_run {
-            eprintln!("{DIM}Action log written to {}{RESET}", log_path.display());
-        }
-    }
-
-    // Phase 4: Archive — includes both unsubscribed senders and archive-only (stale) senders.
-    // Failures are reported with the log path so the user knows their unsubscribe results
-    // are preserved.
-    eprintln!("\n{BOLD}Archiving emails...{RESET}\n");
-
-    // Combine all selected senders for archiving: those unsubscribed and stale-archive-only.
-    let all_to_archive: Vec<&SenderInfo> = to_unsub.iter().copied()
-        .chain(to_archive_only.iter().copied())
-        .collect();
-
-    let archived: u32 = if dry_run {
-        let total: u32 = all_to_archive.iter().map(|s| s.email_count).sum();
-        eprintln!(
-            "Dry run: would archive {total} emails to '{}'",
-            account.archive_folder
-        );
-        total
-    } else {
-        let provider = make_provider(account, credential)?;
-        let messages: Vec<_> = all_to_archive.iter().flat_map(|s| s.messages.clone()).collect();
-        let destination = Folder::new(&account.archive_folder);
-        match provider.archive(&messages, &destination) {
-            Ok(n) => n,
+        match make_email_sender(account, credential) {
+            Ok(sender) => Some(sender),
             Err(e) => {
-                eprintln!("{RED}Archive failed:{RESET} {e}");
-                if !to_unsub.is_empty() {
-                    eprintln!(
-                        "{YELLOW}Unsubscribe results are preserved in:{RESET} {}",
-                        log_path.display()
-                    );
-                }
-                eprintln!("{DIM}You may archive manually or re-run after resolving the issue.{RESET}");
-                return Err(e);
+                note!(
+                    "{YELLOW}Note: mailto unsubscribe unavailable ({e}). Mailto-only senders will be skipped.{RESET}"
+                );
+                None
             }
         }
     };
 
-    eprintln!(
-        "{GREEN}Archived {archived} emails{RESET} to '{}'.",
-        account.archive_folder
+    let archive_folder = Folder::new(&account.archive_folder);
+    let observer = CliRunObserver::new(
+        request.dry_run,
+        &account.archive_folder,
+        log_path,
+        request.tty.stderr,
     );
+    let ctx = RunContext {
+        account: &account.account_id,
+        archive_folder: &archive_folder,
+        provider: provider.as_ref(),
+        http: &http_client,
+        email_sender: email_sender.as_deref(),
+        history,
+        cache: cache_store,
+        observer: &observer,
+    };
 
-    // The archived messages have moved, so the cached rows now point at message
-    // ids that are no longer where the cache says they are. Pruning also keeps a
-    // sender that was just handled from reappearing on the next cached run.
-    // Only a real archive prunes: a dry run changed nothing.
-    if !dry_run {
-        let archived_senders: Vec<String> = all_to_archive
-            .iter()
-            .map(|s| s.email.clone())
-            .collect();
-        if let Err(e) = cache_store.remove_cached_senders(&account.account_id, &archived_senders) {
-            eprintln!("{YELLOW}Warning: could not prune the scan cache: {e}{RESET}");
-            eprintln!("{DIM}Run `unsubscribe scan` to rebuild it.{RESET}");
+    let outcome = match execute_run(&plan, &ctx, &policy) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("{RED}Archive failed:{RESET} {e}");
+            if !plan.to_unsubscribe.is_empty() {
+                eprintln!(
+                    "{YELLOW}Unsubscribe results are preserved in:{RESET} {}",
+                    observer.log_path().display()
+                );
+            }
+            eprintln!("{DIM}You may archive manually or re-run after resolving the issue.{RESET}");
+            return Err(classify_provider_error(e));
         }
-    }
+    };
+
+    report_exhausted(&plan);
+    report_unknown_senders(&chosen);
 
     if !from_cache {
         print_warnings_summary(&warnings);
     }
 
-    Ok(())
+    let exit = if outcome.failed() > 0 {
+        Exit::SomeFailed
+    } else {
+        Exit::Success
+    };
+
+    if request.json {
+        output::emit_json(&run_document(
+            account,
+            request,
+            &resolved.scanned_at,
+            from_cache,
+            &plan,
+            &outcome,
+            &chosen,
+            &reasons,
+            &warnings,
+            exit,
+        ))?;
+    }
+
+    Ok(exit)
 }
 
-/// Build the history record for a completed attempt.
+/// The message a headless caller gets when it has not said what to act on.
 ///
-/// The sender supplies the identity evidence (domain, list id, the raw
-/// `List-Unsubscribe` header) and the result supplies what the attempt did.
-fn attempt_from_result(
-    account: &str,
-    sender: &SenderInfo,
-    result: &UnsubscribeResult,
-) -> UnsubscribeAttempt {
-    UnsubscribeAttempt::new(
-        account.to_string(),
-        sender.email.clone(),
-        sender.domain.clone(),
-        sender.list_id.clone(),
-        now_unix_secs(),
-        result.method,
-        result.success,
-        result.http_status,
-        result.url.clone(),
-        result.final_url.clone(),
-        sender.list_unsubscribe_raw.clone(),
-        result.detail.clone(),
-    )
+/// Public because `main` checks the mode before it unlocks anything, so the
+/// user hears about the missing flag rather than about their keyring.
+pub const SELECTION_REQUIRED: &str = "\
+`run` needs to know which senders to act on when there is no terminal to ask at.
+
+Pass one or more selection flags:
+  --resumed             senders that ignored a previous unsubscribe
+  --all-active          every non-stale sender not previously unsubscribed
+  --stale               stale senders (archived without an attempt)
+  --sender <EMAIL>      one named sender, repeatable
+  --senders-file <PATH> one address per line
+
+Add --yes to act without a confirmation, e.g. `unsubscribe run --resumed --yes`.";
+
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
+
+/// Get the senders to act on, from the policy or from the person.
+///
+/// `None` means the interactive screen was cancelled; an empty selection means
+/// nothing matched, which is a different thing and gets a different exit code.
+fn choose_senders(
+    annotated: AnnotatedSenders,
+    request: &RunRequest,
+    scanned_at: &str,
+    preferences: &Preferences,
+) -> Result<Option<Selection>> {
+    if request.policy.is_empty() {
+        note!("{BOLD}Opening selection screen...{RESET}\n");
+        let Some(selections) = tui::select_senders(annotated, Some(scanned_at), preferences)?
+        else {
+            return Ok(None);
+        };
+        // The screen is the selection: what it hands back is already the
+        // answer, so there is no policy to attribute a reason to.
+        let selected = selections
+            .into_iter()
+            .filter(|(_, selected)| *selected)
+            .map(|(sender, _)| SelectedSender {
+                sender,
+                reason: SelectionReason::Chosen,
+            })
+            .collect();
+        return Ok(Some(Selection {
+            selected,
+            unknown: Vec::new(),
+            over_cap: None,
+        }));
+    }
+
+    let selection = select_by_policy(&annotated, &request.policy);
+    if let Some(cap) = selection.over_cap {
+        return Err(ExitError::usage(format!(
+            "Refusing to act on {} senders in one non-interactive run (limit {}).\n\
+             Raise it with `--max-senders {}`, or narrow the selection.",
+            cap.selected, cap.max_senders, cap.selected
+        ))
+        .into());
+    }
+    describe_selection(&selection);
+    Ok(Some(selection))
+}
+
+/// Say what the policy matched, grouped by the flag that matched it.
+fn describe_selection(selection: &Selection) {
+    if selection.selected.is_empty() {
+        return;
+    }
+    let mut counts: Vec<(SelectionReason, usize)> = Vec::new();
+    for chosen in &selection.selected {
+        match counts.iter_mut().find(|(r, _)| *r == chosen.reason) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((chosen.reason, 1)),
+        }
+    }
+    let summary: Vec<String> = counts
+        .iter()
+        .map(|(reason, count)| format!("{count} {}", reason.label()))
+        .collect();
+    note!(
+        "{BOLD}Selected {} senders{RESET} ({}).\n",
+        selection.selected.len(),
+        summary.join(", ")
+    );
+}
+
+/// Name the addresses that were asked for but are not in this scan.
+///
+/// Not an error: a sender that has stopped mailing has nothing to unsubscribe
+/// from, and a list of addresses is meant to outlive any one scan.
+fn report_unknown_senders(selection: &Selection) {
+    if selection.unknown.is_empty() {
+        return;
+    }
+    note!(
+        "\n{YELLOW}{} named sender(s) were not in this scan and were skipped:{RESET}",
+        selection.unknown.len()
+    );
+    for email in &selection.unknown {
+        note!("  {email}");
+    }
+}
+
+/// Confirm before acting, where there is anyone to confirm with.
+///
+/// `--yes` is the unattended answer. Without it a terminal is asked, and a
+/// caller with no terminal is told to pass the flag rather than left hanging
+/// on a stdin nobody is typing into.
+fn confirm_plan(plan: &RunPlan, request: &RunRequest) -> Result<bool> {
+    // The selection screen was the confirmation; so is a dry run, which is
+    // about to change nothing.
+    if request.policy.is_empty() || request.dry_run || request.yes {
+        return Ok(true);
+    }
+    if !request.tty.stdin {
+        return Err(ExitError::usage(format!(
+            "Refusing to act on {} senders without a confirmation.\n\
+             Pass `--yes` to run unattended, or `--dry-run` to see what would happen.",
+            plan.to_unsubscribe.len() + plan.archive_only.len() + plan.exhausted.len()
+        ))
+        .into());
+    }
+    confirm("Proceed?")
+}
+
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+/// Say what the run is about to do, before anything happens.
+fn announce_plan(plan: &RunPlan) {
+    if !plan.to_unsubscribe.is_empty() {
+        note!(
+            "Will unsubscribe from {BOLD}{}{RESET} active senders ({} emails).",
+            plan.to_unsubscribe.len(),
+            plan.unsubscribe_emails()
+        );
+    }
+    if !plan.archive_only.is_empty() {
+        note!(
+            "Will archive {BOLD}{}{RESET} stale senders without unsubscribing ({} emails).",
+            plan.archive_only.len(),
+            plan.archive_only_emails()
+        );
+    }
+    if !plan.exhausted.is_empty() {
+        note!(
+            "Will archive {BOLD}{}{RESET} senders with no unsubscribe method left ({} emails).",
+            plan.exhausted.len(),
+            plan.exhausted_emails()
+        );
+    }
+    note!("Total: {} emails.\n", plan.total_emails());
+}
+
+/// Spell out a dry run sender by sender: why it was picked, and what rung it
+/// would climb. Without this a `--dry-run` says how many, never which.
+fn report_dry_run(plan: &RunPlan, reasons: &HashMap<String, SelectionReason>) {
+    let reason_of = |email: &str| {
+        reasons
+            .get(&email.to_lowercase())
+            .map(|r| r.label())
+            .unwrap_or("selected")
+    };
+    for planned in &plan.to_unsubscribe {
+        note!(
+            "  {:<40} {DIM}{} \u{2014} {}{RESET}",
+            planned.sender.email,
+            reason_of(&planned.sender.email),
+            planned.step.label()
+        );
+    }
+    for sender in &plan.archive_only {
+        note!(
+            "  {:<40} {DIM}{} \u{2014} archive only, no attempt{RESET}",
+            sender.email,
+            reason_of(&sender.email)
+        );
+    }
+    for sender in &plan.exhausted {
+        note!(
+            "  {:<40} {DIM}{} \u{2014} exhausted, archive only{RESET}",
+            sender.email,
+            reason_of(&sender.email)
+        );
+    }
+    note!();
+}
+
+/// Name the senders that have run out of ways to be asked.
+///
+/// They are the input to the rungs that do not exist yet -- a server-side
+/// filter, and a report to the company or its ESP -- so the run ends by
+/// listing them rather than letting them disappear into the archive.
+fn report_exhausted(plan: &RunPlan) {
+    if plan.exhausted.is_empty() {
+        return;
+    }
+    note!(
+        "\n{YELLOW}{} sender(s) have no unsubscribe method left:{RESET}",
+        plan.exhausted.len()
+    );
+    for sender in &plan.exhausted {
+        note!("  {:<40} {DIM}archived only{RESET}", sender.email);
+    }
+    note!("{DIM}Every method these senders offer has been tried and ignored.{RESET}");
+}
+
+// ---------------------------------------------------------------------------
+// JSON
+// ---------------------------------------------------------------------------
+
+/// The document for a run that found or selected nothing.
+fn empty_document(account: &AccountConfig, scanned_at: &str, warnings: &[String]) -> Value {
+    let mut doc = json_out::document("run", &account.account_id);
+    doc.insert("scanned_at".to_string(), json!(scanned_at));
+    doc.insert("senders".to_string(), json!([]));
+    doc.insert(
+        "totals".to_string(),
+        json!({
+            "selected": 0,
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "archived_messages": 0,
+        }),
+    );
+    doc.insert("warnings".to_string(), json!(warnings));
+    doc.insert("exit_code".to_string(), json!(Exit::NothingToDo.code()));
+    Value::Object(doc)
+}
+
+/// Everything the run did, per sender and in total.
+#[allow(clippy::too_many_arguments)]
+fn run_document(
+    account: &AccountConfig,
+    request: &RunRequest,
+    scanned_at: &str,
+    from_cache: bool,
+    plan: &RunPlan,
+    outcome: &RunOutcome,
+    selection: &Selection,
+    reasons: &HashMap<String, SelectionReason>,
+    warnings: &[String],
+    exit: Exit,
+) -> Value {
+    let reason_of = |sender: &SenderInfo| reasons.get(&sender.email.to_lowercase()).copied();
+
+    let attempted = plan
+        .to_unsubscribe
+        .iter()
+        .zip(&outcome.results)
+        .map(|(planned, result)| {
+            let mut value = json_out::planned(planned, reason_of(&planned.sender));
+            json_out::merge(&mut value, json!({ "result": json_out::result(result) }));
+            value
+        });
+
+    let archived = |senders: &[SenderInfo], action: &'static str| {
+        senders
+            .iter()
+            .map(|sender| {
+                let mut value = json_out::identity(sender);
+                json_out::merge(
+                    &mut value,
+                    json!({
+                        "email_count": sender.email_count,
+                        "messages": sender.messages.len(),
+                        "selection_reason": reason_of(sender).map(SelectionReason::as_id),
+                        "action": action,
+                        "result": Value::Null,
+                    }),
+                );
+                value
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let senders: Vec<Value> = attempted
+        .chain(archived(&plan.archive_only, "archive_only"))
+        .chain(archived(&plan.exhausted, "exhausted"))
+        .collect();
+
+    let mut doc = json_out::document("run", &account.account_id);
+    doc.insert("dry_run".to_string(), json!(request.dry_run));
+    doc.insert("scanned_at".to_string(), json!(scanned_at));
+    doc.insert("from_cache".to_string(), json!(from_cache));
+    doc.insert("senders".to_string(), json!(senders));
+    doc.insert(
+        "totals".to_string(),
+        json!({
+            "selected": selection.selected.len(),
+            "attempted": plan.to_unsubscribe.len(),
+            "succeeded": outcome.succeeded(),
+            "failed": outcome.failed(),
+            "archive_only": plan.archive_only.len(),
+            "exhausted": plan.exhausted.len(),
+            "archived_messages": outcome.archived,
+            "emails": plan.total_emails(),
+        }),
+    );
+    doc.insert("unknown_senders".to_string(), json!(selection.unknown));
+    doc.insert("warnings".to_string(), json!(warnings));
+    doc.insert("exit_code".to_string(), json!(exit.code()));
+    Value::Object(doc)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use crate::exit::exit_code;
+    use unsubscribe_core::{
+        AuthType, Folder as CoreFolder, FolderMessage, MessageId, NextStep, PlannedSender,
+        PreviouslyUnsubscribed, ProviderType, SenderVerdict, UnsubscribeMethod, UnsubscribeOutcome,
+        UnsubscribeResult,
+    };
 
-    /// A sender carrying every piece of identity evidence an attempt records.
-    fn evidence_sender() -> SenderInfo {
+    fn account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@example.com".to_string(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.example.com".to_string()),
+            port: Some(993),
+            username: "user@example.com".to_string(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    fn sender(email: &str, count: u32) -> SenderInfo {
         SenderInfo {
             display_name: "Acme News".to_string(),
-            email: "news@acme.com".to_string(),
-            domain: "acme.com".to_string(),
-            unsubscribe_urls: vec!["https://acme.com/unsub?t=abc".to_string()],
-            unsubscribe_mailto: vec!["mailto:unsub@acme.com".to_string()],
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/u?id=1".to_string()],
+            unsubscribe_mailto: Vec::new(),
             one_click: true,
-            list_id: Some("weekly.acme.com".to_string()),
-            list_unsubscribe_raw: Some(
-                "<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>".to_string(),
-            ),
-            email_count: 7,
-            messages: vec![],
+            list_id: Some("acme.list.example.com".to_string()),
+            list_unsubscribe_raw: None,
+            email_count: count,
+            messages: vec![FolderMessage {
+                folder: CoreFolder::new("INBOX"),
+                message_id: MessageId::new(format!("INBOX:{email}")),
+            }],
             last_seen: Some(1_700_000_000),
         }
     }
 
-    fn successful_result() -> UnsubscribeResult {
-        UnsubscribeResult {
-            email: "news@acme.com".to_string(),
-            method: UnsubscribeMethod::OneClickPost,
-            success: true,
-            detail: "HTTP 200".to_string(),
-            url: "https://acme.com/unsub?t=abc".to_string(),
-            http_status: Some(200),
-            final_url: Some("https://acme.com/unsub/done".to_string()),
+    fn request(policy: SelectionPolicy, tty: Tty) -> RunRequest {
+        RunRequest {
+            dry_run: false,
+            cached: false,
+            rescan: false,
+            yes: false,
+            json: false,
+            policy,
+            tty,
         }
     }
 
-    /// Check a string against the RFC 4122 textual form: 8-4-4-4-12 lowercase
-    /// hex digits, with the version nibble set to 4 for a random UUID.
-    fn is_wellformed_uuid_v4(s: &str) -> bool {
-        let groups: Vec<&str> = s.split('-').collect();
-        if groups.len() != 5 {
-            return false;
+    fn headless_policy() -> SelectionPolicy {
+        SelectionPolicy {
+            resumed: true,
+            max_senders: 50,
+            ..SelectionPolicy::default()
         }
-        if [8, 4, 4, 4, 12] != [
-            groups[0].len(),
-            groups[1].len(),
-            groups[2].len(),
-            groups[3].len(),
-            groups[4].len(),
-        ] {
-            return false;
+    }
+
+    fn plan_of(senders: &[&str]) -> RunPlan {
+        RunPlan {
+            to_unsubscribe: senders
+                .iter()
+                .map(|email| PlannedSender {
+                    sender: sender(email, 3),
+                    step: NextStep::FirstAttempt,
+                })
+                .collect(),
+            archive_only: Vec::new(),
+            exhausted: Vec::new(),
         }
-        if !groups
-            .iter()
-            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
-        {
-            return false;
-        }
-        // Version 4 lives in the first nibble of the third group; the variant
-        // bits put the fourth group's first character in 8..=b.
-        groups[2].starts_with('4')
-            && matches!(groups[3].chars().next(), Some('8' | '9' | 'a' | 'b'))
     }
 
-    #[test]
-    fn attempt_copies_every_evidence_field_from_the_sender_and_the_result() {
-        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &successful_result());
-
-        assert_eq!(attempt.account, "me@example.com");
-        assert_eq!(attempt.sender_email, "news@acme.com");
-        assert_eq!(attempt.sender_domain, "acme.com");
-        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
-        assert_eq!(attempt.method, "one_click_post");
-        assert!(attempt.success);
-        assert_eq!(attempt.http_status, Some(200));
-        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
-        assert_eq!(
-            attempt.final_url.as_deref(),
-            Some("https://acme.com/unsub/done")
-        );
-        assert_eq!(
-            attempt.list_unsubscribe_raw.as_deref(),
-            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
-        );
-        assert_eq!(attempt.detail, "HTTP 200");
-    }
+    // -----------------------------------------------------------------------
+    // confirm_plan
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn attempt_records_the_senders_domain_not_the_accounts() {
-        // Both are email addresses; swapping them would silently file every
-        // attempt under the user's own domain.
-        let attempt =
-            attempt_from_result("me@gmail.com", &evidence_sender(), &successful_result());
-        assert_eq!(attempt.sender_domain, "acme.com");
-        assert_eq!(attempt.account, "me@gmail.com");
-    }
-
-    #[test]
-    fn attempt_stores_the_stable_method_id_not_the_display_label() {
-        // MailtoSent is the case where the two differ: id "mailto_sent",
-        // label "mailto". Storing the label would break history on a rename.
-        let mut result = successful_result();
-        result.method = UnsubscribeMethod::MailtoSent;
-
-        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &result);
-
-        assert_eq!(attempt.method, "mailto_sent");
-        assert_ne!(
-            attempt.method,
-            UnsubscribeMethod::MailtoSent.label(),
-            "the display label must not be what gets stored"
-        );
-    }
-
-    #[test]
-    fn a_failed_attempt_maps_the_same_fields_as_a_successful_one() {
-        let result = UnsubscribeResult {
-            email: "news@acme.com".to_string(),
-            method: UnsubscribeMethod::Get,
-            success: false,
-            detail: "HTTP 410".to_string(),
-            url: "https://acme.com/unsub?t=abc".to_string(),
-            http_status: Some(410),
-            final_url: None,
+    fn a_headless_run_with_yes_needs_no_confirmation() {
+        let request = RunRequest {
+            yes: true,
+            ..request(headless_policy(), Tty::detached())
         };
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
 
-        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &result);
+    #[test]
+    fn a_dry_run_is_its_own_confirmation() {
+        // It is about to change nothing, so there is nothing to agree to.
+        let request = RunRequest {
+            dry_run: true,
+            ..request(headless_policy(), Tty::detached())
+        };
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
 
-        assert!(!attempt.success);
-        assert_eq!(attempt.method, "get");
-        assert_eq!(attempt.http_status, Some(410));
-        assert_eq!(attempt.detail, "HTTP 410");
-        assert_eq!(attempt.final_url, None);
-        // The identity evidence is recorded whether or not the attempt worked.
-        assert_eq!(attempt.sender_email, "news@acme.com");
-        assert_eq!(attempt.sender_domain, "acme.com");
-        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
+    #[test]
+    fn the_selection_screen_is_its_own_confirmation() {
+        let request = request(SelectionPolicy::default(), Tty::attached());
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
+
+    #[test]
+    fn a_headless_run_without_yes_and_without_a_terminal_refuses_to_act() {
+        let request = request(headless_policy(), Tty::detached());
+        let error = confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+    }
+
+    #[test]
+    fn the_refusal_names_the_flag_that_would_have_allowed_the_run() {
+        let request = request(headless_policy(), Tty::detached());
+        let error = confirm_plan(&plan_of(&["a@acme.example.com", "b@acme.example.com"]), &request)
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--yes"), "{message}");
+        assert!(message.contains("--dry-run"), "{message}");
+        assert!(message.contains('2'), "the size of the plan should be named: {message}");
+    }
+
+    #[test]
+    fn the_count_in_the_refusal_covers_every_sender_the_run_would_touch() {
+        // Archive-only and exhausted senders are acted on too.
+        let plan = RunPlan {
+            to_unsubscribe: vec![PlannedSender {
+                sender: sender("a@acme.example.com", 1),
+                step: NextStep::FirstAttempt,
+            }],
+            archive_only: vec![sender("b@acme.example.com", 1)],
+            exhausted: vec![sender("c@acme.example.com", 1)],
+        };
+        let request = request(headless_policy(), Tty::detached());
+        let message = format!("{:#}", confirm_plan(&plan, &request).unwrap_err());
+        assert!(message.contains(" 3 senders"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // choose_senders
+    // -----------------------------------------------------------------------
+
+    fn annotated() -> AnnotatedSenders {
+        AnnotatedSenders {
+            previously_unsubscribed: vec![PreviouslyUnsubscribed {
+                sender: sender("resumed@acme.example.com", 4),
+                verdict: SenderVerdict {
+                    attempt_id: "attempt-1".to_string(),
+                    unsubscribed_at: 1_600_000_000,
+                    outcome: UnsubscribeOutcome::Resumed { days_after: 30 },
+                    violation_count: 1,
+                    next_step: NextStep::Exhausted,
+                },
+            }],
+            active: vec![
+                sender("one@acme.example.com", 3),
+                sender("two@acme.example.com", 5),
+            ],
+            stale: Vec::new(),
+            new_resumptions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_policy_selection_never_opens_the_screen() {
+        // Reaching the TUI from here would hang a timer; the test runs without
+        // a terminal, so anything that tried would fail rather than return.
+        let request = request(headless_policy(), Tty::detached());
+        let selection = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap()
+            .expect("a policy selection is never a cancellation");
         assert_eq!(
-            attempt.list_unsubscribe_raw.as_deref(),
-            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
+            selection
+                .selected
+                .iter()
+                .map(|s| s.sender.email.as_str())
+                .collect::<Vec<_>>(),
+            ["resumed@acme.example.com"]
         );
-        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
     }
 
     #[test]
-    fn a_sender_without_identity_headers_records_none_rather_than_empty_strings() {
-        let mut sender = evidence_sender();
-        sender.list_id = None;
-        sender.list_unsubscribe_raw = None;
-        let mut result = successful_result();
-        result.method = UnsubscribeMethod::MailtoSkipped;
-        result.http_status = None;
-        result.final_url = None;
-        result.url = String::new();
-
-        let attempt = attempt_from_result("me@example.com", &sender, &result);
-
-        assert_eq!(attempt.list_id, None);
-        assert_eq!(attempt.list_unsubscribe_raw, None);
-        assert_eq!(attempt.http_status, None);
-        assert_eq!(attempt.final_url, None);
-        assert_eq!(attempt.url, "");
-        assert_eq!(attempt.method, "mailto_skipped");
+    fn a_selection_over_the_cap_refuses_before_anything_is_attempted() {
+        let request = request(
+            SelectionPolicy {
+                all_active: true,
+                max_senders: 1,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let error = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
     }
 
     #[test]
-    fn each_attempt_gets_a_distinct_well_formed_uuid() {
-        // Histories from two devices merge as a union keyed by id, so a
-        // repeated id would silently drop an attempt.
-        let sender = evidence_sender();
-        let result = successful_result();
-        let ids: HashSet<String> = (0..64)
-            .map(|_| attempt_from_result("me@example.com", &sender, &result).id)
-            .collect();
+    fn the_cap_refusal_says_how_many_matched_and_how_to_allow_them() {
+        let request = request(
+            SelectionPolicy {
+                all_active: true,
+                max_senders: 1,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let error = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--max-senders 2"), "{message}");
+        assert!(message.contains("limit 1"), "{message}");
+    }
 
-        assert_eq!(ids.len(), 64, "attempt ids must be unique");
-        for id in &ids {
+    #[test]
+    fn a_policy_that_matches_nothing_is_an_empty_selection_not_a_cancellation() {
+        // Empty and cancelled are different outcomes; only one of them means
+        // the user changed their mind.
+        let request = request(
+            SelectionPolicy {
+                senders: vec!["nobody@elsewhere.example.com".to_string()],
+                max_senders: 50,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let selection = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap()
+            .expect("a policy selection is never a cancellation");
+        assert!(selection.is_empty());
+        assert_eq!(selection.unknown, ["nobody@elsewhere.example.com"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The message a caller with no selection gets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_selection_required_message_lists_every_flag_that_would_satisfy_it() {
+        for flag in [
+            "--resumed",
+            "--all-active",
+            "--stale",
+            "--sender",
+            "--senders-file",
+            "--yes",
+        ] {
             assert!(
-                is_wellformed_uuid_v4(id),
-                "id is not an RFC 4122 v4 UUID: {id}"
+                SELECTION_REQUIRED.contains(flag),
+                "{flag} is missing from the message a headless caller gets"
             );
         }
     }
 
+    // -----------------------------------------------------------------------
+    // JSON documents
+    // -----------------------------------------------------------------------
+
+    fn selection() -> Selection {
+        Selection {
+            selected: vec![
+                SelectedSender {
+                    sender: sender("resumed@acme.example.com", 4),
+                    reason: SelectionReason::Resumed,
+                },
+                SelectedSender {
+                    sender: sender("named@acme.example.com", 2),
+                    reason: SelectionReason::Named,
+                },
+            ],
+            unknown: vec!["gone@elsewhere.example.com".to_string()],
+            over_cap: None,
+        }
+    }
+
+    fn reasons() -> HashMap<String, SelectionReason> {
+        selection()
+            .selected
+            .iter()
+            .map(|s| (s.sender.email.to_lowercase(), s.reason))
+            .collect()
+    }
+
+    fn executed_plan() -> RunPlan {
+        RunPlan {
+            to_unsubscribe: vec![PlannedSender {
+                sender: sender("resumed@acme.example.com", 4),
+                step: NextStep::Exhausted,
+            }],
+            archive_only: vec![sender("stale@acme.example.com", 1)],
+            exhausted: vec![sender("named@acme.example.com", 2)],
+        }
+    }
+
+    fn outcome() -> RunOutcome {
+        RunOutcome {
+            results: vec![UnsubscribeResult {
+                email: "resumed@acme.example.com".to_string(),
+                method: UnsubscribeMethod::OneClickPost,
+                success: false,
+                detail: "HTTP 500".to_string(),
+                url: "https://acme.example.com/u?id=1".to_string(),
+                http_status: Some(500),
+                final_url: None,
+            }],
+            archived: 3,
+            cancelled: false,
+        }
+    }
+
+    fn document() -> Value {
+        run_document(
+            &account(),
+            &request(headless_policy(), Tty::detached()),
+            "2026-03-18T09:00:00Z",
+            true,
+            &executed_plan(),
+            &outcome(),
+            &selection(),
+            &reasons(),
+            &["Unparseable header in INBOX".to_string()],
+            Exit::SomeFailed,
+        )
+    }
+
     #[test]
-    fn attempted_at_is_the_current_utc_time_in_seconds() {
-        // Derived independently of `now_unix_secs` so a unit mix-up (millis) or
-        // a local-time offset would show up as a large difference.
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the Unix epoch")
-            .as_secs() as i64;
+    fn the_run_document_matches_its_golden_shape() {
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/run_document.json")).unwrap();
+        assert_eq!(document(), golden);
+    }
 
-        let attempt =
-            attempt_from_result("me@example.com", &evidence_sender(), &successful_result());
-
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the Unix epoch")
-            .as_secs() as i64;
-
-        assert!(
-            (before..=after).contains(&attempt.attempted_at),
-            "attempted_at {} is outside [{before}, {after}]",
-            attempt.attempted_at
+    #[test]
+    fn the_empty_run_document_matches_its_golden_shape() {
+        let document = empty_document(
+            &account(),
+            "2026-03-18T09:00:00Z",
+            &["Unparseable header in INBOX".to_string()],
         );
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/run_empty_document.json")).unwrap();
+        assert_eq!(document, golden);
+    }
+
+    #[test]
+    fn every_sender_row_says_what_was_done_about_it() {
+        let document = document();
+        let actions: Vec<&str> = document["senders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["unsubscribe", "archive_only", "exhausted"]);
+    }
+
+    #[test]
+    fn only_an_attempted_sender_carries_a_result() {
+        let document = document();
+        let rows = document["senders"].as_array().unwrap();
+        assert_eq!(rows[0]["result"]["method"], json!("one_click_post"));
+        assert_eq!(rows[1]["result"], Value::Null);
+        assert_eq!(rows[2]["result"], Value::Null);
+    }
+
+    #[test]
+    fn a_sender_row_reports_the_flag_that_selected_it() {
+        let document = document();
+        let rows = document["senders"].as_array().unwrap();
+        assert_eq!(rows[0]["selection_reason"], json!("resumed"));
+        assert_eq!(rows[2]["selection_reason"], json!("named"));
+        // Not selected by a policy at all: reported as unknown rather than
+        // attributed to a flag it did not come from.
+        assert_eq!(rows[1]["selection_reason"], Value::Null);
+    }
+
+    #[test]
+    fn the_totals_count_what_happened_rather_than_what_was_planned() {
+        let totals = &document()["totals"];
+        assert_eq!(totals["selected"], json!(2));
+        assert_eq!(totals["attempted"], json!(1));
+        assert_eq!(totals["succeeded"], json!(0));
+        assert_eq!(totals["failed"], json!(1));
+        assert_eq!(totals["archived_messages"], json!(3));
+        assert_eq!(totals["emails"], json!(7));
+    }
+
+    #[test]
+    fn the_document_carries_the_exit_code_the_process_will_return() {
+        // A script that has already read the document should not need to check
+        // `$?` to know what happened.
+        assert_eq!(document()["exit_code"], json!(Exit::SomeFailed.code()));
+        let empty = empty_document(&account(), "2026-03-18T09:00:00Z", &[]);
+        assert_eq!(empty["exit_code"], json!(Exit::NothingToDo.code()));
+    }
+
+    #[test]
+    fn named_senders_that_were_not_in_the_scan_are_listed_not_dropped() {
+        assert_eq!(
+            document()["unknown_senders"],
+            json!(["gone@elsewhere.example.com"])
+        );
+    }
+
+    #[test]
+    fn a_dry_run_says_so_in_its_document() {
+        let request = RunRequest {
+            dry_run: true,
+            ..request(headless_policy(), Tty::detached())
+        };
+        let document = run_document(
+            &account(),
+            &request,
+            "2026-03-18T09:00:00Z",
+            false,
+            &executed_plan(),
+            &outcome(),
+            &selection(),
+            &reasons(),
+            &[],
+            Exit::Success,
+        );
+        assert_eq!(document["dry_run"], json!(true));
+        assert_eq!(document["from_cache"], json!(false));
     }
 }

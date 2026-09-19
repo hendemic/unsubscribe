@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use imap::Session;
@@ -9,12 +10,34 @@ use native_tls::TlsStream;
 use unsubscribe_core::{
     domain_from_email, list_id_warning, parse_from_header, parse_list_id,
     parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId, ScanProgress,
-    ScanResult, SenderInfo,
+    ScanResult, ScanWatermark, SenderInfo,
 };
 
 /// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
 /// connections; we stay well under that to avoid throttling.
 const MAX_CONCURRENT_CONNECTIONS: usize = 5;
+
+/// Most message headers held in memory at once. This is the memory bound, and
+/// the largest fetch the scan will ever ask for.
+const MAX_FETCH_BATCH: u32 = 500;
+
+/// Smallest fetch the scan will drop to on a slow connection. Below this the
+/// round trips cost more than the extra progress detail is worth.
+const MIN_FETCH_BATCH: u32 = 25;
+
+/// What the first fetch of a folder asks for, before anything is known about
+/// how fast the connection is.
+const INITIAL_FETCH_BATCH: u32 = 50;
+
+/// How long a single fetch should ideally take.
+///
+/// A FETCH is atomic to us -- the imap crate returns the whole response or
+/// nothing -- so the fetch size *is* the progress granularity: nothing can be
+/// reported until the last message of the batch has arrived. Sizing each
+/// fetch by how long the previous one took keeps a fast connection on large
+/// batches (few round trips) and a slow one on small batches (a display that
+/// keeps moving), rather than fixing one size that is wrong for both.
+const TARGET_FETCH_TIME: Duration = Duration::from_millis(400);
 
 /// IMAP adapter for the `EmailProvider` trait.
 ///
@@ -77,6 +100,11 @@ impl EmailProvider for ImapProvider {
 
         // Process folders in batches to respect server connection limits
         for batch in folders.chunks(MAX_CONCURRENT_CONNECTIONS) {
+            // Between batches is the cheapest place to stop: no connection is
+            // open yet for the folders in this one.
+            if progress.should_cancel() {
+                break;
+            }
             std::thread::scope(|s| {
                 let handles: Vec<_> = batch
                     .iter()
@@ -100,6 +128,9 @@ impl EmailProvider for ImapProvider {
                             all_warnings.push(w);
                         }
                     }
+                    // Senders are deduplicated here and nowhere else, so this
+                    // is the only place a running unique count exists.
+                    progress.on_totals(combined.len() as u32, all_warnings.len() as u32);
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -109,7 +140,12 @@ impl EmailProvider for ImapProvider {
         let mut senders: Vec<SenderInfo> = combined.into_values().collect();
         senders.sort_by(|a, b| b.email_count.cmp(&a.email_count));
 
-        Ok(ScanResult { senders, warnings: all_warnings })
+        let watermark = watermark_from_senders(&senders);
+        Ok(ScanResult {
+            senders,
+            warnings: all_warnings,
+            watermark,
+        })
     }
 
     fn archive(&self, messages: &[FolderMessage], destination: &Folder) -> Result<u32> {
@@ -237,15 +273,24 @@ fn scan_folder(
 
     let uid_validity = mailbox.uid_validity;
 
-    // Fetch in batches to bound memory usage on large mailboxes
-    let batch_size = 500u32;
+    // Fetch in batches to bound memory usage on large mailboxes, sized so a
+    // batch also lands often enough to keep the progress display moving.
+    let mut batch_size = INITIAL_FETCH_BATCH;
     let mut start = 1u32;
     while start <= total {
+        // Between fetches, so a cancelled scan never abandons a request that
+        // is already in flight. What has been parsed so far is returned and
+        // the pipeline discards it.
+        if progress.should_cancel() {
+            break;
+        }
         let end = total.min(start + batch_size - 1);
         let sequence = format!("{start}:{end}");
+        let fetch_started = Instant::now();
         let messages = session
             .fetch(&sequence, "(UID INTERNALDATE BODY.PEEK[HEADER])")
             .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
+        batch_size = next_fetch_size(batch_size, fetch_started.elapsed());
 
         for msg in messages.iter() {
             progress.on_messages_scanned(folder, 1);
@@ -368,6 +413,23 @@ fn scan_folder(
     Ok(FolderResult { senders, warnings })
 }
 
+/// How many messages the next fetch should ask for, given how long the last
+/// one took.
+///
+/// Scales toward [`TARGET_FETCH_TIME`] and never more than doubles in one
+/// step, so an unusually quick fetch cannot commit the next one to a long
+/// silence. The result is always within the memory bound.
+fn next_fetch_size(current: u32, elapsed: Duration) -> u32 {
+    // A fetch that registers as instant would otherwise divide by zero; one
+    // millisecond is close enough and still pushes the size upward.
+    let elapsed_ms = elapsed.as_millis().max(1);
+    let scaled = u128::from(current) * TARGET_FETCH_TIME.as_millis() / elapsed_ms;
+    let ceiling = u128::from(current)
+        .saturating_mul(2)
+        .clamp(u128::from(MIN_FETCH_BATCH), u128::from(MAX_FETCH_BATCH));
+    scaled.clamp(u128::from(MIN_FETCH_BATCH), ceiling) as u32
+}
+
 /// Merge a per-folder result into the combined sender map.
 fn merge_folder_result(
     combined: &mut HashMap<String, SenderInfo>,
@@ -443,6 +505,29 @@ fn merge_folder_result(
 
 fn encode_message_id(folder: &str, uid: u32, uid_validity: u32) -> MessageId {
     MessageId::new(format!("{folder}:{uid}:{uid_validity}"))
+}
+
+/// Highest UID and UIDVALIDITY per folder across everything a scan found.
+///
+/// Derived here rather than in core because the position is encoded in this
+/// adapter's own `MessageId` format, which core never reads. Ids that do not
+/// parse are skipped: a watermark is an optimisation for a future incremental
+/// scan, never a correctness requirement.
+fn watermark_from_senders(senders: &[SenderInfo]) -> ScanWatermark {
+    senders
+        .iter()
+        .flat_map(|sender| sender.messages.iter())
+        .filter_map(|message| {
+            parse_message_id(message.message_id.as_str())
+                .ok()
+                .map(|(uid, validity)| (message.folder.as_str().to_string(), uid, validity))
+        })
+        .fold(ScanWatermark::default(), |mut mark, (folder, uid, validity)| {
+            let highest = mark.highest_uid.entry(folder.clone()).or_insert(0);
+            *highest = (*highest).max(uid);
+            mark.uid_validity.insert(folder, validity);
+            mark
+        })
 }
 
 /// Parse a MessageId back into (uid, uid_validity).

@@ -1,11 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-use crate::history::UnsubscribeAttempt;
+use crate::history::{Resumption, UnsubscribeAttempt};
 use crate::types::{
     AccountConfig, Credential, Folder, FolderMessage, HttpResponse, Preferences, ScanResult,
-    SenderInfo,
+    ScanWatermark, SenderInfo,
 };
 
 /// Port for scan progress reporting.
@@ -22,6 +21,25 @@ pub trait ScanProgress: Send + Sync {
 
     /// Called when a folder scan is complete.
     fn on_folder_done(&self, folder: &Folder);
+
+    /// Running totals once another folder's results have been merged in.
+    ///
+    /// Senders are deduplicated across folders, so only the adapter can say
+    /// how many *distinct* senders have been found so far; it reports the
+    /// figure whenever it changes. Consumers that show no live tally ignore
+    /// it, which is the default.
+    fn on_totals(&self, _senders: u32, _warnings: u32) {}
+
+    /// Whether the consumer has asked the scan to stop.
+    ///
+    /// Adapters poll this between batches -- never mid-fetch -- and return
+    /// whatever they have; [`crate::pipeline::scan_senders`] then discards it
+    /// and leaves the existing cache alone, so a cancelled scan costs nothing
+    /// but the time it ran for. Cancelling is a consumer's choice, so the
+    /// default is never, and an adapter that cannot poll is still correct.
+    fn should_cancel(&self) -> bool {
+        false
+    }
 }
 
 /// No-op implementation for consumers that don't need progress reporting.
@@ -151,23 +169,20 @@ pub trait HistoryStore {
 
     /// All attempts recorded for an account, oldest first.
     fn attempts_for_account(&self, account: &str) -> Result<Vec<UnsubscribeAttempt>>;
+
+    /// Append one observed resumption. Append-only, like attempts.
+    ///
+    /// At most one resumption exists per ignored attempt; implementations
+    /// enforce that, and callers are expected not to offer a duplicate.
+    fn record_resumption(&self, resumption: &Resumption) -> Result<()>;
+
+    /// All resumptions recorded for an account, oldest first.
+    fn resumptions_for_account(&self, account: &str) -> Result<Vec<Resumption>>;
 }
 
 // ---------------------------------------------------------------------------
 // DataStore: scan warnings, action logs, and cached scan results
 // ---------------------------------------------------------------------------
-
-/// Watermark for tracking scan position per adapter.
-/// Stored alongside cached results for future incremental scanning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanWatermark {
-    /// Per-folder highest UID seen (IMAP adapter)
-    pub highest_uid: HashMap<String, u32>,
-    /// Per-folder UIDVALIDITY (IMAP adapter)
-    pub uid_validity: HashMap<String, u32>,
-    /// Adapter-specific opaque state (e.g., Gmail historyId)
-    pub adapter_state: Option<String>,
-}
 
 /// Metadata about a cached scan (persistence-layer concern, not a domain type).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,5 +291,85 @@ mod cached_scan_compat_tests {
         assert_eq!(cache.watermark.highest_uid.get("INBOX"), Some(&42));
         assert_eq!(cache.watermark.uid_validity.get("INBOX"), Some(&1));
         assert_eq!(cache.watermark.adapter_state, None);
+    }
+}
+
+#[cfg(test)]
+mod default_port_behaviour_tests {
+    use super::*;
+    use crate::pipeline::{NoopRunObserver, PlannedSender, RunObserver, RunWarning};
+    use crate::types::UnsubscribeResult;
+    use std::sync::Mutex;
+
+    /// A progress reporter that implements only the required methods, as a
+    /// consumer with no way to cancel would.
+    #[derive(Default)]
+    struct MinimalProgress {
+        totals: Mutex<Vec<(u32, u32)>>,
+    }
+
+    impl ScanProgress for MinimalProgress {
+        fn on_folder_start(&self, _folder: &Folder, _total_messages: u32) {}
+        fn on_messages_scanned(&self, _folder: &Folder, _count: u32) {}
+        fn on_folder_done(&self, _folder: &Folder) {}
+        fn on_totals(&self, senders: u32, warnings: u32) {
+            self.totals.lock().expect("totals").push((senders, warnings));
+        }
+    }
+
+    /// A reporter with nothing beyond the required methods: no cancel, no
+    /// totals, exactly as a consumer with neither would write it.
+    struct BareProgress;
+
+    impl ScanProgress for BareProgress {
+        fn on_folder_start(&self, _folder: &Folder, _total_messages: u32) {}
+        fn on_messages_scanned(&self, _folder: &Folder, _count: u32) {}
+        fn on_folder_done(&self, _folder: &Folder) {}
+    }
+
+    /// The same for the run side.
+    struct MinimalObserver;
+
+    impl RunObserver for MinimalObserver {
+        fn on_unsubscribe_start(&self, _sender_count: u32) {}
+        fn on_sender_result(&self, _planned: &PlannedSender, _result: &UnsubscribeResult) {}
+        fn on_unsubscribe_done(&self, _planned: &[PlannedSender], _results: &[UnsubscribeResult]) {}
+        fn on_archive_start(&self, _message_count: u32, _email_count: u32) {}
+        fn on_archive_done(&self, _archived: u32) {}
+        fn on_warning(&self, _warning: &RunWarning) {}
+    }
+
+    #[test]
+    fn a_progress_reporter_that_says_nothing_about_cancelling_never_cancels() {
+        assert!(!BareProgress.should_cancel());
+        assert!(!NoopProgress.should_cancel());
+    }
+
+    #[test]
+    fn a_run_observer_that_says_nothing_about_cancelling_never_cancels() {
+        assert!(!MinimalObserver.should_cancel());
+        assert!(!NoopRunObserver.should_cancel());
+    }
+
+    #[test]
+    fn a_consumer_that_wants_totals_gets_them_through_the_port() {
+        // The default is a no-op, so the only way to tell the override is
+        // wired up is to make one and call it through the trait object the
+        // adapters actually hold.
+        let counting = MinimalProgress::default();
+        let reporter: &dyn ScanProgress = &counting;
+
+        reporter.on_totals(12, 3);
+        reporter.on_totals(40, 5);
+
+        assert_eq!(counting.totals.lock().expect("totals").as_slice(), [(12, 3), (40, 5)]);
+    }
+
+    #[test]
+    fn the_default_on_totals_is_a_no_op_an_adapter_can_always_call() {
+        let silent: &dyn ScanProgress = &NoopProgress;
+
+        // Would panic or fail to compile if the default were not provided.
+        silent.on_totals(7, 1);
     }
 }

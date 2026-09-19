@@ -6,18 +6,14 @@
 //! listing folders, re-authenticating) to a [`SettingsIo`] implementation.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::io;
 
-use unsubscribe_core::{AccountConfig, AuthType, PreferenceField, Preferences, ProviderType};
+use unsubscribe_core::{AccountConfig, Preferences};
 
-use super::{TerminalGuard, Tui};
+use super::keys::{self, Action as Key};
+use super::{suspended, TerminalGuard};
 
 // ---------------------------------------------------------------------------
 // Side effects
@@ -50,310 +46,11 @@ pub trait SettingsIo {
 // Fields
 // ---------------------------------------------------------------------------
 
-/// One editable setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
-    Provider,
-    Host,
-    Port,
-    Username,
-    AuthType,
-    SmtpHost,
-    SmtpPort,
-    Folders,
-    ArchiveFolder,
-    MinEmails,
-    StaleAfterMonths,
-    CacheMaxAgeDays,
-}
-
-impl Field {
-    /// Every field, in the order they appear on screen.
-    pub const ALL: [Field; 12] = [
-        Field::Provider,
-        Field::Host,
-        Field::Port,
-        Field::Username,
-        Field::AuthType,
-        Field::SmtpHost,
-        Field::SmtpPort,
-        Field::Folders,
-        Field::ArchiveFolder,
-        Field::MinEmails,
-        Field::StaleAfterMonths,
-        Field::CacheMaxAgeDays,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Field::Provider => "Provider",
-            Field::Host => "Host",
-            Field::Port => "Port",
-            Field::Username => "Username",
-            Field::AuthType => "Auth type",
-            Field::SmtpHost => "SMTP host",
-            Field::SmtpPort => "SMTP port",
-            Field::Folders => "Folders",
-            Field::ArchiveFolder => "Archive folder",
-            Field::MinEmails => "Minimum emails",
-            Field::StaleAfterMonths => "Stale after (months)",
-            Field::CacheMaxAgeDays => "Cache max age (days)",
-        }
-    }
-
-    /// Fields with a fixed set of values cycle through them instead of
-    /// accepting free text, so they can never hold something unparseable.
-    const fn choices(self) -> Option<&'static [&'static str]> {
-        match self {
-            Field::Provider => Some(&["imap", "gmail"]),
-            Field::AuthType => Some(&["password", "oauth"]),
-            _ => None,
-        }
-    }
-
-    /// Whether changing this field invalidates the stored credentials.
-    const fn affects_credentials(self) -> bool {
-        matches!(self, Field::Provider | Field::Username | Field::AuthType)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Draft
-// ---------------------------------------------------------------------------
-
-/// The settings as text, which is what the user is actually editing.
-///
-/// Numbers are held as strings so a half-typed or invalid value survives until
-/// the user corrects it, rather than being silently coerced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Draft {
-    pub provider: String,
-    pub host: String,
-    pub port: String,
-    pub username: String,
-    pub auth_type: String,
-    pub smtp_host: String,
-    pub smtp_port: String,
-    pub folders: Vec<String>,
-    pub archive_folder: String,
-    pub min_emails: String,
-    pub stale_after_months: String,
-    pub cache_max_age_days: String,
-}
-
-impl Draft {
-    pub fn from_config(account: &AccountConfig, preferences: &Preferences) -> Self {
-        Self {
-            provider: match account.provider_type {
-                ProviderType::Gmail => "gmail".to_string(),
-                ProviderType::Imap => "imap".to_string(),
-            },
-            host: account.host.clone().unwrap_or_default(),
-            port: account.port.map(|p| p.to_string()).unwrap_or_default(),
-            username: account.username.clone(),
-            auth_type: match account.auth_type {
-                AuthType::OAuth => "oauth".to_string(),
-                AuthType::Password => "password".to_string(),
-            },
-            smtp_host: account.smtp_host.clone().unwrap_or_default(),
-            smtp_port: account.smtp_port.map(|p| p.to_string()).unwrap_or_default(),
-            folders: account.scan_folders.clone(),
-            archive_folder: account.archive_folder.clone(),
-            min_emails: preferences.min_emails.to_string(),
-            stale_after_months: preferences.stale_after_months.to_string(),
-            cache_max_age_days: preferences.cache_max_age_days.to_string(),
-        }
-    }
-
-    /// The field's value as editable/displayable text.
-    pub fn get(&self, field: Field) -> String {
-        match field {
-            Field::Provider => self.provider.clone(),
-            Field::Host => self.host.clone(),
-            Field::Port => self.port.clone(),
-            Field::Username => self.username.clone(),
-            Field::AuthType => self.auth_type.clone(),
-            Field::SmtpHost => self.smtp_host.clone(),
-            Field::SmtpPort => self.smtp_port.clone(),
-            Field::Folders => self.folders.join(", "),
-            Field::ArchiveFolder => self.archive_folder.clone(),
-            Field::MinEmails => self.min_emails.clone(),
-            Field::StaleAfterMonths => self.stale_after_months.clone(),
-            Field::CacheMaxAgeDays => self.cache_max_age_days.clone(),
-        }
-    }
-
-    pub fn set(&mut self, field: Field, value: String) {
-        match field {
-            Field::Provider => self.provider = value,
-            Field::Host => self.host = value,
-            Field::Port => self.port = value,
-            Field::Username => self.username = value,
-            Field::AuthType => self.auth_type = value,
-            Field::SmtpHost => self.smtp_host = value,
-            Field::SmtpPort => self.smtp_port = value,
-            Field::Folders => self.folders = split_folders(&value),
-            Field::ArchiveFolder => self.archive_folder = value,
-            Field::MinEmails => self.min_emails = value,
-            Field::StaleAfterMonths => self.stale_after_months = value,
-            Field::CacheMaxAgeDays => self.cache_max_age_days = value,
-        }
-    }
-
-    /// Advance a fixed-choice field to its next value. No-op for text fields.
-    pub fn cycle(&mut self, field: Field) {
-        let Some(choices) = field.choices() else {
-            return;
-        };
-        let current = self.get(field);
-        let next = choices
-            .iter()
-            .position(|c| *c == current)
-            .map_or(0, |i| (i + 1) % choices.len());
-        self.set(field, choices[next].to_string());
-    }
-
-    fn is_gmail(&self) -> bool {
-        self.provider == "gmail"
-    }
-
-    /// Check one field, returning a message suitable for display next to it.
-    pub fn validate(&self, field: Field) -> Result<(), String> {
-        let value = self.get(field);
-        match field {
-            // Fixed-choice fields can only hold a value they were cycled to.
-            Field::Provider | Field::AuthType => Ok(()),
-            // Gmail talks to an API rather than a host, so a blank host is fine there.
-            Field::Host if self.is_gmail() => Ok(()),
-            Field::Host => require_non_empty(&value, "Host"),
-            Field::Username => require_non_empty(&value, "Username"),
-            Field::ArchiveFolder => require_non_empty(&value, "Archive folder"),
-            Field::Port if self.is_gmail() => optional_port(&value, "Port"),
-            Field::Port => require_non_empty(&value, "Port").and(optional_port(&value, "Port")),
-            Field::SmtpHost => Ok(()),
-            Field::SmtpPort => optional_port(&value, "SMTP port"),
-            Field::Folders => {
-                if self.folders.is_empty() {
-                    Err("At least one folder is required".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            Field::MinEmails => preference(&value, PreferenceField::MinEmails).map(|_| ()),
-            Field::StaleAfterMonths => {
-                preference(&value, PreferenceField::StaleAfterMonths).map(|_| ())
-            }
-            Field::CacheMaxAgeDays => {
-                preference(&value, PreferenceField::CacheMaxAgeDays).map(|_| ())
-            }
-        }
-    }
-
-    /// The first field that fails validation, if any.
-    pub fn first_invalid(&self) -> Option<(Field, String)> {
-        Field::ALL
-            .into_iter()
-            .find_map(|field| self.validate(field).err().map(|msg| (field, msg)))
-    }
-
-    /// Convert to the shapes the config store writes, or report the first
-    /// field that is not usable yet.
-    pub fn to_config(&self, account_id_hint: &str) -> Result<(AccountConfig, Preferences), (Field, String)> {
-        if let Some(problem) = self.first_invalid() {
-            return Err(problem);
-        }
-
-        let provider_type = if self.is_gmail() {
-            ProviderType::Gmail
-        } else {
-            ProviderType::Imap
-        };
-        let auth_type = if self.auth_type == "oauth" {
-            AuthType::OAuth
-        } else {
-            AuthType::Password
-        };
-
-        let account = AccountConfig {
-            // The username is the account id; the hint only matters when a
-            // future multi-account layout keys accounts by something else.
-            account_id: if self.username.is_empty() {
-                account_id_hint.to_string()
-            } else {
-                self.username.clone()
-            },
-            provider_type,
-            host: optional_text(&self.host),
-            port: self.port.trim().parse().ok(),
-            username: self.username.trim().to_string(),
-            auth_type,
-            scan_folders: self.folders.clone(),
-            archive_folder: self.archive_folder.trim().to_string(),
-            smtp_host: optional_text(&self.smtp_host),
-            smtp_port: self.smtp_port.trim().parse().ok(),
-        };
-
-        let preferences = Preferences {
-            min_emails: preference(&self.min_emails, PreferenceField::MinEmails)
-                .map_err(|e| (Field::MinEmails, e))?,
-            stale_after_months: preference(
-                &self.stale_after_months,
-                PreferenceField::StaleAfterMonths,
-            )
-            .map_err(|e| (Field::StaleAfterMonths, e))?,
-            cache_max_age_days: preference(
-                &self.cache_max_age_days,
-                PreferenceField::CacheMaxAgeDays,
-            )
-            .map_err(|e| (Field::CacheMaxAgeDays, e))?,
-        };
-
-        Ok((account, preferences))
-    }
-}
-
-fn optional_text(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn require_non_empty(value: &str, label: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        Err(format!("{label} cannot be empty"))
-    } else {
-        Ok(())
-    }
-}
-
-/// Ports are optional here; a blank one falls back to the protocol default.
-fn optional_port(value: &str, label: &str) -> Result<(), String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    match trimmed.parse::<u32>() {
-        Ok(port) if (1..=65535).contains(&port) => Ok(()),
-        _ => Err(format!("{label} must be a number between 1 and 65535")),
-    }
-}
-
-fn preference(value: &str, field: PreferenceField) -> Result<u32, String> {
-    let parsed: u32 = value
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{}` must be a whole number", field.key()))?;
-    field.validate(parsed)?;
-    Ok(parsed)
-}
-
-fn split_folders(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
+// The settings schema -- every key, its range, and what a valid value looks
+// like -- lives in the config layer, so this screen and `unsubscribe config`
+// validate identically. Kept under the names this file has always used.
+pub use unsubscribe_persistence::{SettingKey as Field, Settings as Draft};
+use unsubscribe_persistence::split_folders;
 
 // ---------------------------------------------------------------------------
 // Rows
@@ -650,18 +347,90 @@ impl SettingsApp {
     }
 
     /// Handle one key press and report any side effect the caller must run.
+    ///
+    /// Raw keys come in and are mapped once, here, so the standalone
+    /// `unsubscribe config` screen and the Settings panel inside the app
+    /// answer to exactly the same bindings.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        match &self.mode {
-            Mode::Browse => self.on_key_browse(key),
-            Mode::Editing { .. } => self.on_key_editing(key),
-            Mode::Folders(_) => self.on_key_folders(key),
-            Mode::ConfirmQuit => self.on_key_confirm_quit(key),
+        match keys::action(key, self.captures_text()) {
+            Some(action) => self.on_action(action),
+            None => Action::None,
         }
     }
 
-    fn on_key_browse(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+    /// Whether a field is taking free text right now.
+    #[must_use]
+    pub fn captures_text(&self) -> bool {
+        match &self.mode {
+            Mode::Editing { .. } => true,
+            Mode::Folders(picker) => picker.free_text.is_some(),
+            _ => false,
+        }
+    }
+
+    pub fn on_action(&mut self, action: Key) -> Action {
+        match &self.mode {
+            Mode::Browse => self.on_action_browse(action),
+            Mode::Editing { .. } => self.on_action_editing(action),
+            Mode::Folders(_) => self.on_action_folders(action),
+            Mode::ConfirmQuit => self.on_action_confirm_quit(action),
+        }
+    }
+
+    /// The actions this screen answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Key> {
+        match &self.mode {
+            Mode::Editing { .. } => vec![Key::Activate, Key::Back],
+            Mode::Folders(picker) if picker.free_text.is_some() => {
+                vec![Key::Activate, Key::Back]
+            }
+            Mode::Folders(_) => keys::list_actions(&[Key::Toggle, Key::Activate]),
+            Mode::ConfirmQuit => vec![Key::Mnemonic('y'), Key::Mnemonic('n')],
+            Mode::Browse => keys::list_actions(&[
+                Key::Activate,
+                Key::Toggle,
+                Key::Mnemonic('w'),
+                Key::Mnemonic('x'),
+            ]),
+        }
+    }
+
+    fn on_action_browse(&mut self, action: Key) -> Action {
+        // The rows are not a flat list -- headers are skipped -- so the screen
+        // steps for itself, as many rows as the key is worth, rather than
+        // using the helper's index arithmetic.
+        if let Some(steps) = keys::steps(action) {
+            for _ in 0..steps {
+                if keys::is_backwards(action) {
+                    self.move_up();
+                } else {
+                    self.move_down();
+                }
+            }
+            return Action::None;
+        }
+        match action {
+            Key::First => {
+                self.cursor = self
+                    .rows
+                    .iter()
+                    .position(|row| row.is_selectable())
+                    .unwrap_or_default();
+                return Action::None;
+            }
+            Key::Last => {
+                self.cursor = self
+                    .rows
+                    .iter()
+                    .rposition(|row| row.is_selectable())
+                    .unwrap_or_default();
+                return Action::None;
+            }
+            _ => {}
+        }
+        match action {
+            Key::Back => {
                 if self.is_dirty() {
                     self.mode = Mode::ConfirmQuit;
                     Action::None
@@ -669,23 +438,15 @@ impl SettingsApp {
                     Action::Quit
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                Action::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                Action::None
-            }
-            KeyCode::Char('s') => Action::Save,
-            KeyCode::Char('r') => {
+            Key::Mnemonic('w') => Action::Save,
+            Key::Mnemonic('x') => {
                 if self.is_dirty() {
                     self.revert();
                     self.set_status(StatusKind::Info, "Reverted to the saved settings.");
                 }
                 Action::None
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
+            Key::Activate | Key::Toggle => self.activate(),
             _ => Action::None,
         }
     }
@@ -715,19 +476,19 @@ impl SettingsApp {
         }
     }
 
-    fn on_key_editing(&mut self, key: KeyEvent) -> Action {
+    fn on_action_editing(&mut self, action: Key) -> Action {
         let Mode::Editing { field, buffer, .. } = &mut self.mode else {
             return Action::None;
         };
         let field = *field;
 
-        match key.code {
-            KeyCode::Esc => self.mode = Mode::Browse,
-            KeyCode::Char(c) => buffer.push(c),
-            KeyCode::Backspace => {
+        match action {
+            Key::Back => self.mode = Mode::Browse,
+            Key::Type(c) => buffer.push(c),
+            Key::Erase => {
                 buffer.pop();
             }
-            KeyCode::Enter => {
+            Key::Activate => {
                 // Validate against a copy so a rejected value never lands in
                 // the draft and never counts as an unsaved change.
                 let candidate = buffer.clone();
@@ -750,31 +511,41 @@ impl SettingsApp {
         Action::None
     }
 
-    fn on_key_folders(&mut self, key: KeyEvent) -> Action {
+    fn on_action_folders(&mut self, action: Key) -> Action {
         let Mode::Folders(picker) = &mut self.mode else {
             return Action::None;
         };
 
         // Free-text mode is a single-line editor; the list mode is a checklist.
         if let Some(text) = &mut picker.free_text {
-            match key.code {
-                KeyCode::Esc => self.mode = Mode::Browse,
-                KeyCode::Char(c) => text.push(c),
-                KeyCode::Backspace => {
+            match action {
+                Key::Back => self.mode = Mode::Browse,
+                Key::Type(c) => text.push(c),
+                Key::Erase => {
                     text.pop();
                 }
-                KeyCode::Enter => self.commit_folders(),
+                Key::Activate => self.commit_folders(),
                 _ => {}
             }
             return Action::None;
         }
 
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Browse,
-            KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
-            KeyCode::Char(' ') => picker.toggle(),
-            KeyCode::Enter => self.commit_folders(),
+        if let Some(steps) = keys::steps(action) {
+            for _ in 0..steps {
+                if keys::is_backwards(action) {
+                    picker.move_up();
+                } else {
+                    picker.move_down();
+                }
+            }
+            return Action::None;
+        }
+        match action {
+            Key::Back => self.mode = Mode::Browse,
+            Key::First => picker.cursor = 0,
+            Key::Last => picker.cursor = picker.entries.len().saturating_sub(1),
+            Key::Toggle => picker.toggle(),
+            Key::Activate => self.commit_folders(),
             _ => {}
         }
         Action::None
@@ -795,9 +566,17 @@ impl SettingsApp {
         self.mode = Mode::Browse;
     }
 
-    fn on_key_confirm_quit(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Action::Quit,
+    fn on_action_confirm_quit(&mut self, action: Key) -> Action {
+        // The same answer keys as every other confirmation in the app.
+        match action {
+            Key::Mnemonic('y') | Key::Activate => {
+                // Inside the shell the panel outlives the answer, so the
+                // discard has to actually happen: otherwise the prompt and the
+                // edits are still there and `y` looks like it did nothing.
+                self.revert();
+                self.mode = Mode::Browse;
+                Action::Quit
+            }
             _ => {
                 self.mode = Mode::Browse;
                 Action::None
@@ -889,7 +668,7 @@ pub fn run(
     Ok(())
 }
 
-fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
+pub(crate) fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
     match app.to_config() {
         Err((field, message)) => {
             app.focus_invalid(field, format!("{}: {message}", field.label()));
@@ -902,21 +681,6 @@ fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
             Err(e) => app.set_status(StatusKind::Error, format!("Save failed: {e}")),
         },
     }
-}
-
-/// Leave the alternate screen for the duration of `f`, then take it back.
-///
-/// The outer `Result` covers restoring the terminal; the inner one is `f`'s.
-fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> Result<T>) -> Result<Result<T>> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-
-    let result = f();
-
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    terminal.clear()?;
-    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -932,14 +696,17 @@ fn draw_loading(f: &mut Frame, message: &str) {
     f.render_widget(block, f.area());
 }
 
+/// Draw the whole screen, standalone: title, body, and its own help line.
 fn draw(f: &mut Frame, app: &mut SettingsApp) {
+    // Measured first: the footer wraps rather than clipping a key, so how
+    // many lines it needs decides the layout.
+    let footer = keys::hint_lines(&app.actions(), f.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Min(5),    // body
-            Constraint::Length(3), // status
-            Constraint::Length(2), // help
+            Constraint::Length(3),                        // title
+            Constraint::Min(5),                           // body + status
+            Constraint::Length(footer.len() as u16 + 1),  // help
         ])
         .split(f.area());
 
@@ -949,24 +716,29 @@ fn draw(f: &mut Frame, app: &mut SettingsApp) {
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(title, chunks[0]);
 
+    render(f, chunks[1], app);
+
+    f.render_widget(
+        Paragraph::new(footer.join("\n")).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+/// Draw the screen's body into `area`: the fields (or the folder picker) and
+/// the status line under them. Used by the app shell, which supplies its own
+/// header and footer.
+pub(crate) fn render(f: &mut Frame, area: Rect, app: &mut SettingsApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(area);
+
     match &mut app.mode {
-        Mode::Folders(picker) => draw_folder_picker(f, chunks[1], picker),
-        _ => draw_settings(f, chunks[1], app),
+        Mode::Folders(picker) => draw_folder_picker(f, chunks[0], picker),
+        _ => draw_settings(f, chunks[0], app),
     }
 
-    draw_status(f, chunks[2], app);
-
-    let hints = match &app.mode {
-        Mode::Browse => " Enter: edit | s: save | r: revert | j/k: move | q: quit",
-        Mode::Editing { .. } => " Enter: accept | Esc: cancel",
-        Mode::Folders(picker) if picker.free_text.is_some() => " Enter: accept | Esc: cancel",
-        Mode::Folders(_) => " Space: toggle | Enter: accept | j/k: move | Esc: cancel",
-        Mode::ConfirmQuit => " y: discard changes and quit | any other key: keep editing",
-    };
-    f.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
-        chunks[3],
-    );
+    draw_status(f, chunks[1], app);
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &mut SettingsApp) {
@@ -1109,11 +881,21 @@ fn draw_folder_picker(f: &mut Frame, area: Rect, picker: &mut FolderPicker) {
     );
 }
 
+/// The unsaved-changes hint, built from the real save key rather than a
+/// literal letter -- the two drifted apart once already (the status line
+/// said `s` while the footer, generated from [`keys::MNEMONICS`], said `w`).
+fn unsaved_hint() -> String {
+    let key = keys::describe(Key::Mnemonic('w'))
+        .map(|hint| hint.keys)
+        .unwrap_or("w");
+    format!(" Unsaved changes. Press {key} to save.")
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
     let (style, text) = match &app.mode {
         Mode::ConfirmQuit => (
             Style::default().fg(Color::Yellow),
-            " Discard unsaved changes and quit? [y/N]".to_string(),
+            " Discard unsaved changes and leave? [y/N]".to_string(),
         ),
         _ => match app.status() {
             Some((kind, message)) => {
@@ -1131,7 +913,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
             ),
             None if app.is_dirty() => (
                 Style::default().fg(Color::Yellow),
-                " Unsaved changes. Press s to save.".to_string(),
+                unsaved_hint(),
             ),
             None => (
                 Style::default().fg(Color::DarkGray),
@@ -1151,8 +933,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::cell::RefCell;
+    use unsubscribe_core::{AuthType, ProviderType};
 
     // ─── fixtures ───────────────────────────────────────────────────────────
 
@@ -1192,6 +975,7 @@ mod tests {
             min_emails: 5,
             stale_after_months: 6,
             cache_max_age_days: 21,
+            grace_period_days: 14,
         }
     }
 
@@ -1249,6 +1033,10 @@ mod tests {
 
     fn press(app: &mut SettingsApp, code: KeyCode) -> Action {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn press_ctrl(app: &mut SettingsApp, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::CONTROL))
     }
 
     fn type_chars(app: &mut SettingsApp, text: &str) {
@@ -1350,6 +1138,44 @@ mod tests {
         }
         visited.reverse();
         assert_eq!(visited, SELECTABLE_ORDER);
+    }
+
+    #[test]
+    fn ctrl_with_an_arrow_jumps_five_settings_and_clamps() {
+        let mut app = app();
+
+        press_ctrl(&mut app, KeyCode::Down);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[5]);
+        press_ctrl(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0]);
+        press_ctrl(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0], "clamped");
+    }
+
+    #[test]
+    fn a_jump_lands_on_a_setting_rather_than_on_a_section_header() {
+        // The rows are not a flat list, so a jump steps five selectable rows
+        // rather than five indices.
+        let mut app = app();
+
+        press_ctrl(&mut app, KeyCode::Down);
+        press_ctrl(&mut app, KeyCode::Down);
+
+        assert!(app.rows[app.cursor].is_selectable());
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[10]);
+    }
+
+    #[test]
+    fn g_and_shift_g_reach_the_first_and_last_setting() {
+        let mut app = app();
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(
+            app.rows[app.cursor],
+            SELECTABLE_ORDER[SELECTABLE_ORDER.len() - 1]
+        );
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0]);
     }
 
     #[test]
@@ -1662,7 +1488,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::Host, "imap.elsewhere.example.com");
         edit(&mut app, Field::MinEmails, "1");
-        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('x'));
 
         assert!(!app.is_dirty());
         assert_eq!(app.draft.host, "imap.example.com");
@@ -1673,16 +1499,35 @@ mod tests {
     #[test]
     fn revert_on_a_clean_screen_says_nothing() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.status(), None, "there was nothing to revert");
     }
 
     // ─── saving ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn s_asks_the_event_loop_to_save() {
+    fn w_asks_the_event_loop_to_save() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::Save);
+        assert_eq!(press(&mut app, KeyCode::Char('w')), Action::Save);
+    }
+
+    #[test]
+    fn s_does_not_save_here_it_belongs_to_the_sort_order_elsewhere() {
+        // `s` is spoken for in the shared letter budget (History's sort
+        // order); Settings never offers it, so it must be a no-op rather
+        // than something that looks like it half-works.
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::None);
+        assert!(app.is_dirty(), "s must not have saved or discarded anything");
+    }
+
+    #[test]
+    fn the_unsaved_hint_names_the_key_that_actually_saves() {
+        // Regression: this hint once said "Press s to save" while the real
+        // binding -- and the footer built from it -- was `w`.
+        assert_eq!(unsaved_hint(), " Unsaved changes. Press w to save.");
+        assert_eq!(press(&mut app(), KeyCode::Char('w')), Action::Save);
     }
 
     #[test]
@@ -1750,36 +1595,39 @@ mod tests {
     // ─── quitting ───────────────────────────────────────────────────────────
 
     #[test]
-    fn quitting_a_clean_screen_needs_no_confirmation() {
+    fn leaving_a_clean_screen_needs_no_confirmation() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
     }
 
     #[test]
-    fn escape_also_quits_a_clean_screen() {
+    fn q_is_never_back_here_so_it_does_nothing() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
     }
 
     #[test]
     fn quitting_with_unsaved_changes_asks_first() {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
         assert!(matches!(app.mode, Mode::ConfirmQuit));
     }
 
     #[test]
     fn confirming_the_prompt_quits_and_discards() {
-        for confirm in ['y', 'Y'] {
+        // The same answer keys as every other confirmation in the app.
+        for confirm in [KeyCode::Char('y'), KeyCode::Enter] {
             let mut app = app();
             edit(&mut app, Field::ArchiveFolder, "Archive");
-            press(&mut app, KeyCode::Char('q'));
+            press(&mut app, KeyCode::Esc);
             assert_eq!(
-                press(&mut app, KeyCode::Char(confirm)),
+                press(&mut app, confirm),
                 Action::Quit,
-                "{confirm} should confirm"
+                "{confirm:?} should confirm"
             );
+            assert!(is_browsing(&app), "the prompt should be gone");
+            assert!(!app.is_dirty(), "{confirm:?} should discard the edit");
         }
     }
 
@@ -1787,7 +1635,7 @@ mod tests {
     fn any_other_key_at_the_prompt_returns_to_editing_with_the_changes_intact() {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
-        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Esc);
 
         assert_eq!(press(&mut app, KeyCode::Char('n')), Action::None);
         assert!(is_browsing(&app));
@@ -1800,7 +1648,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
         save(&mut app, &FakeIo::new());
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
     }
 
     #[test]
@@ -1808,7 +1656,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
         save(&mut app, &FakeIo::failing());
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
         assert!(matches!(app.mode, Mode::ConfirmQuit));
     }
 
@@ -2096,6 +1944,67 @@ mod tests {
         assert!(
             picker(&app).free_text.as_deref().unwrap().ends_with('q'),
             "a folder name may contain a q",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Space is the app's second Enter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn space_opens_the_editor_on_a_text_setting_exactly_as_enter_does() {
+        let mut with_enter = app();
+        focus(&mut with_enter, Field::Host);
+        press(&mut with_enter, KeyCode::Enter);
+
+        let mut with_space = app();
+        focus(&mut with_space, Field::Host);
+        press(&mut with_space, KeyCode::Char(' '));
+
+        assert!(is_editing(&with_enter));
+        assert!(is_editing(&with_space), "Space is not Enter here");
+    }
+
+    #[test]
+    fn space_cycles_a_choice_setting_exactly_as_enter_does() {
+        let mut app = app();
+        focus(&mut app, Field::AuthType);
+        let start = app.draft.get(Field::AuthType);
+
+        press(&mut app, KeyCode::Char(' '));
+        let after_space = app.draft.get(Field::AuthType);
+        press(&mut app, KeyCode::Enter);
+
+        assert_ne!(after_space, start, "Space did not cycle the choice");
+        assert_eq!(app.draft.get(Field::AuthType), start, "and back around");
+    }
+
+    #[test]
+    fn space_hands_the_re_authentication_row_to_the_event_loop_too() {
+        let mut app = app();
+        app.cursor = row_index(&app, Row::Reauthenticate);
+
+        assert_eq!(app.on_action(Key::Toggle), Action::Reauthenticate);
+    }
+
+    #[test]
+    fn space_is_typed_into_a_text_field_rather_than_acting() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Old Mail");
+
+        assert_eq!(app.draft.get(Field::ArchiveFolder), "Old Mail");
+    }
+
+    #[test]
+    fn the_browse_screen_advertises_the_space_it_answers() {
+        let mut screen = app();
+        focus(&mut screen, Field::Host);
+        screen.on_action(Key::Toggle);
+        assert!(is_editing(&screen), "Space is answered here");
+
+        assert!(
+            app().actions().contains(&Key::Toggle),
+            "but the footer never mentions it"
         );
     }
 }

@@ -4,31 +4,20 @@
 
 use unsubscribe_core::SenderInfo;
 
-/// Seconds in a month, taken as a twelfth of a 365-day year so that the
-/// default threshold of 12 months is exactly one year.
-const SECS_PER_MONTH: i64 = 365 * 24 * 60 * 60 / 12;
-
 /// Month abbreviations for the hand-rolled date formatting below.
 pub const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// Current time in Unix seconds (UTC), or 0 if the clock is before the epoch.
-pub fn now_unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub use unsubscribe_core::now_unix_secs;
 
 /// A sender is stale when their most recent message predates the configured
-/// threshold. Senders whose adapter gave no date are never stale.
+/// threshold, judged against the clock right now.
+///
+/// The rule itself lives in core so the pipeline and the screens agree; this
+/// only supplies "now" for the display paths that have no run to take it from.
 pub fn is_stale(sender: &SenderInfo, stale_after_months: u32) -> bool {
-    let now = now_unix_secs();
-    match sender.last_seen {
-        Some(ts) => now - ts > i64::from(stale_after_months) * SECS_PER_MONTH,
-        None => false,
-    }
+    unsubscribe_core::is_stale(sender, stale_after_months, now_unix_secs())
 }
 
 /// The configured cached-scan freshness window, in seconds.
@@ -60,6 +49,18 @@ pub fn now_iso8601() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
+/// Format a Unix timestamp (UTC) as "Mon DD, YYYY", e.g. "Mar 14, 2026".
+///
+/// The history stores Unix seconds, so every screen that shows a recorded
+/// date formats it through here rather than reimplementing the calendar. UTC
+/// rather than local time: a record that reads differently depending on where
+/// it is opened is a poor piece of evidence.
+pub fn format_unix_date(ts: i64) -> String {
+    let (year, month, day) = days_to_civil(ts.div_euclid(86400) + 719468);
+    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {day}, {year}")
+}
+
 /// Convert day count to civil date (algorithm from Howard Hinnant).
 fn days_to_civil(day_count: i64) -> (i64, u32, u32) {
     let era = if day_count >= 0 {
@@ -79,10 +80,19 @@ fn days_to_civil(day_count: i64) -> (i64, u32, u32) {
 }
 
 /// Parse an ISO 8601 timestamp (e.g., "2026-03-18T19:30:00Z") into Unix seconds.
+///
+/// Strict on purpose: this also reads dates a person typed (`--since`), and a
+/// mistyped date that quietly becomes a different day selects a window nobody
+/// asked for. Anything that is not a real UTC moment at or after the epoch is
+/// `None`.
 pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     // Minimal parser for the format produced by now_iso8601(): YYYY-MM-DDThh:mm:ssZ
     let b = ts.as_bytes();
     if b.len() < 19 {
+        return None;
+    }
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, expected)| b.get(*at) != Some(expected)) {
         return None;
     }
     let year: i64 = ts.get(0..4)?.parse().ok()?;
@@ -91,6 +101,16 @@ pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     let hour: u64 = ts.get(11..13)?.parse().ok()?;
     let min: u64 = ts.get(14..16)?.parse().ok()?;
     let sec: u64 = ts.get(17..19)?.parse().ok()?;
+
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
+        return None;
+    }
 
     // Convert civil date to days since epoch (inverse of days_to_civil)
     let (y, m) = if month <= 2 {
@@ -104,7 +124,18 @@ pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let day_count = era * 146097 + doe as i64 - 719468;
 
-    Some(day_count as u64 * 86400 + hour * 3600 + min * 60 + sec)
+    Some(u64::try_from(day_count).ok()? * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// How many days a month has, leap years included.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Age of an ISO 8601 UTC timestamp in seconds, or `None` if it will not parse.
@@ -127,6 +158,20 @@ pub fn format_relative_age(age_secs: u64) -> String {
         secs if secs < 2 * DAY => "1 day ago".to_string(),
         secs => format!("{} days ago", secs / DAY),
     }
+}
+
+/// Parse a date a user typed into Unix seconds (UTC).
+///
+/// Accepts `YYYY-MM-DD`, which is what anyone writes on a command line, and a
+/// full `YYYY-MM-DDThh:mm:ssZ` for anything generated.
+pub fn parse_date(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let normalized = if text.len() == 10 {
+        format!("{text}T00:00:00Z")
+    } else {
+        text.to_string()
+    };
+    parse_iso8601_age_secs(&normalized).map(|secs| secs as i64)
 }
 
 /// Convert a UTC ISO 8601 timestamp to local time as "Mon DD, YYYY hh:mm".
@@ -365,5 +410,73 @@ mod tests {
     fn a_scan_timestamped_in_the_future_is_fresh() {
         let ts = iso_utc(now_unix_secs() + 30 * DAY);
         assert!(!is_scan_stale(&ts, 1));
+    }
+}
+
+/// `--since`, as a person types it.
+#[cfg(test)]
+mod parse_date_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_date_is_midnight_utc_on_that_day() {
+        // 1970-01-01 is the epoch by definition, and 1970-01-02 one day after.
+        assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(parse_date("1970-01-02"), Some(86_400));
+    }
+
+    #[test]
+    fn a_leap_day_is_read_as_the_day_it_is() {
+        // 2000 was a leap year (divisible by 400), so 2000-03-01 is one day
+        // after 2000-02-29.
+        let leap_day = parse_date("2000-02-29").unwrap();
+        assert_eq!(parse_date("2000-03-01"), Some(leap_day + 86_400));
+    }
+
+    #[test]
+    fn a_date_before_the_epoch_is_handled_rather_than_panicking() {
+        // `parse_iso8601_age_secs` returns seconds as `u64`, and casts a
+        // negative day count into it: `unsubscribe history --since 1969-12-31`
+        // panics in a debug build and yields nonsense in a release one.
+        // 1900 is also the leap-year edge case (not a leap year, being a
+        // century not divisible by 400), which this would otherwise pin.
+        let feb_28 = parse_date("1900-02-28");
+        assert_eq!(feb_28, None, "a pre-epoch date should be refused, not computed");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(parse_date("  1970-01-02  "), Some(86_400));
+    }
+
+    #[test]
+    fn a_full_timestamp_keeps_its_time_of_day() {
+        assert_eq!(parse_date("1970-01-01T01:02:03Z"), Some(3_723));
+    }
+
+    #[test]
+    fn something_that_is_not_a_date_is_rejected() {
+        for text in ["", "notadate", "18/03/2026", "2026-03", "march 18"] {
+            assert_eq!(parse_date(text), None, "{text:?} is not a date");
+        }
+    }
+
+    #[test]
+    fn a_date_written_with_the_wrong_separators_is_rejected() {
+        // Only the digit positions are read, so `2026/03/18` is accepted as
+        // 2026-03-18 -- forgiving, but it means genuinely malformed input is
+        // never reported.
+        assert_eq!(parse_date("2026/03/18"), None);
+    }
+
+    #[test]
+    fn a_date_that_could_not_exist_is_rejected() {
+        // Each of these currently parses to a different, real day: month 13
+        // rolls into the next January, day 32 into the next month, and day 0
+        // back into the previous one. A mistyped `--since` therefore selects a
+        // window the user did not ask for instead of being reported.
+        for text in ["2026-13-01", "2026-00-10", "2026-02-30", "2026-01-32", "2026-01-00"] {
+            assert_eq!(parse_date(text), None, "{text:?} names a day that does not exist");
+        }
     }
 }
