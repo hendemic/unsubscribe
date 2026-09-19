@@ -210,5 +210,8 @@ fn print_run_warning(warning: &RunWarning) {
         RunWarning::AttemptNotRecorded(e) => {
             eprintln!("{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}");
         }
+        RunWarning::ResumptionNotRecorded(e) => {
+            eprintln!("{YELLOW}Warning: could not record a resumed sender: {e}{RESET}");
+        }
     }
 }

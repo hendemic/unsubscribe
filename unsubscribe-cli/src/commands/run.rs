@@ -6,13 +6,14 @@
 
 use anyhow::{Context, Result};
 use unsubscribe_core::{
-    annotate_senders, execute_run, plan_run, AccountConfig, Credential, DataStore, EmailSender,
-    Folder, HistoryStore, Preferences, RunContext, RunPlan, RunPolicy, ScanCacheStore, SenderInfo,
+    annotate_senders, execute_run, plan_run, record_resumptions, AccountConfig, Credential,
+    DataStore, EmailSender, Folder, HistoryStore, Preferences, RunContext, RunPlan, RunPolicy,
+    ScanCacheStore, SenderInfo,
 };
 
 use crate::commands::load_history;
 use crate::commands::scan::{print_warnings_summary, resolve_scan};
-use crate::progress::CliRunObserver;
+use crate::progress::{CliRunObserver, CliWarningsOnly};
 use crate::terminal::{BOLD, DIM, RED, RESET, YELLOW};
 use crate::time::now_unix_secs;
 use crate::{http, make_email_sender, make_provider, tui};
@@ -36,6 +37,7 @@ pub fn cmd_run(
     let policy = RunPolicy {
         min_emails: preferences.min_emails,
         stale_after_months: preferences.stale_after_months,
+        grace_period_days: preferences.grace_period_days,
         dry_run,
     };
 
@@ -73,8 +75,18 @@ pub fn cmd_run(
     // Phase 2: annotate against history, then let the user choose. Senders we
     // already unsubscribed from get their own section, so a sender that ignored
     // an unsubscribe is the first thing seen.
-    let attempts = load_history(history, &account.account_id);
-    let annotated = annotate_senders(senders, &attempts, &policy, now_unix_secs());
+    let history_view = load_history(history, &account.account_id);
+    let annotated = annotate_senders(
+        &account.account_id,
+        senders,
+        &history_view.attempts,
+        &history_view.resumptions,
+        &policy,
+        now_unix_secs(),
+    );
+    // Seeing a sender ignore an unsubscribe is evidence in its own right, so it
+    // is written before the user gets a chance to cancel out of the screen.
+    record_resumptions(&annotated, history, &policy, &CliWarningsOnly);
 
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
     let Some(selections) = tui::select_senders(annotated, Some(&resolved.scanned_at), preferences)?

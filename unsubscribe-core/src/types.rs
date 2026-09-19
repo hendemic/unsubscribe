@@ -419,14 +419,16 @@ pub enum PreferenceField {
     MinEmails,
     StaleAfterMonths,
     CacheMaxAgeDays,
+    GracePeriodDays,
 }
 
 impl PreferenceField {
     /// Every field, in the order a settings UI should present them.
-    pub const ALL: [PreferenceField; 3] = [
+    pub const ALL: [PreferenceField; 4] = [
         PreferenceField::MinEmails,
         PreferenceField::StaleAfterMonths,
         PreferenceField::CacheMaxAgeDays,
+        PreferenceField::GracePeriodDays,
     ];
 
     /// The TOML key for this field inside `[preferences]`.
@@ -435,6 +437,7 @@ impl PreferenceField {
             PreferenceField::MinEmails => "min_emails",
             PreferenceField::StaleAfterMonths => "stale_after_months",
             PreferenceField::CacheMaxAgeDays => "cache_max_age_days",
+            PreferenceField::GracePeriodDays => "grace_period_days",
         }
     }
 
@@ -448,6 +451,9 @@ impl PreferenceField {
             PreferenceField::MinEmails => (0, 1_000_000),
             PreferenceField::StaleAfterMonths => (1, 1200),
             PreferenceField::CacheMaxAgeDays => (1, 3650),
+            // 0 is meaningful here too: it means any mail after a successful
+            // unsubscribe counts as a resumption straight away.
+            PreferenceField::GracePeriodDays => (0, 3650),
         }
     }
 
@@ -479,12 +485,19 @@ pub struct Preferences {
     pub stale_after_months: u32,
     /// Days a cached scan is considered fresh.
     pub cache_max_age_days: u32,
+    /// Days a sender is given to honour an unsubscribe before new mail from it
+    /// counts as a resumption.
+    ///
+    /// CAN-SPAM allows ten business days to act on an opt-out, so the default
+    /// leaves a margin either side of that.
+    pub grace_period_days: u32,
 }
 
 impl Preferences {
     pub const DEFAULT_MIN_EMAILS: u32 = 3;
     pub const DEFAULT_STALE_AFTER_MONTHS: u32 = 12;
     pub const DEFAULT_CACHE_MAX_AGE_DAYS: u32 = 7;
+    pub const DEFAULT_GRACE_PERIOD_DAYS: u32 = 14;
 
     /// Read the value of one field.
     pub fn get(&self, field: PreferenceField) -> u32 {
@@ -492,6 +505,7 @@ impl Preferences {
             PreferenceField::MinEmails => self.min_emails,
             PreferenceField::StaleAfterMonths => self.stale_after_months,
             PreferenceField::CacheMaxAgeDays => self.cache_max_age_days,
+            PreferenceField::GracePeriodDays => self.grace_period_days,
         }
     }
 
@@ -501,6 +515,7 @@ impl Preferences {
             PreferenceField::MinEmails => self.min_emails = value,
             PreferenceField::StaleAfterMonths => self.stale_after_months = value,
             PreferenceField::CacheMaxAgeDays => self.cache_max_age_days = value,
+            PreferenceField::GracePeriodDays => self.grace_period_days = value,
         }
     }
 
@@ -518,6 +533,7 @@ impl Default for Preferences {
             min_emails: Self::DEFAULT_MIN_EMAILS,
             stale_after_months: Self::DEFAULT_STALE_AFTER_MONTHS,
             cache_max_age_days: Self::DEFAULT_CACHE_MAX_AGE_DAYS,
+            grace_period_days: Self::DEFAULT_GRACE_PERIOD_DAYS,
         }
     }
 }

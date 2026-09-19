@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::history::UnsubscribeAttempt;
+use crate::history::{Resumption, UnsubscribeAttempt};
 use crate::types::{
     AccountConfig, Credential, Folder, FolderMessage, HttpResponse, Preferences, ScanResult,
     ScanWatermark, SenderInfo,
@@ -150,6 +150,15 @@ pub trait HistoryStore {
 
     /// All attempts recorded for an account, oldest first.
     fn attempts_for_account(&self, account: &str) -> Result<Vec<UnsubscribeAttempt>>;
+
+    /// Append one observed resumption. Append-only, like attempts.
+    ///
+    /// At most one resumption exists per ignored attempt; implementations
+    /// enforce that, and callers are expected not to offer a duplicate.
+    fn record_resumption(&self, resumption: &Resumption) -> Result<()>;
+
+    /// All resumptions recorded for an account, oldest first.
+    fn resumptions_for_account(&self, account: &str) -> Result<Vec<Resumption>>;
 }
 
 // ---------------------------------------------------------------------------

@@ -94,6 +94,8 @@ struct FilePreferences {
     stale_after_months: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_max_age_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grace_period_days: Option<u32>,
 }
 
 impl FilePreferences {
@@ -104,6 +106,7 @@ impl FilePreferences {
             min_emails: self.min_emails.unwrap_or(defaults.min_emails),
             stale_after_months: self.stale_after_months.unwrap_or(defaults.stale_after_months),
             cache_max_age_days: self.cache_max_age_days.unwrap_or(defaults.cache_max_age_days),
+            grace_period_days: self.grace_period_days.unwrap_or(defaults.grace_period_days),
         };
         prefs
             .validate()
@@ -995,6 +998,7 @@ mod preferences_tests {
             min_emails: 11,
             stale_after_months: 2,
             cache_max_age_days: 90,
+            grace_period_days: 14,
         };
         store.write_preferences(&wanted).unwrap();
         assert_eq!(store.read_preferences().unwrap(), wanted);
@@ -1008,6 +1012,7 @@ mod preferences_tests {
             min_emails: 3,
             stale_after_months: 0,
             cache_max_age_days: 7,
+            grace_period_days: 14,
         };
         let message = format!("{:#}", store.write_preferences(&invalid).unwrap_err());
         assert!(message.contains("stale_after_months"), "got: {message}");
@@ -1021,6 +1026,7 @@ mod preferences_tests {
             min_emails: 3,
             stale_after_months: 3000,
             cache_max_age_days: 7,
+            grace_period_days: 14,
         };
         assert!(store.write_preferences(&invalid).is_err());
         let on_disk = fs::read_to_string(dir.path().join("config.toml")).unwrap();
@@ -1066,6 +1072,7 @@ archive_folder = "Unsubscribed"
 min_emails = 5
 stale_after_months = 6
 cache_max_age_days = 3
+grace_period_days = 14
 
 # A section this version does not model at all.
 [experimental]
@@ -1321,6 +1328,7 @@ archive_folder = "Unsubscribed"
                 min_emails: 2,
                 stale_after_months: 3,
                 cache_max_age_days: 4,
+                grace_period_days: 14,
             })
             .unwrap();
 
@@ -1341,6 +1349,7 @@ archive_folder = "Unsubscribed"
                 min_emails: 4,
                 stale_after_months: 8,
                 cache_max_age_days: 14,
+                grace_period_days: 14,
             })
             .unwrap();
 
@@ -1372,6 +1381,7 @@ archive_folder = "Unsubscribed"
                 min_emails: 4,
                 stale_after_months: 8,
                 cache_max_age_days: 14,
+                grace_period_days: 14,
             })
             .unwrap();
 
@@ -1416,6 +1426,7 @@ archive_folder = "Unsubscribed"
                 min_emails: 6,
                 stale_after_months: 6,
                 cache_max_age_days: 6,
+                grace_period_days: 14,
             })
             .unwrap_err();
 

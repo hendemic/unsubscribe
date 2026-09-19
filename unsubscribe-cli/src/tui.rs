@@ -5,7 +5,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::io;
 
-use unsubscribe_core::{AnnotatedSenders, Preferences, SenderInfo};
+use unsubscribe_core::{
+    AnnotatedSenders, Preferences, SenderInfo, SenderVerdict, UnsubscribeOutcome,
+};
 
 use crate::time::{is_scan_stale, utc_to_local_display, MONTH_NAMES};
 
@@ -55,13 +57,15 @@ impl Drop for TerminalGuard {
 struct App {
     /// Senders with a prior successful unsubscribe, newest attempt date alongside.
     previous: Vec<SenderInfo>,
-    /// When each previously unsubscribed sender was last unsubscribed (Unix seconds).
-    previous_unsubscribed_at: Vec<i64>,
+    /// What the history says about each previously unsubscribed sender: when
+    /// it was unsubscribed, whether it honoured that, and how often it has not.
+    previous_verdicts: Vec<SenderVerdict>,
     /// Active senders (seen within the staleness threshold, or date unknown).
     active: Vec<SenderInfo>,
     /// Stale senders (last seen before the staleness threshold).
     stale: Vec<SenderInfo>,
-    /// Selection state for previously unsubscribed senders. Defaults to false.
+    /// Selection state for previously unsubscribed senders. Senders that
+    /// ignored an unsubscribe start selected; the rest do not.
     previous_selected: Vec<bool>,
     /// Selection state for active senders (parallel to `active`).
     active_selected: Vec<bool>,
@@ -84,26 +88,37 @@ impl App {
     /// The grouping is [`unsubscribe_core::annotate_senders`]'s job, so the
     /// screen and a headless run always agree about which sender is where.
     fn new(annotated: AnnotatedSenders, preferences: Preferences) -> Self {
+        // The observations have already been recorded by the time the screen
+        // opens, so the screen only needs the three groups.
         let AnnotatedSenders {
             previously_unsubscribed,
             active,
             stale,
+            ..
         } = annotated;
 
-        let (previous, previous_unsubscribed_at): (Vec<_>, Vec<_>) = previously_unsubscribed
+        let (previous, previous_verdicts): (Vec<_>, Vec<_>) = previously_unsubscribed
             .into_iter()
-            .map(|p| (p.sender, p.unsubscribed_at))
+            .map(|p| (p.sender, p.verdict))
             .unzip();
 
         let rows = build_rows(previous.len(), active.len(), stale.len());
         let cursor = first_selectable_row(&rows);
 
+        // A sender that kept mailing after a successful unsubscribe is the
+        // reason this section exists, so it arrives already ticked; one still
+        // inside its grace period has not done anything wrong yet.
+        let previous_selected: Vec<bool> = previous_verdicts
+            .iter()
+            .map(|verdict| verdict.outcome.is_resumed())
+            .collect();
+
         Self {
-            previous_selected: vec![false; previous.len()],
+            previous_selected,
             active_selected: vec![false; active.len()],
             stale_selected: vec![false; stale.len()],
             previous,
-            previous_unsubscribed_at,
+            previous_verdicts,
             active,
             stale,
             rows,
@@ -376,10 +391,18 @@ mod tests {
         let policy = RunPolicy {
             min_emails: preferences.min_emails,
             stale_after_months: preferences.stale_after_months,
+            grace_period_days: preferences.grace_period_days,
             dry_run: false,
         };
         App::new(
-            annotate_senders(senders, history, &policy, now_unix_secs()),
+            annotate_senders(
+                "user@example.com",
+                senders,
+                history,
+                &[],
+                &policy,
+                now_unix_secs(),
+            ),
             preferences,
         )
     }
@@ -882,7 +905,13 @@ mod tests {
             &[older, unsubscribed("p1@test.com")],
             Preferences::default(),
         );
-        assert_eq!(app.previous_unsubscribed_at, [1_700_000_000]);
+        assert_eq!(
+            app.previous_verdicts
+                .iter()
+                .map(|v| v.unsubscribed_at)
+                .collect::<Vec<_>>(),
+            [1_700_000_000]
+        );
     }
 
     // -------------------------------------------------------------------
@@ -890,7 +919,10 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn previously_unsubscribed_senders_start_deselected() {
+    fn previously_unsubscribed_senders_that_stopped_mailing_start_deselected() {
+        // These fixtures carry no `last_seen`, so nothing arrived after the
+        // unsubscribe as far as the app can tell. Senders caught mailing again
+        // start selected instead -- that is what the section is for.
         let app = all_three_sections();
         assert_eq!(app.previous_selected, [false, false]);
     }
@@ -1403,7 +1435,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             RowKind::Previous(idx) => {
                 items.push(previous_sender_row(
                     &app.previous[idx],
-                    app.previous_unsubscribed_at[idx],
+                    &app.previous_verdicts[idx],
                     app.previous_selected[idx],
                     is_cursor,
                 ));
@@ -1486,30 +1518,59 @@ fn select_all_row(selected: &[bool], is_cursor: bool) -> Line<'static> {
     Line::styled(format!(" {checkbox} Select All"), style)
 }
 
-/// A sender we already unsubscribed from, annotated with when that happened.
+/// A sender we already unsubscribed from, annotated with what happened next.
 ///
 /// Selecting one retries the unsubscribe and archives, exactly like an active
-/// sender -- the section is about drawing attention, not about behaving
-/// differently.
+/// sender. What the row adds is the measurement: an HTTP 200 was never the
+/// point, the mail stopping was.
 fn previous_sender_row(
     sender: &SenderInfo,
-    unsubscribed_at: i64,
+    verdict: &SenderVerdict,
     selected: bool,
     is_cursor: bool,
 ) -> Line<'static> {
     let text = format!(
-        "{}  unsubscribed {}",
+        "{}  unsubscribed {}  {}{}",
         sender_row_text(sender, selected),
-        format_date(unsubscribed_at),
+        format_date(verdict.unsubscribed_at),
+        outcome_label(verdict.outcome),
+        violations_label(verdict.violation_count),
     );
     let style = if is_cursor {
         Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else if verdict.outcome.is_resumed() {
+        // The one row that is a finding rather than a listing.
+        Style::default().fg(Color::Red).bold()
     } else if selected {
         Style::default().fg(Color::Red)
-    } else {
+    } else if matches!(verdict.outcome, UnsubscribeOutcome::WithinGrace { .. }) {
         Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
     Line::styled(text, style)
+}
+
+/// How an outcome reads on a row.
+fn outcome_label(outcome: UnsubscribeOutcome) -> String {
+    match outcome {
+        UnsubscribeOutcome::NoNewMail => "no new mail".to_string(),
+        UnsubscribeOutcome::WithinGrace { days_left } => {
+            format!("within grace period ({days_left}d left)")
+        }
+        UnsubscribeOutcome::Resumed { days_after } => {
+            format!("resumed {days_after}d after unsubscribe")
+        }
+    }
+}
+
+/// A repeat offender's tally, shown only once there is more than one.
+fn violations_label(violation_count: u32) -> String {
+    if violation_count > 1 {
+        format!("  ({violation_count} violations)")
+    } else {
+        String::new()
+    }
 }
 
 /// The text of a sender row, shared by the active and previously unsubscribed

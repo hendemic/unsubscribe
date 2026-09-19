@@ -143,12 +143,14 @@ use the default:
 | `min_emails` | `3` | Minimum emails a sender needs to be listed. `0` shows every sender. Overridden per-run by `--min-emails`. |
 | `stale_after_months` | `12` | Months without a message before a sender counts as stale. Stale senders start deselected and are archived without an unsubscribe request. |
 | `cache_max_age_days` | `7` | Days a cached scan stays fresh. Past this, the scan timestamp is flagged as old. |
+| `grace_period_days` | `14` | Days a sender is given to honour an unsubscribe. Mail arriving after this counts as a resumption and is recorded as a violation. `0` counts any new mail immediately. |
 
 ```toml
 [preferences]
 min_emails = 3
 stale_after_months = 12
 cache_max_age_days = 7
+grace_period_days = 14
 ```
 
 ### Supported providers

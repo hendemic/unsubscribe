@@ -17,7 +17,7 @@
 use anyhow::Result;
 
 use crate::history::{
-    split_previously_unsubscribed, PreviouslyUnsubscribed, UnsubscribeAttempt,
+    split_previously_unsubscribed, PreviouslyUnsubscribed, Resumption, UnsubscribeAttempt,
 };
 use crate::ports::{
     CacheMeta, CachedScan, DataStore, EmailProvider, EmailSender, HistoryStore, HttpClient,
@@ -69,6 +69,9 @@ pub struct RunPolicy {
     /// Months without a message before a sender is archived rather than
     /// unsubscribed from.
     pub stale_after_months: u32,
+    /// Days a sender is given to honour an unsubscribe before new mail counts
+    /// as a resumption.
+    pub grace_period_days: u32,
     /// Report what would happen and change nothing.
     pub dry_run: bool,
 }
@@ -89,6 +92,9 @@ pub enum RunWarning {
     /// An attempt completed but could not be written to the history. The
     /// unsubscribe happened; the evidence for it did not survive.
     AttemptNotRecorded(String),
+    /// A sender was seen ignoring its unsubscribe but the observation could
+    /// not be written to the history.
+    ResumptionNotRecorded(String),
 }
 
 /// Port for reporting run progress and per-sender outcomes.
@@ -237,12 +243,16 @@ pub fn scan_senders(
 /// stale: that it came back at all is the interesting part.
 #[derive(Debug, Clone, Default)]
 pub struct AnnotatedSenders {
-    /// Senders with a prior successful unsubscribe, in scanned order.
+    /// Senders with a prior successful unsubscribe, in scanned order, each
+    /// carrying the verdict on whether that unsubscribe was honoured.
     pub previously_unsubscribed: Vec<PreviouslyUnsubscribed>,
     /// Senders seen within the staleness threshold (or of unknown date).
     pub active: Vec<SenderInfo>,
     /// Senders whose most recent message predates the staleness threshold.
     pub stale: Vec<SenderInfo>,
+    /// Senders caught ignoring an unsubscribe that the history does not
+    /// already record. Hand these to [`record_resumptions`].
+    pub new_resumptions: Vec<Resumption>,
 }
 
 impl AnnotatedSenders {
@@ -251,29 +261,79 @@ impl AnnotatedSenders {
     pub fn total(&self) -> usize {
         self.previously_unsubscribed.len() + self.active.len() + self.stale.len()
     }
+
+    /// Senders that ignored an unsubscribe, however long ago it was observed.
+    pub fn resumed(&self) -> impl Iterator<Item = &PreviouslyUnsubscribed> {
+        self.previously_unsubscribed
+            .iter()
+            .filter(|p| p.verdict.outcome.is_resumed())
+    }
 }
 
-/// Match scanned senders against an account's unsubscribe history.
+/// Match scanned senders against an account's unsubscribe history, judging
+/// what each previously unsubscribed sender has done since.
 ///
-/// Pure: the TUI, a headless run and a server all group senders identically
-/// from the same inputs.
+/// The judgement itself is pure ([`crate::history::classify_outcome`]); what
+/// this adds is the grouping and the list of observations worth recording.
+/// Nothing is written here -- a consumer that decides not to record (a dry run)
+/// simply does not call [`record_resumptions`].
 #[must_use]
 pub fn annotate_senders(
+    account: &str,
     senders: Vec<SenderInfo>,
     attempts: &[UnsubscribeAttempt],
+    resumptions: &[Resumption],
     policy: &RunPolicy,
     now: i64,
 ) -> AnnotatedSenders {
-    let sections = split_previously_unsubscribed(senders, attempts);
+    let sections = split_previously_unsubscribed(
+        senders,
+        attempts,
+        resumptions,
+        now,
+        policy.grace_period_days,
+    );
     let (stale, active): (Vec<_>, Vec<_>) = sections
         .remaining
         .into_iter()
         .partition(|s| is_stale(s, policy.stale_after_months, now));
 
+    let new_resumptions = sections
+        .previously_unsubscribed
+        .iter()
+        .filter_map(|previous| previous.new_resumption(account, resumptions, now))
+        .collect();
+
     AnnotatedSenders {
         previously_unsubscribed: sections.previously_unsubscribed,
         active,
         stale,
+        new_resumptions,
+    }
+}
+
+/// Write the resumptions an annotation turned up.
+///
+/// The violation log is evidence, not a prerequisite: a history that cannot be
+/// written costs the record and nothing else. A dry run records nothing,
+/// having promised to change nothing.
+pub fn record_resumptions(
+    annotated: &AnnotatedSenders,
+    history: Option<&dyn HistoryStore>,
+    policy: &RunPolicy,
+    observer: &dyn RunObserver,
+) {
+    if policy.dry_run {
+        return;
+    }
+    let Some(history) = history else {
+        return;
+    };
+    for resumption in &annotated.new_resumptions {
+        if let Err(e) = history.record_resumption(resumption) {
+            observer
+                .on_warning(&RunWarning::ResumptionNotRecorded(e.to_string()));
+        }
     }
 }
 

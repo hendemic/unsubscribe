@@ -5,16 +5,17 @@ use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
-    decide_scan_action, latest_successful_attempts, load_cached_senders, scan_senders,
-    AccountConfig, CachedScanSummary, Credential, DataStore, Folder, HistoryStore, ObtainedSenders,
-    Preferences, ScanAction, ScanCacheStore, SenderInfo,
+    decide_scan_action, judge_sender, load_cached_senders, scan_senders, AccountConfig,
+    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, LatestAttempts,
+    ObtainedSenders, Preferences, PreviouslyUnsubscribed, Resumption, RunObserver, RunPolicy,
+    RunWarning, ScanAction, ScanCacheStore, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
 use crate::commands::load_history;
 use crate::progress::CliWarningsOnly;
 use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{
-    age_secs_since, format_relative_age, is_stale, now_iso8601, utc_to_local_date,
+    age_secs_since, format_relative_age, is_stale, now_iso8601, now_unix_secs, utc_to_local_date,
     scan_max_age_secs,
 };
 use crate::{make_provider, progress};
@@ -171,8 +172,34 @@ pub fn cmd_scan(
     preferences: &Preferences,
 ) -> Result<()> {
     let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
-    let previously_unsubscribed =
-        latest_successful_attempts(&load_history(history, &account.account_id));
+
+    // Same judgement the run makes, so the two commands never disagree about
+    // which sender ignored its unsubscribe -- and recording it here means a
+    // plain `scan` builds the violation log too.
+    let history_view = load_history(history, &account.account_id);
+    let policy = run_policy(preferences);
+    let now = now_unix_secs();
+    let latest = LatestAttempts::from_history(&history_view.attempts);
+    let verdicts: Vec<Option<SenderVerdict>> = senders
+        .iter()
+        .map(|sender| {
+            judge_sender(
+                sender,
+                &latest,
+                &history_view.resumptions,
+                now,
+                policy.grace_period_days,
+            )
+        })
+        .collect();
+    record_scan_resumptions(
+        &account.account_id,
+        &senders,
+        &verdicts,
+        &history_view.resumptions,
+        history,
+        now,
+    );
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -190,22 +217,21 @@ pub fn cmd_scan(
     );
     println!("{DIM}{}{RESET}", "-".repeat(100));
 
-    for s in &senders {
+    for (s, verdict) in senders.iter().zip(&verdicts) {
         let name = if s.display_name.is_empty() {
             "-"
         } else {
             &s.display_name
         };
-        // A sender we already unsubscribed from is mailing again, so say so
-        // even when it is also stale.
-        let (marker, marker_color) =
-            if previously_unsubscribed.contains_key(&s.email.to_lowercase()) {
-                (" [unsubscribed]", RED)
-            } else if is_stale(s, preferences.stale_after_months) {
-                (" [stale]", DIM)
-            } else {
-                ("", DIM)
-            };
+        // What happened after a previous unsubscribe outranks staleness: a
+        // sender that came back is the finding, stale or not.
+        let (marker, marker_color) = match verdict {
+            Some(verdict) => (outcome_marker(verdict), outcome_color(verdict)),
+            None if is_stale(s, preferences.stale_after_months) => {
+                (" [stale]".to_string(), DIM)
+            }
+            None => (String::new(), DIM),
+        };
         let (method, method_color) = if s.one_click {
             ("1-click", GREEN)
         } else if !s.unsubscribe_urls.is_empty() {
@@ -227,12 +253,15 @@ pub fn cmd_scan(
         .iter()
         .filter(|s| is_stale(s, preferences.stale_after_months))
         .count();
-    let previous_count = senders
+    let previous_count = verdicts.iter().flatten().count();
+    let resumed_count = verdicts
         .iter()
-        .filter(|s| previously_unsubscribed.contains_key(&s.email.to_lowercase()))
+        .flatten()
+        .filter(|v| v.outcome.is_resumed())
         .count();
     let notes: Vec<String> = [
         (previous_count, "previously unsubscribed"),
+        (resumed_count, "resumed"),
         (stale_count, "stale"),
     ]
     .iter()
@@ -315,6 +344,75 @@ pub fn cmd_export(
     wtr.flush()?;
     println!("{GREEN}Exported {} senders{RESET} to {output:?}", senders.len());
     Ok(())
+}
+
+/// The policy a listing command judges senders under.
+fn run_policy(preferences: &Preferences) -> RunPolicy {
+    RunPolicy {
+        min_emails: preferences.min_emails,
+        stale_after_months: preferences.stale_after_months,
+        grace_period_days: preferences.grace_period_days,
+        dry_run: false,
+    }
+}
+
+/// Write every resumption this listing turned up that is not on record yet.
+///
+/// `scan` changes nothing about the mailbox, but observing a sender ignore an
+/// unsubscribe is an observation either way, and it cannot be made again later.
+fn record_scan_resumptions(
+    account: &str,
+    senders: &[SenderInfo],
+    verdicts: &[Option<SenderVerdict>],
+    known: &[Resumption],
+    history: Option<&dyn HistoryStore>,
+    now: i64,
+) {
+    let Some(history) = history else {
+        return;
+    };
+    senders
+        .iter()
+        .zip(verdicts)
+        .filter_map(|(sender, verdict)| {
+            let verdict = verdict.as_ref()?;
+            PreviouslyUnsubscribed {
+                sender: sender.clone(),
+                verdict: verdict.clone(),
+            }
+            .new_resumption(account, known, now)
+        })
+        .for_each(|resumption| {
+            if let Err(e) = history.record_resumption(&resumption) {
+                CliWarningsOnly.on_warning(&RunWarning::ResumptionNotRecorded(e.to_string()));
+            }
+        });
+}
+
+/// The short marker a listing row carries for a previously unsubscribed sender.
+fn outcome_marker(verdict: &SenderVerdict) -> String {
+    let violations = if verdict.violation_count > 1 {
+        format!(" x{}", verdict.violation_count)
+    } else {
+        String::new()
+    };
+    match verdict.outcome {
+        UnsubscribeOutcome::NoNewMail => " [unsubscribed]".to_string(),
+        UnsubscribeOutcome::WithinGrace { days_left } => {
+            format!(" [grace: {days_left}d left]")
+        }
+        UnsubscribeOutcome::Resumed { days_after } => {
+            format!(" [resumed {days_after}d after{violations}]")
+        }
+    }
+}
+
+fn outcome_color(verdict: &SenderVerdict) -> &'static str {
+    match verdict.outcome {
+        UnsubscribeOutcome::Resumed { .. } => RED,
+        UnsubscribeOutcome::WithinGrace { .. } => YELLOW,
+        UnsubscribeOutcome::NoNewMail => DIM,
+    }
 }
 
 fn truncate(s: &str, max: usize) -> &str {

@@ -34,6 +34,9 @@ min_emails = 3
 stale_after_months = 12
 # Days a cached scan stays fresh. Past this, `run` flags the scan as old. (1-3650)
 cache_max_age_days = 7
+# Days a sender is given to honour an unsubscribe before mail from it counts as
+# a resumption. CAN-SPAM allows ten business days to act on an opt-out. (0-3650)
+grace_period_days = 14
 
 # Common IMAP hosts:
 #   Gmail:      imap.gmail.com (or use provider = "gmail" for OAuth)

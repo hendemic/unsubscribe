@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Row};
-use unsubscribe_core::{HistoryStore, UnsubscribeAttempt};
+use unsubscribe_core::{HistoryStore, Resumption, UnsubscribeAttempt};
 
 use crate::sqlite::{apply_migrations, open_database};
 
@@ -29,6 +29,19 @@ const MIGRATIONS: &[&str] = &["
     );
     CREATE INDEX idx_attempts_account_sender
         ON unsubscribe_attempts (account, sender_email);
+", "
+    CREATE TABLE resumptions (
+        id           TEXT PRIMARY KEY,
+        account      TEXT NOT NULL,
+        sender_email TEXT NOT NULL,
+        list_id      TEXT,
+        attempt_id   TEXT NOT NULL UNIQUE,
+        observed_at  INTEGER NOT NULL,
+        last_seen    INTEGER NOT NULL,
+        email_count  INTEGER NOT NULL
+    );
+    CREATE INDEX idx_resumptions_account_sender
+        ON resumptions (account, sender_email);
 "];
 
 /// The file name used inside the data directory.
@@ -114,6 +127,62 @@ impl HistoryStore for SqliteHistoryStore {
 
         Ok(attempts)
     }
+
+    fn record_resumption(&self, resumption: &Resumption) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| poisoned())?;
+        conn.execute(
+            "INSERT INTO resumptions (
+                 id, account, sender_email, list_id, attempt_id,
+                 observed_at, last_seen, email_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                resumption.id,
+                resumption.account,
+                resumption.sender_email,
+                resumption.list_id,
+                resumption.attempt_id,
+                resumption.observed_at,
+                resumption.last_seen,
+                resumption.email_count,
+            ],
+        )
+        .context("Failed to record resumption")?;
+        Ok(())
+    }
+
+    fn resumptions_for_account(&self, account: &str) -> Result<Vec<Resumption>> {
+        let conn = self.conn.lock().map_err(|_| poisoned())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account, sender_email, list_id, attempt_id,
+                        observed_at, last_seen, email_count
+                 FROM resumptions
+                 WHERE account = ?1
+                 ORDER BY observed_at ASC, id ASC",
+            )
+            .context("Failed to prepare resumption query")?;
+
+        let resumptions = stmt
+            .query_map([account], row_to_resumption)
+            .context("Failed to read resumptions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read resumptions")?;
+
+        Ok(resumptions)
+    }
+}
+
+fn row_to_resumption(row: &Row<'_>) -> rusqlite::Result<Resumption> {
+    Ok(Resumption {
+        id: row.get(0)?,
+        account: row.get(1)?,
+        sender_email: row.get(2)?,
+        list_id: row.get(3)?,
+        attempt_id: row.get(4)?,
+        observed_at: row.get(5)?,
+        last_seen: row.get(6)?,
+        email_count: row.get(7)?,
+    })
 }
 
 fn row_to_attempt(row: &Row<'_>) -> rusqlite::Result<UnsubscribeAttempt> {
@@ -328,8 +397,13 @@ mod tests {
             .expect("record");
 
         let alice_history = store.attempts_for_account("alice@example.com").expect("read");
-        let sections =
-            split_previously_unsubscribed(vec![sender("news@acme.example.com")], &alice_history);
+        let sections = split_previously_unsubscribed(
+            vec![sender("news@acme.example.com")],
+            &alice_history,
+            &[],
+            1_700_000_000,
+            14,
+        );
 
         assert!(sections.previously_unsubscribed.is_empty());
         assert_eq!(sections.remaining.len(), 1);

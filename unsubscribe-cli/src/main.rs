@@ -478,6 +478,7 @@ mod with_min_emails_tests {
             min_emails: 5,
             stale_after_months: 6,
             cache_max_age_days: 21,
+            grace_period_days: 14,
         }
     }
 
