@@ -19,6 +19,7 @@ use unsubscribe_core::{
     CachedScanSummary, ConfigStore, Credential, DataStore, ObtainedSenders, Preferences, RunPlan,
     RunPolicy, ScanAction, SenderInfo,
 };
+use unsubscribe_core::sender_histories;
 use unsubscribe_persistence::{
     FileDataStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
 };
@@ -30,10 +31,13 @@ use super::config::{SettingsApp, SettingsIo};
 use super::home::{HomeScreen, HomeStats};
 use super::select::{App as SelectScreen, SelectAction};
 use super::warnings::WarningsScreen;
+use super::history::{DetailScreen, HistoryScreen};
 use super::run::{PlanCounts, RunScreen};
 use super::scan::{ScanEnded, ScanScreen};
 use super::worker::{self, RunShared, ScanShared, SelectionContext};
-use super::{config, home, run, scan, select, suspended, warnings, TerminalGuard, Tui};
+use super::{
+    config, history, home, run, scan, select, suspended, warnings, TerminalGuard, Tui,
+};
 use crate::commands::config::ConfigIo;
 use crate::commands::load_history;
 use crate::progress::CliWarningsOnly;
@@ -182,6 +186,8 @@ pub enum Effect {
     SettingsFolders,
     /// The settings screen asked to re-authenticate.
     SettingsReauth,
+    /// A resumed sender's timeline asked for another go at it.
+    RunFromHistory,
 }
 
 /// One screen in the stack.
@@ -199,6 +205,8 @@ pub enum Screen {
         io: Box<ConfigIo>,
     },
     Warnings(WarningsScreen),
+    History(Box<HistoryScreen>),
+    SenderHistory(Box<DetailScreen>),
 }
 
 impl Screen {
@@ -211,6 +219,8 @@ impl Screen {
             Self::Select { .. } => "Review senders",
             Self::Settings { .. } => "Settings",
             Self::Warnings(_) => "Scan warnings",
+            Self::History(_) => "History",
+            Self::SenderHistory(_) => "Sender history",
         }
     }
 
@@ -222,6 +232,8 @@ impl Screen {
             Self::Select { app, .. } => app.hints(),
             Self::Settings { app, .. } => config::hints(app),
             Self::Warnings(screen) => screen.hints(),
+            Self::History(screen) => screen.hints(),
+            Self::SenderHistory(screen) => screen.hints(),
         }
     }
 
@@ -248,6 +260,8 @@ impl Screen {
                 ("q / Esc", "back"),
             ],
             Self::Warnings(screen) => screen.keys(),
+            Self::History(screen) => screen.keys(),
+            Self::SenderHistory(screen) => screen.keys(),
         }
     }
 
@@ -287,6 +301,8 @@ impl Screen {
                 config::Action::Reauthenticate => Nav::Effect(Effect::SettingsReauth),
             },
             Self::Warnings(screen) => screen.on_key(key),
+            Self::History(screen) => screen.on_key(key),
+            Self::SenderHistory(screen) => screen.on_key(key),
         }
     }
 
@@ -298,6 +314,8 @@ impl Screen {
             Self::Select { app, .. } => select::render(f, area, app),
             Self::Settings { app, .. } => config::render(f, area, app),
             Self::Warnings(screen) => warnings::render(f, area, screen),
+            Self::History(screen) => history::render_list(f, area, screen),
+            Self::SenderHistory(screen) => history::render_detail(f, area, screen),
         }
     }
 }
@@ -511,12 +529,8 @@ impl Shell {
                     ],
                 ));
             }
-            Effect::OpenHistory => {
-                self.dialog = Some(Dialog::notice(
-                    "History",
-                    ["The History screen arrives with the next release.".to_string()],
-                ));
-            }
+            Effect::OpenHistory => self.open_history(),
+            Effect::RunFromHistory => self.run_from_history(),
             Effect::OpenWarnings => match self.ctx.data.read_warnings() {
                 Ok(warnings) => self
                     .stack
@@ -766,6 +780,83 @@ impl Shell {
         self.stack.push(Screen::Run(Box::new(RunScreen::new(
             shared, result, counts, dry_run,
         ))));
+    }
+
+    /// Open the History screen on everything the store holds.
+    ///
+    /// Loaded once, here, rather than queried as the user scrolls: the
+    /// reduction is pure and a few thousand attempts collapse to one row per
+    /// sender, so the screen never touches a store again.
+    fn open_history(&mut self) {
+        let stored = load_history(self.ctx.history_store(), &self.ctx.account.account_id);
+        let scanned = load_cached_senders(
+            &self.ctx.cache,
+            &self.ctx.account.account_id,
+            self.ctx.preferences.min_emails,
+            &CliWarningsOnly,
+        )
+        .map(|cached| cached.senders)
+        .unwrap_or_default();
+
+        let views = sender_histories(
+            &stored.attempts,
+            &stored.resumptions,
+            &scanned,
+            now_unix_secs(),
+            self.ctx.preferences.grace_period_days,
+        );
+        self.stack
+            .push(Screen::History(Box::new(HistoryScreen::new(views))));
+    }
+
+    /// Send one sender from its timeline straight to the run confirmation.
+    ///
+    /// Only reachable for a resumed sender that is in the current scan, which
+    /// is the only case where there is mail to act on and a rung to climb to.
+    fn run_from_history(&mut self) {
+        let Some(Screen::SenderHistory(detail)) = self.stack.last() else {
+            return;
+        };
+        let (email, list_id) = detail.sender();
+        let (email, list_id) = (email.to_string(), list_id.map(str::to_string));
+
+        let cached = load_cached_senders(
+            &self.ctx.cache,
+            &self.ctx.account.account_id,
+            self.ctx.preferences.min_emails,
+            &CliWarningsOnly,
+        );
+        let sender = cached.and_then(|cached| {
+            cached.senders.into_iter().find(|sender| {
+                sender.email.eq_ignore_ascii_case(&email) && sender.list_id == list_id
+            })
+        });
+        let Some(sender) = sender else {
+            self.set_status(StatusMessage::warning(
+                "That sender is no longer in the cached scan \u{2014} scan again first.",
+            ));
+            return;
+        };
+
+        let stored = load_history(self.ctx.history_store(), &self.ctx.account.account_id);
+        let history = SelectionContext {
+            attempts: stored.attempts,
+            resumptions: stored.resumptions,
+        };
+        let plan = worker::plan(
+            vec![sender],
+            &history,
+            &self.ctx.policy(false),
+            now_unix_secs(),
+        );
+        let counts = PlanCounts::of(&plan);
+        self.dialog = Some(
+            Dialog::confirm("Confirm run", plan_summary(&plan)).with_toggle("Dry run", false),
+        );
+        self.pending = Some(Pending::Run {
+            plan: Box::new(plan),
+            counts: Box::new(counts),
+        });
     }
 
     fn open_settings(&mut self) {

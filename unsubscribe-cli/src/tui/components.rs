@@ -11,6 +11,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+/// Width of the key column in the help overlay: a right-aligned key, padded.
+const KEY_COLUMN: usize = 15;
+
 /// How long a transient status message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(4);
 
@@ -34,8 +37,6 @@ pub enum DialogKind {
     Confirm,
     /// Any key dismisses. Drawn in red.
     Error,
-    /// Any key dismisses. Drawn in the normal accent.
-    Notice,
 }
 
 /// A labelled switch on a confirm dialog.
@@ -50,7 +51,7 @@ pub struct DialogToggle {
 pub enum DialogOutcome {
     /// The dialog stays open.
     Open,
-    /// The user said yes (or dismissed a notice).
+    /// The user said yes (or acknowledged an error).
     Confirmed,
     /// The user said no, or pressed Esc.
     Dismissed,
@@ -75,17 +76,6 @@ impl Dialog {
             kind: DialogKind::Error,
             title: title.into(),
             body: wrapped_lines(&message.into()),
-            toggle: None,
-            hints: None,
-        }
-    }
-
-    /// Something worth a modal that is not a failure.
-    pub fn notice(title: impl Into<String>, body: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            kind: DialogKind::Notice,
-            title: title.into(),
-            body: body.into_iter().collect(),
             toggle: None,
             hints: None,
         }
@@ -117,7 +107,7 @@ impl Dialog {
     pub fn on_key(&mut self, key: KeyEvent) -> DialogOutcome {
         match self.kind {
             // Anything dismisses a notice, so there is no wrong key to press.
-            DialogKind::Error | DialogKind::Notice => DialogOutcome::Confirmed,
+            DialogKind::Error => DialogOutcome::Confirmed,
             DialogKind::Confirm => match key.code {
                 KeyCode::Char('d') if self.toggle.is_some() => {
                     if let Some(toggle) = self.toggle.as_mut() {
@@ -146,7 +136,7 @@ impl Dialog {
                 " Enter/y: confirm | d: toggle dry run | Esc/n: cancel"
             }
             DialogKind::Confirm => " Enter/y: confirm | Esc/n: cancel",
-            DialogKind::Error | DialogKind::Notice => " any key: dismiss",
+            DialogKind::Error => " any key: dismiss",
         }
     }
 }
@@ -226,7 +216,6 @@ pub fn render_dialog(f: &mut Frame, dialog: &Dialog) {
     let accent = match dialog.kind {
         DialogKind::Error => Color::Red,
         DialogKind::Confirm => Color::Yellow,
-        DialogKind::Notice => Color::Cyan,
     };
 
     f.render_widget(Clear, area);
@@ -243,18 +232,21 @@ pub fn render_dialog(f: &mut Frame, dialog: &Dialog) {
 
 /// Draw the help overlay: the keys the current screen answers to.
 pub fn render_help(f: &mut Frame, screen_title: &str, keys: &[(&str, &str)]) {
+    // The key column is padded to a fixed width, so the widest row is that
+    // plus the longest description, plus the two borders. Counted in chars:
+    // the arrows are multi-byte and `len()` would over-measure them.
     let width = keys
         .iter()
-        .map(|(key, what)| key.len() + what.len() + 6)
+        .map(|(_, what)| KEY_COLUMN + what.chars().count() + 3)
         .max()
         .unwrap_or(40)
-        .clamp(34, 70) as u16;
+        .clamp(34, 90) as u16;
     let lines: Vec<Line> = keys
         .iter()
         .map(|(key, what)| {
             Line::from(vec![
                 Span::styled(
-                    format!(" {key:>12}  "),
+                    format!(" {key:>width$}  ", width = KEY_COLUMN - 3),
                     Style::default().fg(Color::Yellow).bold(),
                 ),
                 Span::raw((*what).to_string()),
