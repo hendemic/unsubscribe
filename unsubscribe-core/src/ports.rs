@@ -47,6 +47,17 @@ pub trait EmailProvider {
 /// Port for HTTP operations needed during unsubscribe flows and API access.
 ///
 /// CLI provides this via reqwest, iOS via URLSession, tests via mocks.
+///
+/// URLs passed here come from attacker-controlled email headers and are
+/// fetched unattended (no human watching the result), so every adapter
+/// must guard against SSRF: refuse loopback/private/link-local/other
+/// non-public addresses, checked against the address actually connected
+/// to (not just the hostname string) and re-checked on every redirect
+/// hop. The CLI's `ReqwestHttpClient` (`unsubscribe-cli/src/http.rs`) is
+/// the reference implementation; a future iOS `URLSession` adapter needs
+/// the equivalent, most likely via a custom `URLProtocol` or
+/// `NWConnection`-based address filtering, since `URLSession` has no
+/// pluggable DNS resolver hook.
 pub trait HttpClient {
     /// Perform an HTTP GET request.
     fn get(&self, url: &str) -> Result<HttpResponse>;
