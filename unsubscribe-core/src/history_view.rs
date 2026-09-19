@@ -14,8 +14,8 @@
 
 use crate::escalation::{next_step, NextStep};
 use crate::history::{
-    attempts_about, classify_outcome, judge_sender, normalized_list_id, resumptions_about,
-    LatestAttempts, Resumption, UnsubscribeAttempt, UnsubscribeOutcome,
+    attempts_about, judge_sender, normalized_list_id, resumptions_about, LatestAttempts,
+    Resumption, UnsubscribeAttempt, UnsubscribeOutcome,
 };
 use crate::types::SenderInfo;
 
@@ -117,7 +117,9 @@ pub fn sender_histories(
 
     let mut views: Vec<SenderHistoryView> = scanned
         .iter()
-        .filter_map(|sender| scanned_view(sender, &latest, attempts, resumptions, now, grace_period_days))
+        .filter_map(|sender| {
+            scanned_view(sender, &latest, attempts, resumptions, now, grace_period_days)
+        })
         .collect();
 
     views.extend(unscanned_views(attempts, resumptions, scanned));
@@ -222,17 +224,6 @@ fn timeline(attempts: &[&UnsubscribeAttempt], resumptions: &[&Resumption]) -> Ve
         .collect();
     events.sort_by_key(TimelineEvent::at);
     events
-}
-
-/// What a sender did between a successful attempt and the newest mail seen.
-///
-/// Exposed for consumers rendering one timeline entry at a time; the grouped
-/// views already carry the same judgement in `outcome`.
-#[must_use]
-pub fn outcome_of(attempt: &UnsubscribeAttempt, last_seen: Option<i64>, now: i64, grace_period_days: u32) -> Option<UnsubscribeOutcome> {
-    attempt
-        .success
-        .then(|| classify_outcome(attempt.attempted_at, last_seen, now, grace_period_days))
 }
 
 // ---------------------------------------------------------------------------

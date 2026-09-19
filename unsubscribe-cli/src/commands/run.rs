@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use unsubscribe_core::{
     annotate_senders, decide_run_mode, execute_run, plan_run, record_resumptions, select_by_policy,
     AccountConfig, AnnotatedSenders, Credential, DataStore, EmailSender, Folder, HistoryStore,
-    Preferences, RunContext, RunMode, RunOutcome, RunPlan, RunPolicy, ScanCacheStore, SelectedSender,
-    Selection, SelectionPolicy, SelectionReason, SenderInfo,
+    Preferences, RunContext, RunMode, RunOutcome, RunPlan, RunPolicy, ScanCacheStore, Selection,
+    SelectedSender, SelectionPolicy, SelectionReason, SenderInfo,
 };
 use unsubscribe_persistence::{LockOutcome, RunLock};
 
@@ -168,7 +168,7 @@ pub fn cmd_run(
         return Ok(Exit::NothingToDo);
     };
 
-    if chosen.selected.is_empty() {
+    if chosen.is_empty() {
         note!("{YELLOW}No senders selected.{RESET}");
         if request.json {
             output::emit_json(&empty_document(account, &resolved.scanned_at, &warnings))?;
