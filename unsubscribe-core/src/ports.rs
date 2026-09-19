@@ -1,11 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::history::UnsubscribeAttempt;
 use crate::types::{
     AccountConfig, Credential, Folder, FolderMessage, HttpResponse, Preferences, ScanResult,
-    SenderInfo,
+    ScanWatermark, SenderInfo,
 };
 
 /// Port for scan progress reporting.
@@ -156,18 +155,6 @@ pub trait HistoryStore {
 // ---------------------------------------------------------------------------
 // DataStore: scan warnings, action logs, and cached scan results
 // ---------------------------------------------------------------------------
-
-/// Watermark for tracking scan position per adapter.
-/// Stored alongside cached results for future incremental scanning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanWatermark {
-    /// Per-folder highest UID seen (IMAP adapter)
-    pub highest_uid: HashMap<String, u32>,
-    /// Per-folder UIDVALIDITY (IMAP adapter)
-    pub uid_validity: HashMap<String, u32>,
-    /// Adapter-specific opaque state (e.g., Gmail historyId)
-    pub adapter_state: Option<String>,
-}
 
 /// Metadata about a cached scan (persistence-layer concern, not a domain type).
 #[derive(Debug, Clone, Serialize, Deserialize)]

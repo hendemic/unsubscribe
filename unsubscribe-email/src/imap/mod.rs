@@ -9,7 +9,7 @@ use native_tls::TlsStream;
 use unsubscribe_core::{
     domain_from_email, list_id_warning, parse_from_header, parse_list_id,
     parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId, ScanProgress,
-    ScanResult, SenderInfo,
+    ScanResult, ScanWatermark, SenderInfo,
 };
 
 /// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
@@ -109,7 +109,12 @@ impl EmailProvider for ImapProvider {
         let mut senders: Vec<SenderInfo> = combined.into_values().collect();
         senders.sort_by(|a, b| b.email_count.cmp(&a.email_count));
 
-        Ok(ScanResult { senders, warnings: all_warnings })
+        let watermark = watermark_from_senders(&senders);
+        Ok(ScanResult {
+            senders,
+            warnings: all_warnings,
+            watermark,
+        })
     }
 
     fn archive(&self, messages: &[FolderMessage], destination: &Folder) -> Result<u32> {
@@ -443,6 +448,29 @@ fn merge_folder_result(
 
 fn encode_message_id(folder: &str, uid: u32, uid_validity: u32) -> MessageId {
     MessageId::new(format!("{folder}:{uid}:{uid_validity}"))
+}
+
+/// Highest UID and UIDVALIDITY per folder across everything a scan found.
+///
+/// Derived here rather than in core because the position is encoded in this
+/// adapter's own `MessageId` format, which core never reads. Ids that do not
+/// parse are skipped: a watermark is an optimisation for a future incremental
+/// scan, never a correctness requirement.
+fn watermark_from_senders(senders: &[SenderInfo]) -> ScanWatermark {
+    senders
+        .iter()
+        .flat_map(|sender| sender.messages.iter())
+        .filter_map(|message| {
+            parse_message_id(message.message_id.as_str())
+                .ok()
+                .map(|(uid, validity)| (message.folder.as_str().to_string(), uid, validity))
+        })
+        .fold(ScanWatermark::default(), |mut mark, (folder, uid, validity)| {
+            let highest = mark.highest_uid.entry(folder.clone()).or_insert(0);
+            *highest = (*highest).max(uid);
+            mark.uid_validity.insert(folder, validity);
+            mark
+        })
 }
 
 /// Parse a MessageId back into (uid, uid_validity).

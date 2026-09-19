@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Opaque identifier for an email message within a folder.
@@ -190,14 +191,31 @@ mod tests {
     }
 }
 
+/// How far a scan got, in whatever terms its adapter counts position.
+///
+/// Adapters fill this in from their own identifier format -- IMAP knows its
+/// UIDs, Gmail its history ids -- because core never interprets a `MessageId`.
+/// Stored alongside cached results for future incremental scanning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScanWatermark {
+    /// Per-folder highest UID seen (IMAP adapter)
+    pub highest_uid: HashMap<String, u32>,
+    /// Per-folder UIDVALIDITY (IMAP adapter)
+    pub uid_validity: HashMap<String, u32>,
+    /// Adapter-specific opaque state (e.g., Gmail historyId)
+    pub adapter_state: Option<String>,
+}
+
 /// Result of scanning one or more folders.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[must_use]
 pub struct ScanResult {
     /// Senders found, sorted by email count descending
     pub senders: Vec<SenderInfo>,
     /// Warnings about unparseable List-Unsubscribe headers
     pub warnings: Vec<String>,
+    /// Where the adapter left off, for a future incremental scan.
+    pub watermark: ScanWatermark,
 }
 
 /// How an unsubscribe attempt was carried out.

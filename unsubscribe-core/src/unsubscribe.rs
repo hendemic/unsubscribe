@@ -37,7 +37,7 @@ pub fn unsubscribe(
 ) -> Vec<UnsubscribeResult> {
     senders
         .iter()
-        .map(|sender| unsubscribe_one(sender, http, email_sender))
+        .map(|sender| unsubscribe_sender(sender, http, email_sender))
         .collect()
 }
 
@@ -54,7 +54,11 @@ struct ConfirmOutcome {
 }
 
 /// Run the unsubscribe flow for a single sender.
-fn unsubscribe_one(
+///
+/// Public because the run pipeline drives senders one at a time, reporting and
+/// recording each result before moving on.
+#[must_use]
+pub fn unsubscribe_sender(
     sender: &SenderInfo,
     http: &dyn HttpClient,
     email_sender: Option<&dyn EmailSender>,
@@ -522,7 +526,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
         assert_eq!(result.detail, "HTTP 200");
@@ -539,7 +543,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
     }
@@ -562,7 +566,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         // POST errored, fell through to GET, GET also errored
         assert!(!result.success);
         assert_eq!(result.method, UnsubscribeMethod::Get);
@@ -580,7 +584,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, UnsubscribeMethod::Get);
         assert_eq!(result.detail, "HTTP 200");
@@ -604,7 +608,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, UnsubscribeMethod::FormPost);
         assert!(result.detail.contains("confirmation form"));
@@ -625,7 +629,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, UnsubscribeMethod::ConfirmLink);
     }
@@ -641,7 +645,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(result.success);
         assert_eq!(result.method, UnsubscribeMethod::Get);
     }
@@ -657,7 +661,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         // 304 is in 300..400 range, so treated as success
         assert!(result.success);
     }
@@ -673,7 +677,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.detail, "HTTP 404");
     }
@@ -689,7 +693,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.detail, "HTTP 500");
     }
@@ -705,7 +709,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, UnsubscribeMethod::Get);
         assert!(result.detail.contains("DNS resolution failed"));
@@ -721,7 +725,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, UnsubscribeMethod::MailtoSkipped);
         assert!(result.detail.contains("mailto"));
@@ -732,7 +736,7 @@ mod tests {
         let http = MockHttpClient::new();
         let sender = make_sender("news@example.com", vec![], vec![], false);
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.method, UnsubscribeMethod::None);
         assert!(result.detail.contains("No unsubscribe URL found"));
@@ -750,7 +754,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
         assert!(result.success);
     }
@@ -1150,7 +1154,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
         assert_eq!(result.http_status, Some(202));
         assert_eq!(result.final_url.as_deref(), Some("https://cdn.example.net/done"));
@@ -1166,7 +1170,7 @@ mod tests {
             true,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.http_status, Some(503));
     }
@@ -1183,7 +1187,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::Get);
         assert_eq!(result.http_status, Some(200));
         assert_eq!(result.final_url.as_deref(), Some("https://example.com/bye"));
@@ -1199,7 +1203,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert!(!result.success);
         assert_eq!(result.http_status, Some(404));
     }
@@ -1214,7 +1218,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::Get);
         assert_eq!(result.http_status, None);
         assert_eq!(result.final_url, None);
@@ -1238,7 +1242,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::FormPost);
         assert_eq!(result.http_status, Some(201));
         assert_eq!(
@@ -1273,7 +1277,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::FormGet);
         assert_eq!(result.http_status, Some(200));
         assert_eq!(
@@ -1299,7 +1303,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::FormPost);
         assert_eq!(result.http_status, None);
         assert_eq!(result.final_url, None);
@@ -1321,7 +1325,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::ConfirmLink);
         assert_eq!(result.http_status, Some(204));
         assert_eq!(result.final_url.as_deref(), Some("https://example.com/gone"));
@@ -1337,7 +1341,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, Some(&StubEmailSender));
+        let result = unsubscribe_sender(&sender, &http, Some(&StubEmailSender));
         assert_eq!(result.method, UnsubscribeMethod::MailtoSent);
         assert!(result.success);
         assert_eq!(result.http_status, None);
@@ -1354,7 +1358,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, Some(&FailingEmailSender));
+        let result = unsubscribe_sender(&sender, &http, Some(&FailingEmailSender));
         assert_eq!(result.method, UnsubscribeMethod::MailtoFailed);
         assert!(!result.success);
         assert_eq!(result.http_status, None);
@@ -1371,7 +1375,7 @@ mod tests {
             false,
         );
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::MailtoSkipped);
         assert_eq!(result.http_status, None);
         assert_eq!(result.final_url, None);
@@ -1382,7 +1386,7 @@ mod tests {
         let http = MockHttpClient::new();
         let sender = make_sender("news@example.com", vec![], vec![], false);
 
-        let result = unsubscribe_one(&sender, &http, None);
+        let result = unsubscribe_sender(&sender, &http, None);
         assert_eq!(result.method, UnsubscribeMethod::None);
         assert_eq!(result.http_status, None);
         assert_eq!(result.final_url, None);
