@@ -30,4 +30,8 @@ sha2 = "0.10"
 url = "2"
 
 [dev-dependencies]
+# Lets tests hand `finish_response` a synthetic `reqwest::blocking::Response`
+# (via its `From<http::Response<T>>` impl) so the body cap can be exercised
+# without standing up a server.
+http = "1"
 tempfile = "3"
