@@ -2655,6 +2655,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "csv",
+ "http",
  "indicatif",
  "libc",
  "rand",
