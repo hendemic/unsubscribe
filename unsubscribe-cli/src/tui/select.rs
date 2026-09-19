@@ -1724,3 +1724,157 @@ fn civil_from_unix(ts: i64) -> (i64, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
+
+/// The key contract the shell and the standalone loop both depend on:
+/// which keys end the screen, and what the selection looks like afterwards.
+#[cfg(test)]
+mod key_handling_tests {
+    use super::*;
+    use unsubscribe_core::{
+        annotate_senders, now_unix_secs, AnnotatedSenders, RunPolicy, SenderInfo,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn sender(email: &str, email_count: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: String::new(),
+            email: email.to_string(),
+            domain: "test.com".to_string(),
+            unsubscribe_urls: vec!["https://test.com/unsub".to_string()],
+            unsubscribe_mailto: vec![],
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count,
+            messages: vec![],
+            last_seen: None,
+        }
+    }
+
+    fn annotated(senders: Vec<SenderInfo>) -> AnnotatedSenders {
+        let policy = RunPolicy {
+            min_emails: 1,
+            stale_after_months: 12,
+            grace_period_days: 14,
+            dry_run: false,
+        };
+        annotate_senders("user@example.com", senders, &[], &[], &policy, now_unix_secs())
+    }
+
+    fn app() -> App {
+        App::new(
+            annotated(vec![
+                sender("a@test.com", 10),
+                sender("b@test.com", 20),
+                sender("c@test.com", 5),
+            ]),
+            Preferences::default(),
+        )
+    }
+
+    fn chosen(app: &App) -> Vec<String> {
+        app.selected_senders()
+            .into_iter()
+            .map(|sender| sender.email)
+            .collect()
+    }
+
+    #[test]
+    fn enter_confirms_the_selection() {
+        assert_eq!(app().on_key(key(KeyCode::Enter)), SelectAction::Confirm);
+    }
+
+    #[test]
+    fn esc_and_q_back_out_without_running() {
+        assert_eq!(app().on_key(key(KeyCode::Esc)), SelectAction::Cancel);
+        assert_eq!(app().on_key(key(KeyCode::Char('q'))), SelectAction::Cancel);
+    }
+
+    #[test]
+    fn moving_and_toggling_keep_the_screen_open() {
+        let mut app = app();
+
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char(' '),
+            KeyCode::Char('a'),
+            KeyCode::Char('n'),
+            KeyCode::Char('g'),
+            KeyCode::Char('G'),
+            KeyCode::Char('z'),
+        ] {
+            assert_eq!(app.on_key(key(code)), SelectAction::None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_selected_until_the_user_says_so() {
+        assert!(chosen(&app()).is_empty());
+    }
+
+    #[test]
+    fn a_selects_every_sender_and_n_clears_them_again() {
+        let mut app = app();
+
+        app.on_key(key(KeyCode::Char('a')));
+        let mut selected = chosen(&app);
+        selected.sort();
+        assert_eq!(selected, ["a@test.com", "b@test.com", "c@test.com"]);
+
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(chosen(&app).is_empty());
+    }
+
+    #[test]
+    fn space_ticks_exactly_the_sender_under_the_cursor() {
+        let mut app = app();
+        // From the active select-all row onto the first sender.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+
+        assert_eq!(chosen(&app), ["a@test.com"]);
+    }
+
+    #[test]
+    fn the_selection_survives_being_read_so_a_declined_run_loses_nothing() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('a')));
+
+        let first = chosen(&app);
+        let second = chosen(&app);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn a_jump_moves_the_cursor_without_changing_the_selection() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        let before = app.cursor;
+
+        assert_eq!(app.on_key(ctrl(KeyCode::Down)), SelectAction::None);
+
+        assert_ne!(app.cursor, before);
+        assert_eq!(chosen(&app), ["a@test.com"]);
+    }
+
+    #[test]
+    fn a_screen_with_no_senders_still_answers_every_key() {
+        let mut app = App::new(annotated(Vec::new()), Preferences::default());
+
+        assert_eq!(app.on_key(key(KeyCode::Char(' '))), SelectAction::None);
+        assert_eq!(app.on_key(key(KeyCode::Char('a'))), SelectAction::None);
+        assert!(chosen(&app).is_empty());
+        assert_eq!(app.on_key(key(KeyCode::Enter)), SelectAction::Confirm);
+    }
+}

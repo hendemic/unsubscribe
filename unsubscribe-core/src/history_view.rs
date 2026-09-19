@@ -480,3 +480,782 @@ pub fn filter_histories(
         .filter_map(|index| views.get_mut(index).and_then(Option::take))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::{judge_sender, LatestAttempts};
+    use crate::types::{Folder, FolderMessage, MessageId, UnsubscribeMethod};
+
+    const ACCOUNT: &str = "user@example.com";
+    const DAY: i64 = 24 * 60 * 60;
+    /// The moment every fixture measures from.
+    const T0: i64 = 1_700_000_000;
+    const GRACE: u32 = 14;
+
+    // -----------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------
+
+    fn sender(email: &str, list_id: Option<&str>, last_seen: Option<i64>) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: email.split('@').nth(1).unwrap_or("").to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: true,
+            list_id: list_id.map(str::to_string),
+            list_unsubscribe_raw: None,
+            email_count: 3,
+            messages: vec![FolderMessage {
+                folder: Folder::new("INBOX"),
+                message_id: MessageId::new("INBOX:1"),
+            }],
+            last_seen,
+        }
+    }
+
+    fn attempt(
+        id: &str,
+        email: &str,
+        list_id: Option<&str>,
+        at: i64,
+        success: bool,
+    ) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: id.to_string(),
+            account: ACCOUNT.to_string(),
+            sender_email: email.to_string(),
+            sender_domain: email.split('@').nth(1).unwrap_or("").to_string(),
+            list_id: list_id.map(str::to_string),
+            attempted_at: at,
+            method: UnsubscribeMethod::OneClickPost.as_id().to_string(),
+            success,
+            http_status: Some(200),
+            url: "https://acme.example.com/unsub".to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            follows_attempt_id: None,
+            detail: "HTTP 200".to_string(),
+        }
+    }
+
+    fn resumption(id: &str, attempt_id: &str, email: &str, list_id: Option<&str>, at: i64) -> Resumption {
+        Resumption {
+            id: id.to_string(),
+            account: ACCOUNT.to_string(),
+            sender_email: email.to_string(),
+            list_id: list_id.map(str::to_string),
+            attempt_id: attempt_id.to_string(),
+            observed_at: at,
+            last_seen: at - DAY,
+            email_count: 2,
+        }
+    }
+
+    /// The views for one reading, with the fixtures' fixed grace period.
+    fn views(
+        attempts: &[UnsubscribeAttempt],
+        resumptions: &[Resumption],
+        scanned: &[SenderInfo],
+        now: i64,
+    ) -> Vec<SenderHistoryView> {
+        sender_histories(attempts, resumptions, scanned, now, GRACE)
+    }
+
+    fn addresses(views: &[SenderHistoryView]) -> Vec<&str> {
+        views.iter().map(|v| v.sender_email.as_str()).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Grouping and matching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_sender_matching_both_a_list_group_and_an_unlisted_address_group_yields_one_view() {
+        // Two rows about the same sender recorded either side of the day
+        // List-Id started being captured: one carries the list, one does not.
+        let attempts = [
+            attempt("a-old", "news@acme.example.com", None, T0 - 90 * DAY, true),
+            attempt(
+                "a-new",
+                "news@acme.example.com",
+                Some("news.acme.example.com"),
+                T0 - 30 * DAY,
+                true,
+            ),
+        ];
+        let scanned = [sender(
+            "news@acme.example.com",
+            Some("news.acme.example.com"),
+            Some(T0 - DAY),
+        )];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views.len(), 1, "the two groups must merge into one sender");
+        assert_eq!(views[0].timeline.len(), 2);
+        assert_eq!(views[0].last_attempt_at, T0 - 30 * DAY);
+    }
+
+    #[test]
+    fn an_attempt_for_a_different_list_at_the_same_address_is_not_the_scanned_sender() {
+        let attempts = [attempt(
+            "a-deals",
+            "news@acme.example.com",
+            Some("deals.acme.example.com"),
+            T0 - 30 * DAY,
+            true,
+        )];
+        let scanned = [sender(
+            "news@acme.example.com",
+            Some("news.acme.example.com"),
+            Some(T0 - DAY),
+        )];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(
+            views[0].list_id.as_deref(),
+            Some("deals.acme.example.com"),
+            "the row belongs to the list it was recorded for"
+        );
+        assert!(
+            !views[0].in_current_scan(),
+            "the scanned sender is a different list, so this row has no current mail"
+        );
+        assert_eq!(views[0].outcome, None);
+        assert_eq!(views[0].next_step, None);
+    }
+
+    #[test]
+    fn a_list_id_is_matched_ignoring_case_and_surrounding_space() {
+        let attempts = [attempt(
+            "a1",
+            "bounce-77@esp.example.net",
+            Some("  News.Acme.Example.Com "),
+            T0 - 30 * DAY,
+            true,
+        )];
+        // A rotated From address: only the list identifier ties the two.
+        let scanned = [sender(
+            "bounce-91@esp.example.net",
+            Some("news.acme.example.com"),
+            Some(T0 - DAY),
+        )];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views.len(), 1);
+        assert!(views[0].in_current_scan());
+        assert_eq!(
+            views[0].sender_email, "bounce-91@esp.example.net",
+            "a matched view is named by the sender as the scan sees it now"
+        );
+    }
+
+    #[test]
+    fn an_address_is_matched_ignoring_case() {
+        let attempts = [attempt("a1", "News@Acme.Example.Com", None, T0 - 30 * DAY, true)];
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - DAY))];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views.len(), 1);
+        assert!(views[0].in_current_scan());
+    }
+
+    #[test]
+    fn two_scanned_senders_do_not_share_one_groups_rows() {
+        let attempts = [
+            attempt("a1", "news@acme.example.com", None, T0 - 30 * DAY, true),
+            attempt("a2", "deals@acme.example.com", None, T0 - 20 * DAY, true),
+        ];
+        let scanned = [
+            sender("news@acme.example.com", None, Some(T0 - DAY)),
+            sender("deals@acme.example.com", None, Some(T0 - DAY)),
+        ];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views.len(), 2);
+        for view in &views {
+            assert_eq!(view.timeline.len(), 1, "each sender keeps only its own row");
+        }
+    }
+
+    #[test]
+    fn a_sender_with_history_but_absent_from_the_scan_has_no_outcome_and_no_next_step() {
+        let attempts = [attempt("a1", "gone@acme.example.com", None, T0 - 60 * DAY, true)];
+
+        let views = views(&attempts, &[], &[], T0);
+
+        assert_eq!(addresses(&views), ["gone@acme.example.com"]);
+        assert_eq!(views[0].outcome, None, "nothing has arrived to judge");
+        assert_eq!(views[0].next_step, None);
+        assert!(!views[0].in_current_scan());
+    }
+
+    #[test]
+    fn a_group_with_resumptions_but_no_attempt_shows_nothing() {
+        // Cannot happen through the normal path -- a resumption references an
+        // attempt id -- but an orphan row must not produce a dateless view.
+        let orphan = [resumption("r1", "missing", "ghost@acme.example.com", None, T0 - DAY)];
+
+        assert!(views(&[], &orphan, &[], T0).is_empty());
+    }
+
+    #[test]
+    fn no_history_at_all_yields_no_views() {
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - DAY))];
+
+        assert!(views(&[], &[], &scanned, T0).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome, violations, next step
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_sender_mailing_again_after_the_grace_period_is_resumed() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, true)];
+        // Newest mail arrived 20 days after the unsubscribe: past the 14-day grace.
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - 40 * DAY))];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views[0].outcome, Some(UnsubscribeOutcome::Resumed { days_after: 20 }));
+        assert!(views[0].is_resumed());
+        assert!(views[0].has_resumed());
+    }
+
+    #[test]
+    fn mail_inside_the_grace_period_is_not_a_violation() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 20 * DAY, true)];
+        // Ten days after the unsubscribe, inside the 14-day window.
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - 10 * DAY))];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert!(matches!(
+            views[0].outcome,
+            Some(UnsubscribeOutcome::WithinGrace { .. })
+        ));
+        assert_eq!(views[0].violation_count, 0);
+        assert!(!views[0].has_resumed());
+    }
+
+    #[test]
+    fn an_outcome_hangs_off_the_newest_successful_attempt_not_the_newest_one() {
+        let attempts = [
+            attempt("a-ok", "news@acme.example.com", None, T0 - 60 * DAY, true),
+            attempt("a-fail", "news@acme.example.com", None, T0 - 5 * DAY, false),
+        ];
+        // Newest mail is 20 days after the *successful* attempt, and predates
+        // the failed one, so it is a resumption of the successful request.
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - 40 * DAY))];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views[0].outcome, Some(UnsubscribeOutcome::Resumed { days_after: 20 }));
+        assert_eq!(
+            views[0].last_attempt_at,
+            T0 - 5 * DAY,
+            "the row still reports when it was last asked"
+        );
+    }
+
+    #[test]
+    fn a_sender_that_was_never_successfully_unsubscribed_has_no_outcome() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, false)];
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - DAY))];
+
+        let views = views(&attempts, &[], &scanned, T0);
+
+        assert_eq!(views[0].outcome, None, "nothing was ever honoured to ignore");
+        assert!(
+            views[0].next_step.is_some(),
+            "it is still in the scan, so there is something to try"
+        );
+    }
+
+    #[test]
+    fn a_violation_this_reading_establishes_is_counted_once_and_only_once() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, true)];
+        let scanned = [sender("news@acme.example.com", None, Some(T0 - 40 * DAY))];
+
+        let fresh = views(&attempts, &[], &scanned, T0);
+        assert_eq!(fresh[0].violation_count, 1, "newly observed");
+
+        // Once it is on record the same reading must not count it twice.
+        let recorded = [resumption("r1", "a1", "news@acme.example.com", None, T0 - 39 * DAY)];
+        let again = views(&attempts, &recorded, &scanned, T0);
+        assert_eq!(again[0].violation_count, 1);
+    }
+
+    #[test]
+    fn a_violation_only_on_record_still_counts_when_the_sender_is_gone() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, true)];
+        let recorded = [resumption("r1", "a1", "news@acme.example.com", None, T0 - 39 * DAY)];
+
+        let views = views(&attempts, &recorded, &[], T0);
+
+        assert_eq!(views[0].violation_count, 1);
+        assert!(!views[0].is_resumed(), "nothing is arriving right now");
+        assert!(views[0].has_resumed(), "but it ignored an unsubscribe once");
+    }
+
+    #[test]
+    fn violation_count_agrees_with_judge_sender_for_the_same_inputs() {
+        // Two ignored unsubscribes on record and a third caught by this very
+        // reading: the History screen and the selection screen must agree.
+        let attempts = [
+            attempt("a1", "news@acme.example.com", None, T0 - 200 * DAY, true),
+            attempt("a2", "news@acme.example.com", None, T0 - 100 * DAY, true),
+            attempt("a3", "news@acme.example.com", None, T0 - 60 * DAY, true),
+        ];
+        let recorded = [
+            resumption("r1", "a1", "news@acme.example.com", None, T0 - 150 * DAY),
+            resumption("r2", "a2", "news@acme.example.com", None, T0 - 80 * DAY),
+        ];
+        let scanned = sender("news@acme.example.com", None, Some(T0 - 40 * DAY));
+
+        let views = views(&attempts, &recorded, std::slice::from_ref(&scanned), T0);
+        let verdict = judge_sender(
+            &scanned,
+            &LatestAttempts::from_history(&attempts),
+            &attempts,
+            &recorded,
+            T0,
+            GRACE,
+        )
+        .expect("the sender has a successful unsubscribe behind it");
+
+        assert_eq!(views[0].violation_count as u32, verdict.violation_count);
+        assert_eq!(views[0].violation_count, 3);
+        assert_eq!(views[0].outcome, Some(verdict.outcome));
+        assert_eq!(views[0].next_step.as_ref(), Some(&verdict.next_step));
+    }
+
+    #[test]
+    fn next_step_is_the_escalation_the_pipeline_would_plan() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, true)];
+        let recorded = [resumption("r1", "a1", "news@acme.example.com", None, T0 - 39 * DAY)];
+        let scanned = sender("news@acme.example.com", None, Some(T0 - 40 * DAY));
+
+        let views = views(&attempts, &recorded, std::slice::from_ref(&scanned), T0);
+
+        assert_eq!(
+            views[0].next_step,
+            Some(next_step(&scanned, &attempts, &recorded)),
+            "the screen never works out its own next step"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeline
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_timeline_interleaves_attempts_and_resumptions_by_time() {
+        let attempts = [
+            attempt("a1", "news@acme.example.com", None, T0 - 100 * DAY, true),
+            attempt("a2", "news@acme.example.com", None, T0 - 50 * DAY, true),
+        ];
+        let recorded = [
+            resumption("r1", "a1", "news@acme.example.com", None, T0 - 70 * DAY),
+            resumption("r2", "a2", "news@acme.example.com", None, T0 - 20 * DAY),
+        ];
+
+        let views = views(&attempts, &recorded, &[], T0);
+        let order: Vec<(&str, i64)> = views[0]
+            .timeline
+            .iter()
+            .map(|event| (event.kind(), event.at()))
+            .collect();
+
+        assert_eq!(
+            order,
+            [
+                ("attempt", T0 - 100 * DAY),
+                ("resumption", T0 - 70 * DAY),
+                ("attempt", T0 - 50 * DAY),
+                ("resumption", T0 - 20 * DAY),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_escalated_attempt_points_at_the_attempt_it_answers() {
+        let first = attempt("a1", "news@acme.example.com", None, T0 - 100 * DAY, true);
+        let escalated = UnsubscribeAttempt {
+            follows_attempt_id: Some("a1".to_string()),
+            ..attempt("a2", "news@acme.example.com", None, T0 - 50 * DAY, true)
+        };
+        let attempts = [first, escalated];
+
+        let views = views(&attempts, &[], &[], T0);
+        let ids: Vec<Option<&str>> = views[0]
+            .attempts()
+            .map(|a| a.follows_attempt_id.as_deref())
+            .collect();
+
+        assert_eq!(ids, [None, Some("a1")]);
+        assert!(
+            views[0].attempts().any(|a| a.id == "a1"),
+            "the attempt it follows is in the same timeline"
+        );
+    }
+
+    #[test]
+    fn last_activity_is_a_resumption_when_that_is_the_newest_event() {
+        let attempts = [attempt("a1", "news@acme.example.com", None, T0 - 100 * DAY, true)];
+        let recorded = [resumption("r1", "a1", "news@acme.example.com", None, T0 - 10 * DAY)];
+
+        let views = views(&attempts, &recorded, &[], T0);
+
+        assert_eq!(views[0].last_attempt_at, T0 - 100 * DAY);
+        assert_eq!(views[0].last_activity_at(), T0 - 10 * DAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn views_come_back_newest_activity_first() {
+        let attempts = [
+            attempt("a1", "old@acme.example.com", None, T0 - 100 * DAY, true),
+            attempt("a2", "new@acme.example.com", None, T0 - 10 * DAY, true),
+            attempt("a3", "middle@acme.example.com", None, T0 - 50 * DAY, true),
+        ];
+
+        let views = views(&attempts, &[], &[], T0);
+
+        assert_eq!(
+            addresses(&views),
+            [
+                "new@acme.example.com",
+                "middle@acme.example.com",
+                "old@acme.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn senders_with_identical_activity_are_ordered_by_address() {
+        let attempts = [
+            attempt("a1", "zeta@acme.example.com", None, T0 - 10 * DAY, true),
+            attempt("a2", "alpha@acme.example.com", None, T0 - 10 * DAY, true),
+            attempt("a3", "mid@acme.example.com", None, T0 - 10 * DAY, true),
+        ];
+
+        let views = views(&attempts, &[], &[], T0);
+
+        assert_eq!(
+            addresses(&views),
+            [
+                "alpha@acme.example.com",
+                "mid@acme.example.com",
+                "zeta@acme.example.com"
+            ],
+            "the order must not depend on how the rows happened to be grouped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Filtering, search, ordering for display
+    // -----------------------------------------------------------------------
+
+    /// Three senders: one resumed, one honoured, one absent from the scan.
+    fn listing() -> Vec<SenderHistoryView> {
+        let attempts = [
+            attempt("a1", "news@acme.example.com", None, T0 - 60 * DAY, true),
+            attempt("a2", "quiet@beta.example.org", None, T0 - 30 * DAY, true),
+            attempt("a3", "gone@gamma.example.net", None, T0 - 400 * DAY, true),
+        ];
+        let scanned = [
+            // Mailing 20 days after its unsubscribe: a violation.
+            sender("news@acme.example.com", Some("news.acme"), Some(T0 - 40 * DAY)),
+            // Nothing since its unsubscribe.
+            sender("quiet@beta.example.org", None, Some(T0 - 31 * DAY)),
+        ];
+        views(&attempts, &[], &scanned, T0)
+    }
+
+    fn visible_addresses(views: &[SenderHistoryView], filter: &HistoryFilter) -> Vec<String> {
+        visible_histories(views, filter)
+            .into_iter()
+            .map(|index| views[index].sender_email.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_default_filter_shows_every_sender_newest_attempt_first() {
+        let views = listing();
+
+        assert_eq!(
+            visible_addresses(&views, &HistoryFilter::default()),
+            [
+                "quiet@beta.example.org",
+                "news@acme.example.com",
+                "gone@gamma.example.net"
+            ]
+        );
+    }
+
+    #[test]
+    fn resumed_only_keeps_the_sender_that_ignored_its_unsubscribe() {
+        let views = listing();
+        let filter = HistoryFilter {
+            resumed_only: true,
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(visible_addresses(&views, &filter), ["news@acme.example.com"]);
+    }
+
+    #[test]
+    fn search_matches_the_address_case_insensitively() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "QUIET@".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(visible_addresses(&views, &filter), ["quiet@beta.example.org"]);
+    }
+
+    #[test]
+    fn search_matches_the_domain() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "gamma.example.net".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(visible_addresses(&views, &filter), ["gone@gamma.example.net"]);
+    }
+
+    #[test]
+    fn search_matches_the_list_id() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "News.Acme".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(visible_addresses(&views, &filter), ["news@acme.example.com"]);
+    }
+
+    #[test]
+    fn a_blank_search_matches_everything() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "   ".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(visible_addresses(&views, &filter).len(), views.len());
+    }
+
+    #[test]
+    fn a_search_that_matches_nothing_shows_nothing() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "nobody".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert!(visible_addresses(&views, &filter).is_empty());
+    }
+
+    #[test]
+    fn a_sender_with_no_list_id_is_not_matched_by_a_list_search() {
+        let views = listing();
+        let filter = HistoryFilter {
+            search: "news.acme".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert!(
+            !visible_addresses(&views, &filter).contains(&"quiet@beta.example.org".to_string()),
+            "a missing list id must not match, and must not panic"
+        );
+    }
+
+    #[test]
+    fn since_keeps_a_sender_whose_event_lands_exactly_on_the_boundary() {
+        let views = listing();
+        let on_the_line = HistoryFilter {
+            since: Some(T0 - 60 * DAY),
+            ..HistoryFilter::default()
+        };
+        let one_second_later = HistoryFilter {
+            since: Some(T0 - 60 * DAY + 1),
+            ..HistoryFilter::default()
+        };
+
+        assert!(visible_addresses(&views, &on_the_line).contains(&"news@acme.example.com".to_string()));
+        assert!(
+            !visible_addresses(&views, &one_second_later)
+                .contains(&"news@acme.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn filters_combine_rather_than_replace_one_another() {
+        let views = listing();
+        let filter = HistoryFilter {
+            resumed_only: true,
+            search: "beta".to_string(),
+            ..HistoryFilter::default()
+        };
+
+        assert!(
+            visible_addresses(&views, &filter).is_empty(),
+            "the resumed sender is not on beta, and the beta sender did not resume"
+        );
+    }
+
+    #[test]
+    fn sorting_by_violations_puts_the_worst_offender_first() {
+        // Two senders, three violations against one and one against the other.
+        let attempts = [
+            attempt("a1", "bad@acme.example.com", None, T0 - 200 * DAY, true),
+            attempt("a2", "bad@acme.example.com", None, T0 - 150 * DAY, true),
+            attempt("a3", "bad@acme.example.com", None, T0 - 100 * DAY, true),
+            attempt("b1", "mild@beta.example.org", None, T0 - 100 * DAY, true),
+        ];
+        let recorded = [
+            resumption("r1", "a1", "bad@acme.example.com", None, T0 - 180 * DAY),
+            resumption("r2", "a2", "bad@acme.example.com", None, T0 - 120 * DAY),
+            resumption("r3", "a3", "bad@acme.example.com", None, T0 - 90 * DAY),
+            resumption("r4", "b1", "mild@beta.example.org", None, T0 - 80 * DAY),
+        ];
+        let views = views(&attempts, &recorded, &[], T0);
+        let filter = HistoryFilter {
+            sort: HistorySort::Violations,
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(
+            visible_addresses(&views, &filter),
+            ["bad@acme.example.com", "mild@beta.example.org"]
+        );
+    }
+
+    #[test]
+    fn violations_ties_are_broken_by_the_newest_attempt() {
+        let attempts = [
+            attempt("a1", "older@acme.example.com", None, T0 - 100 * DAY, true),
+            attempt("b1", "newer@beta.example.org", None, T0 - 50 * DAY, true),
+        ];
+        let recorded = [
+            resumption("r1", "a1", "older@acme.example.com", None, T0 - 90 * DAY),
+            resumption("r2", "b1", "newer@beta.example.org", None, T0 - 40 * DAY),
+        ];
+        let views = views(&attempts, &recorded, &[], T0);
+        let filter = HistoryFilter {
+            sort: HistorySort::Violations,
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(
+            visible_addresses(&views, &filter),
+            ["newer@beta.example.org", "older@acme.example.com"]
+        );
+    }
+
+    #[test]
+    fn sorting_by_sender_is_alphabetical_regardless_of_case() {
+        let attempts = [
+            attempt("a1", "Zeta@acme.example.com", None, T0 - 10 * DAY, true),
+            attempt("a2", "alpha@acme.example.com", None, T0 - 20 * DAY, true),
+            attempt("a3", "Mid@acme.example.com", None, T0 - 30 * DAY, true),
+        ];
+        let views = views(&attempts, &[], &[], T0);
+        let filter = HistoryFilter {
+            sort: HistorySort::Sender,
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(
+            visible_addresses(&views, &filter),
+            [
+                "alpha@acme.example.com",
+                "Mid@acme.example.com",
+                "Zeta@acme.example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn sorting_by_last_attempt_breaks_ties_by_address() {
+        let attempts = [
+            attempt("a1", "zeta@acme.example.com", None, T0 - 10 * DAY, true),
+            attempt("a2", "alpha@acme.example.com", None, T0 - 10 * DAY, true),
+        ];
+        let views = views(&attempts, &[], &[], T0);
+        let filter = HistoryFilter {
+            sort: HistorySort::LastAttempt,
+            ..HistoryFilter::default()
+        };
+
+        assert_eq!(
+            visible_addresses(&views, &filter),
+            ["alpha@acme.example.com", "zeta@acme.example.com"]
+        );
+    }
+
+    #[test]
+    fn visible_histories_returns_indices_into_the_views_it_was_given() {
+        let views = listing();
+        let filter = HistoryFilter {
+            sort: HistorySort::Sender,
+            ..HistoryFilter::default()
+        };
+
+        for index in visible_histories(&views, &filter) {
+            assert!(index < views.len(), "every index must address a real view");
+        }
+        let mut indices = visible_histories(&views, &filter);
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(indices.len(), views.len(), "no view listed twice or dropped");
+    }
+
+    #[test]
+    fn filter_histories_yields_the_same_senders_in_the_same_order() {
+        let views = listing();
+        let filter = HistoryFilter {
+            sort: HistorySort::Sender,
+            ..HistoryFilter::default()
+        };
+        let expected = visible_addresses(&views, &filter);
+
+        let owned: Vec<String> = filter_histories(views, &filter)
+            .into_iter()
+            .map(|view| view.sender_email)
+            .collect();
+
+        assert_eq!(owned, expected);
+    }
+
+    #[test]
+    fn the_sort_cycle_visits_every_order_and_comes_back() {
+        let mut sort = HistorySort::default();
+        let mut seen = Vec::new();
+        for _ in 0..HistorySort::ALL.len() {
+            seen.push(sort);
+            sort = sort.next();
+        }
+
+        assert_eq!(sort, HistorySort::default(), "the cycle closes");
+        for order in HistorySort::ALL {
+            assert!(seen.contains(&order), "{order:?} is reachable by cycling");
+        }
+    }
+}

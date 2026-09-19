@@ -295,3 +295,137 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn wrapped_lines(message: &str) -> Vec<String> {
     message.lines().map(str::to_string).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn confirm() -> Dialog {
+        Dialog::confirm("Confirm run", ["3 senders.".to_string()])
+    }
+
+    // -- confirming and declining -------------------------------------------
+
+    #[test]
+    fn enter_and_y_confirm_a_question() {
+        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('Y')] {
+            assert_eq!(
+                confirm().on_key(key(code)),
+                DialogOutcome::Confirmed,
+                "{code:?} should confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_n_and_q_decline_a_question() {
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('q'),
+        ] {
+            assert_eq!(
+                confirm().on_key(key(code)),
+                DialogOutcome::Dismissed,
+                "{code:?} should decline"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_means_nothing_leaves_the_question_open() {
+        assert_eq!(confirm().on_key(key(KeyCode::Char('x'))), DialogOutcome::Open);
+        assert_eq!(confirm().on_key(key(KeyCode::Down)), DialogOutcome::Open);
+    }
+
+    #[test]
+    fn any_key_at_all_dismisses_an_error() {
+        // There is no wrong key to press on a notice.
+        for code in [KeyCode::Char('x'), KeyCode::Esc, KeyCode::Enter, KeyCode::Up] {
+            let mut dialog = Dialog::error("Scan failed", "connection refused");
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Confirmed);
+        }
+    }
+
+    #[test]
+    fn an_error_keeps_the_line_breaks_the_message_arrived_with() {
+        let dialog = Dialog::error("Scan failed", "could not connect\n\nCheck the host.");
+
+        assert_eq!(dialog.body, ["could not connect", "", "Check the host."]);
+    }
+
+    // -- the dry-run switch --------------------------------------------------
+
+    #[test]
+    fn a_question_with_no_switch_is_never_toggled_on() {
+        let mut dialog = confirm();
+
+        assert_eq!(dialog.on_key(key(KeyCode::Char('d'))), DialogOutcome::Open);
+        assert!(!dialog.toggled(), "d is not a switch when there is none");
+    }
+
+    #[test]
+    fn d_flips_the_switch_without_answering_the_question() {
+        let mut dialog = confirm().with_toggle("Dry run", false);
+
+        assert_eq!(dialog.on_key(key(KeyCode::Char('d'))), DialogOutcome::Open);
+        assert!(dialog.toggled());
+        assert_eq!(dialog.on_key(key(KeyCode::Char('d'))), DialogOutcome::Open);
+        assert!(!dialog.toggled(), "and flips back");
+    }
+
+    #[test]
+    fn the_switch_survives_until_the_question_is_answered() {
+        let mut dialog = confirm().with_toggle("Dry run", false);
+
+        dialog.on_key(key(KeyCode::Char('d')));
+        dialog.on_key(key(KeyCode::Char('x')));
+        assert_eq!(dialog.on_key(key(KeyCode::Enter)), DialogOutcome::Confirmed);
+        assert!(
+            dialog.toggled(),
+            "the shell reads the switch after the answer, so it has to still be there"
+        );
+    }
+
+    #[test]
+    fn a_switch_can_start_on() {
+        let dialog = confirm().with_toggle("Dry run", true);
+
+        assert!(dialog.toggled());
+    }
+
+    // -- footer wording ------------------------------------------------------
+
+    #[test]
+    fn a_question_with_a_switch_says_so_in_the_footer() {
+        assert!(confirm().with_toggle("Dry run", false).hints().contains("dry run"));
+        assert!(!confirm().hints().contains("dry run"));
+    }
+
+    #[test]
+    fn replacement_hints_win_over_the_default_wording() {
+        let dialog = confirm().with_hints(" y: use the cached scan | n/Esc: scan again");
+
+        assert_eq!(dialog.hints(), " y: use the cached scan | n/Esc: scan again");
+    }
+
+    // -- transient status ----------------------------------------------------
+
+    #[test]
+    fn a_fresh_status_message_has_not_expired() {
+        assert!(!StatusMessage::success("Re-authenticated.").expired());
+        assert!(!StatusMessage::warning("Nothing selected.").expired());
+    }
+
+    #[test]
+    fn a_status_message_keeps_the_kind_it_was_made_with() {
+        assert_eq!(StatusMessage::success("ok").kind, StatusKind::Success);
+        assert_eq!(StatusMessage::warning("careful").kind, StatusKind::Warning);
+    }
+}

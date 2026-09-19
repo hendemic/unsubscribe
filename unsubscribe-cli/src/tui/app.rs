@@ -1119,3 +1119,227 @@ fn press_enter_to_return() -> Result<()> {
     let _ = std::io::stdin().read_line(&mut line);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use std::sync::mpsc;
+    use unsubscribe_core::{
+        annotate_senders, FolderMessage, MessageId, NextStep, PlannedSender,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// What a `Nav` is, for asserting on without a shell.
+    fn nav_name(nav: &Nav) -> &'static str {
+        match nav {
+            Nav::Stay => "stay",
+            Nav::Push(_) => "push",
+            Nav::Pop => "pop",
+            Nav::Quit => "quit",
+            Nav::Effect(Effect::ConfirmRun) => "confirm run",
+            Nav::Effect(_) => "other effect",
+        }
+    }
+
+    fn sender(email: &str, count: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: count,
+            messages: vec![FolderMessage {
+                folder: unsubscribe_core::Folder::new("INBOX"),
+                message_id: MessageId::new("INBOX:1"),
+            }],
+            last_seen: None,
+        }
+    }
+
+    fn policy() -> RunPolicy {
+        RunPolicy {
+            min_emails: 1,
+            stale_after_months: 12,
+            grace_period_days: 14,
+            dry_run: false,
+        }
+    }
+
+    fn selection_screen() -> Screen {
+        let annotated = annotate_senders(
+            "user@example.com",
+            vec![sender("one@acme.example.com", 3)],
+            &[],
+            &[],
+            &policy(),
+            0,
+        );
+        Screen::Select {
+            app: Box::new(SelectScreen::new(annotated, Preferences::default())),
+            history: Box::new(SelectionContext::default()),
+        }
+    }
+
+    /// One screen of each kind the shell can push without a store.
+    fn screens() -> Vec<Screen> {
+        let (_, scan_rx) = mpsc::channel();
+        let (_, run_rx) = mpsc::channel();
+        vec![
+            Screen::Home(HomeScreen::new(HomeStats::default())),
+            Screen::Scan(Box::new(ScanScreen::new(ScanShared::new(), scan_rx))),
+            Screen::Run(Box::new(RunScreen::new(
+                RunShared::new(),
+                run_rx,
+                PlanCounts::default(),
+                false,
+            ))),
+            selection_screen(),
+            Screen::Warnings(WarningsScreen::new(Vec::new())),
+            Screen::History(Box::new(HistoryScreen::new(Vec::new()))),
+        ]
+    }
+
+    // -- the screen contract -------------------------------------------------
+
+    #[test]
+    fn every_screen_names_itself_for_the_header_and_the_breadcrumb() {
+        for screen in screens() {
+            assert!(!screen.title().is_empty());
+        }
+    }
+
+    #[test]
+    fn no_two_screens_share_a_name() {
+        // The breadcrumb is a trail of these, so duplicates would read as
+        // the same place twice.
+        let titles: Vec<&str> = screens().iter().map(Screen::title).collect();
+        let mut unique = titles.clone();
+        unique.sort_unstable();
+        unique.dedup();
+
+        assert_eq!(unique.len(), titles.len(), "duplicate titles in {titles:?}");
+    }
+
+    #[test]
+    fn every_screen_offers_a_footer_hint_and_a_help_listing() {
+        for screen in screens() {
+            assert!(!screen.hints().is_empty(), "{}", screen.title());
+            assert!(!screen.keys().is_empty(), "{}", screen.title());
+        }
+    }
+
+    #[test]
+    fn only_a_screen_taking_free_text_keeps_the_shell_from_answering_the_help_key() {
+        for screen in screens() {
+            assert!(
+                !screen.captures_text(),
+                "{} takes no free text",
+                screen.title()
+            );
+        }
+    }
+
+    #[test]
+    fn a_screen_with_no_worker_has_nothing_to_report_each_frame() {
+        for mut screen in screens() {
+            let title = screen.title();
+            match screen {
+                // These two do poll a worker; the rest must stay quiet.
+                Screen::Scan(_) | Screen::Run(_) => {}
+                _ => assert_eq!(nav_name(&screen.tick()), "stay", "{title}"),
+            }
+        }
+    }
+
+    // -- key dispatch --------------------------------------------------------
+
+    #[test]
+    fn confirming_the_selection_asks_the_shell_before_anything_is_sent() {
+        let mut screen = selection_screen();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Enter))), "confirm run");
+    }
+
+    #[test]
+    fn backing_out_of_the_selection_pops_it_off_the_stack() {
+        let mut screen = selection_screen();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+    }
+
+    #[test]
+    fn moving_inside_the_selection_asks_the_shell_for_nothing() {
+        let mut screen = selection_screen();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Down))), "stay");
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Char(' ')))), "stay");
+    }
+
+    #[test]
+    fn every_nested_screen_offers_a_way_back_and_home_offers_a_way_out() {
+        for mut screen in screens() {
+            let title = screen.title();
+            let expected = match screen {
+                Screen::Home(_) => "quit",
+                // The running screens ask before throwing work away.
+                Screen::Scan(_) | Screen::Run(_) => "other effect",
+                _ => "pop",
+            };
+            assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), expected, "{title}");
+        }
+    }
+
+    // -- the run confirmation ------------------------------------------------
+
+    fn planned(email: &str, count: u32) -> PlannedSender {
+        PlannedSender {
+            sender: sender(email, count),
+            step: NextStep::FirstAttempt,
+        }
+    }
+
+    #[test]
+    fn the_confirmation_names_each_destination_with_its_own_counts() {
+        let plan = RunPlan {
+            to_unsubscribe: vec![planned("one@acme.example.com", 3)],
+            archive_only: vec![sender("stale@acme.example.com", 4)],
+            exhausted: vec![sender("spent@acme.example.com", 5)],
+        };
+
+        let lines = plan_summary(&plan);
+
+        assert!(lines.iter().any(|l| l.contains("Unsubscribe from 1 sender(s) (3 emails)")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Archive 1 stale sender(s)") && l.contains("(4 emails)")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("no method left") && l.contains("(5 emails)")), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("12 emails in total."));
+    }
+
+    #[test]
+    fn the_confirmation_leaves_out_the_destinations_a_plan_does_not_use() {
+        let plan = RunPlan {
+            to_unsubscribe: vec![planned("one@acme.example.com", 3)],
+            ..RunPlan::default()
+        };
+
+        let lines = plan_summary(&plan);
+
+        assert!(!lines.iter().any(|l| l.contains("stale")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("no method left")), "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("3 emails in total."));
+    }
+
+    #[test]
+    fn an_empty_plan_still_says_how_much_it_would_touch() {
+        let lines = plan_summary(&RunPlan::default());
+
+        assert_eq!(lines.last().map(String::as_str), Some("0 emails in total."));
+    }
+}

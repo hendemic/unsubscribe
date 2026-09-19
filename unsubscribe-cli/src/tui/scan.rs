@@ -213,3 +213,183 @@ fn truncate(s: &str, max: usize) -> String {
         None => s.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc;
+
+    use super::super::app::Effect;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// What a `Nav` is, for asserting on without a shell.
+    fn nav_name(nav: &Nav) -> &'static str {
+        match nav {
+            Nav::Stay => "stay",
+            Nav::Push(_) => "push",
+            Nav::Pop => "pop",
+            Nav::Quit => "quit",
+            Nav::Effect(Effect::ScanEnded) => "scan ended",
+            Nav::Effect(Effect::ConfirmCancelScan) => "confirm cancel",
+            Nav::Effect(_) => "other effect",
+        }
+    }
+
+    fn obtained(count: usize) -> Box<ObtainedSenders> {
+        Box::new(ObtainedSenders {
+            senders: (0..count)
+                .map(|i| unsubscribe_core::SenderInfo {
+                    display_name: "Acme News".to_string(),
+                    email: format!("s{i}@acme.example.com"),
+                    domain: "acme.example.com".to_string(),
+                    unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+                    unsubscribe_mailto: Vec::new(),
+                    one_click: true,
+                    list_id: None,
+                    list_unsubscribe_raw: None,
+                    email_count: 3,
+                    messages: Vec::new(),
+                    last_seen: None,
+                })
+                .collect(),
+            warnings: Vec::new(),
+            scanned_at: "2026-06-01T09:00:00Z".to_string(),
+            from_cache: false,
+        })
+    }
+
+    /// A screen whose worker has already reported `outcome`.
+    fn ended_with(outcome: ScanOutcome) -> ScanScreen {
+        let (tx, rx) = mpsc::channel();
+        tx.send(outcome).expect("the screen is listening");
+        ScanScreen::new(ScanShared::new(), rx)
+    }
+
+    /// A screen with a worker that is still going.
+    fn running() -> (ScanScreen, mpsc::Sender<ScanOutcome>) {
+        let (tx, rx) = mpsc::channel();
+        (ScanScreen::new(ScanShared::new(), rx), tx)
+    }
+
+    #[test]
+    fn a_scan_that_has_not_reported_yet_asks_the_shell_for_nothing() {
+        let (mut screen, _tx) = running();
+
+        assert_eq!(nav_name(&screen.tick()), "stay");
+        assert_eq!(screen.state, ScanState::Running);
+    }
+
+    #[test]
+    fn esc_while_scanning_asks_before_stopping() {
+        let (mut screen, _tx) = running();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "confirm cancel");
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Char('q')))), "confirm cancel");
+    }
+
+    #[test]
+    fn cancelling_raises_the_flag_the_adapter_polls() {
+        let (tx, rx) = mpsc::channel::<ScanOutcome>();
+        let shared = ScanShared::new();
+        let mut screen = ScanScreen::new(Arc::clone(&shared), rx);
+
+        screen.request_cancel();
+
+        assert!(shared.cancel_requested());
+        assert_eq!(screen.state, ScanState::Cancelling);
+        drop(tx);
+    }
+
+    #[test]
+    fn asking_to_stop_a_second_time_changes_nothing() {
+        let (mut screen, _tx) = running();
+        screen.request_cancel();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "stay");
+        assert_eq!(screen.state, ScanState::Cancelling);
+    }
+
+    #[test]
+    fn a_completed_scan_hands_its_senders_to_the_shell() {
+        let mut screen = ended_with(ScanOutcome::Done(obtained(3)));
+
+        assert_eq!(nav_name(&screen.tick()), "scan ended");
+        assert_eq!(screen.state, ScanState::Ended);
+        match screen.into_ended() {
+            ScanEnded::Done(obtained) => assert_eq!(obtained.senders.len(), 3),
+            _ => panic!("expected a completed scan"),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_ends_as_cancelled_not_as_a_failure() {
+        let mut screen = ended_with(ScanOutcome::Cancelled);
+
+        assert_eq!(nav_name(&screen.tick()), "scan ended");
+        assert!(matches!(screen.into_ended(), ScanEnded::Cancelled));
+    }
+
+    #[test]
+    fn a_failed_scan_carries_its_message_to_the_dialog() {
+        let mut screen = ended_with(ScanOutcome::Failed("connection refused".to_string()));
+
+        screen.tick();
+
+        match screen.into_ended() {
+            ScanEnded::Failed(message) => assert_eq!(message, "connection refused"),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn a_worker_that_dies_without_reporting_becomes_a_failure_rather_than_a_hang() {
+        let (tx, rx) = mpsc::channel::<ScanOutcome>();
+        let mut screen = ScanScreen::new(ScanShared::new(), rx);
+        drop(tx);
+
+        assert_eq!(nav_name(&screen.tick()), "scan ended");
+        assert!(matches!(screen.into_ended(), ScanEnded::Failed(_)));
+    }
+
+    #[test]
+    fn the_ending_is_announced_once_however_many_frames_are_drawn() {
+        let mut screen = ended_with(ScanOutcome::Cancelled);
+
+        assert_eq!(nav_name(&screen.tick()), "scan ended");
+        assert_eq!(nav_name(&screen.tick()), "stay");
+        assert_eq!(nav_name(&screen.tick()), "stay");
+    }
+
+    #[test]
+    fn a_screen_taken_apart_before_it_ended_says_so_rather_than_panicking() {
+        let (screen, _tx) = running();
+
+        assert!(matches!(screen.into_ended(), ScanEnded::Failed(_)));
+    }
+
+    #[test]
+    fn a_cancelled_scan_that_then_reports_still_ends_as_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        let shared = ScanShared::new();
+        let mut screen = ScanScreen::new(Arc::clone(&shared), rx);
+
+        screen.request_cancel();
+        tx.send(ScanOutcome::Cancelled).expect("listening");
+        screen.tick();
+
+        assert!(matches!(screen.into_ended(), ScanEnded::Cancelled));
+    }
+
+    #[test]
+    fn the_footer_says_what_the_scan_is_doing() {
+        let (mut screen, _tx) = running();
+        assert!(screen.hints().contains("cancel"));
+
+        screen.request_cancel();
+        assert!(screen.hints().contains("stopping"));
+    }
+}

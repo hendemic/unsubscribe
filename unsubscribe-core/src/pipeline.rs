@@ -2188,6 +2188,377 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------------
+
+    /// A progress reporter that has already been asked to stop.
+    struct CancellingProgress;
+
+    impl ScanProgress for CancellingProgress {
+        fn on_folder_start(&self, _folder: &Folder, _total_messages: u32) {}
+        fn on_messages_scanned(&self, _folder: &Folder, _count: u32) {}
+        fn on_folder_done(&self, _folder: &Folder) {}
+        fn should_cancel(&self) -> bool {
+            true
+        }
+    }
+
+    /// An observer that asks the run to stop once `after` senders have been
+    /// attempted, the way a user pressing Esc part-way through does.
+    struct CancelAfter {
+        after: usize,
+        attempted: Mutex<Vec<String>>,
+    }
+
+    impl CancelAfter {
+        fn new(after: usize) -> Self {
+            Self {
+                after,
+                attempted: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn attempted(&self) -> Vec<String> {
+            self.attempted.lock().expect("attempted").clone()
+        }
+    }
+
+    impl RunObserver for CancelAfter {
+        fn on_unsubscribe_start(&self, _sender_count: u32) {}
+        fn on_sender_result(&self, _planned: &PlannedSender, result: &UnsubscribeResult) {
+            self.attempted
+                .lock()
+                .expect("attempted")
+                .push(result.email.clone());
+        }
+        fn on_unsubscribe_done(&self, _planned: &[PlannedSender], _results: &[UnsubscribeResult]) {}
+        fn on_archive_start(&self, _message_count: u32, _email_count: u32) {}
+        fn on_archive_done(&self, _archived: u32) {}
+        fn on_warning(&self, _warning: &RunWarning) {}
+        fn should_cancel(&self) -> bool {
+            self.attempted.lock().expect("attempted").len() >= self.after
+        }
+    }
+
+    fn cancelling_scan(h: &Harness) -> Result<ObtainedSenders> {
+        scan_senders(
+            ACCOUNT,
+            &[Folder::new("INBOX")],
+            &h.provider,
+            &h.cache,
+            &h.warnings_store,
+            3,
+            "2026-06-01T00:00:00Z",
+            &CancellingProgress,
+            &h.observer,
+        )
+    }
+
+    #[test]
+    fn a_cancelled_scan_reports_cancellation_rather_than_a_failure() {
+        let h = Harness::new();
+        *h.provider.scan_result.lock().expect("scan result") = Some(scan_result(
+            vec![sender("news@acme.example.com", 5, None)],
+            vec!["bad header".to_string()],
+        ));
+
+        let error = cancelling_scan(&h).expect_err("a cancelled scan yields no senders");
+
+        assert!(is_cancelled(&error), "got {error:#}");
+    }
+
+    #[test]
+    fn a_cancelled_scan_leaves_the_last_complete_scan_in_the_cache() {
+        let h = Harness::new();
+        let previous = cached_scan(vec![sender("old@acme.example.com", 9, None)]);
+        *h.cache.cached.lock().expect("cached") = Some(previous.clone());
+        *h.warnings_store.written.lock().expect("warnings") = vec!["older warning".to_string()];
+        *h.provider.scan_result.lock().expect("scan result") = Some(scan_result(
+            vec![sender("news@acme.example.com", 5, None)],
+            vec!["newer warning".to_string()],
+        ));
+
+        let _ = cancelling_scan(&h).expect_err("cancelled");
+
+        let still_cached = h.cache.written().expect("the previous cache is still there");
+        assert_eq!(still_cached.meta.scanned_at, previous.meta.scanned_at);
+        assert_eq!(still_cached.senders.len(), 1);
+        assert_eq!(still_cached.senders[0].email, "old@acme.example.com");
+        assert_eq!(
+            h.warnings_store.read_warnings().expect("warnings"),
+            ["older warning"],
+            "the warnings of the last complete scan stand too"
+        );
+        assert_eq!(h.log.count("write_scan_cache"), 0);
+        assert_eq!(h.log.count("write_warnings"), 0);
+    }
+
+    #[test]
+    fn an_adapter_that_reports_its_abort_as_an_error_is_still_a_cancellation() {
+        // The adapter was configured with no result, so `scan` fails. Because
+        // the cancel flag is checked before the result is unwrapped, the user
+        // is told the scan stopped, not that it broke.
+        let h = Harness::new();
+
+        let error = cancelling_scan(&h).expect_err("no scan result configured");
+
+        assert!(is_cancelled(&error), "got {error:#}");
+    }
+
+    #[test]
+    fn a_scan_nobody_cancelled_reports_an_adapter_failure_as_a_failure() {
+        let h = Harness::new();
+
+        let error = run_scan(&h).expect_err("no scan result configured");
+
+        assert!(!is_cancelled(&error), "got {error:#}");
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_mistaken_for_a_cancellation() {
+        assert!(!is_cancelled(&anyhow::anyhow!("mailbox refused the move")));
+        assert!(is_cancelled(&anyhow::Error::from(Cancelled)));
+    }
+
+    /// Three first-time senders, two messages each.
+    fn three_sender_plan() -> RunPlan {
+        plan_run(
+            vec![
+                sender("one@acme.example.com", 2, Some(UNSUB)),
+                sender("two@acme.example.com", 2, Some(UNSUB)),
+                sender("three@acme.example.com", 2, Some(UNSUB)),
+            ],
+            &[],
+            &[],
+            &policy(false),
+            UNSUB,
+        )
+    }
+
+    #[test]
+    fn a_run_cancelled_after_two_senders_attempts_those_two_and_stops() {
+        let h = Harness::new();
+        let observer = CancelAfter::new(2);
+        let plan = three_sender_plan();
+
+        let outcome = execute_run(
+            &plan,
+            &RunContext {
+                observer: &observer,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("the archive still succeeds");
+
+        assert!(outcome.cancelled);
+        assert_eq!(
+            observer.attempted(),
+            ["one@acme.example.com", "two@acme.example.com"],
+            "the third sender is never asked anything"
+        );
+        assert_eq!(outcome.results.len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_run_keeps_the_evidence_of_the_attempts_it_made() {
+        let h = Harness::new();
+        let observer = CancelAfter::new(2);
+
+        let _ = execute_run(
+            &three_sender_plan(),
+            &RunContext {
+                observer: &observer,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("archive succeeds");
+
+        let recorded: Vec<String> = h
+            .history
+            .recorded_attempts()
+            .into_iter()
+            .map(|attempt| attempt.sender_email)
+            .collect();
+        assert_eq!(
+            recorded,
+            ["one@acme.example.com", "two@acme.example.com"],
+            "an attempt that was made is evidence and is on record"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_archives_only_the_senders_it_handled() {
+        let h = Harness::new();
+        let observer = CancelAfter::new(2);
+
+        let outcome = execute_run(
+            &three_sender_plan(),
+            &RunContext {
+                observer: &observer,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("archive succeeds");
+
+        // Two senders, two messages each: the third sender's mail stays put,
+        // so the next run finds it exactly as this one did.
+        assert_eq!(outcome.archived, 4);
+        assert_eq!(h.log.count("archive:Unsubscribed:4"), 1);
+        let mut pruned = h.cache.pruned();
+        pruned.sort();
+        assert_eq!(pruned, ["one@acme.example.com", "two@acme.example.com"]);
+    }
+
+    #[test]
+    fn a_cancelled_run_leaves_stale_and_exhausted_senders_where_they_are() {
+        // They were never handled: archiving them would be doing work the user
+        // just asked to stop.
+        let h = Harness::new();
+        let observer = CancelAfter::new(1);
+        let mut plan = three_sender_plan();
+        plan.archive_only = vec![sender("stale@acme.example.com", 4, Some(UNSUB - 800 * DAY))];
+        plan.exhausted = vec![SenderInfo {
+            unsubscribe_urls: Vec::new(),
+            unsubscribe_mailto: Vec::new(),
+            one_click: false,
+            ..sender("spent@acme.example.com", 4, Some(UNSUB))
+        }];
+
+        let outcome = execute_run(
+            &plan,
+            &RunContext {
+                observer: &observer,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("archive succeeds");
+
+        assert_eq!(outcome.archived, 2, "only the one attempted sender moves");
+        assert_eq!(h.cache.pruned(), ["one@acme.example.com"]);
+    }
+
+    #[test]
+    fn a_run_cancelled_before_its_first_sender_opens_no_mailbox_connection() {
+        let h = Harness::new();
+        let observer = CancelAfter::new(0);
+
+        let outcome = execute_run(
+            &three_sender_plan(),
+            &RunContext {
+                observer: &observer,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("nothing to do is not a failure");
+
+        assert!(outcome.cancelled);
+        assert!(outcome.results.is_empty());
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(
+            h.log.count("archive:"),
+            0,
+            "no connection is opened to move nothing"
+        );
+        assert!(h.history.recorded_attempts().is_empty());
+    }
+
+    #[test]
+    fn a_run_nobody_cancelled_is_not_reported_as_cancelled() {
+        let h = Harness::new();
+        let plan = three_sender_plan();
+
+        let outcome = execute_run(&plan, &h.ctx(), &policy(false)).expect("archive succeeds");
+
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(outcome.archived, 6);
+    }
+
+    #[test]
+    fn a_default_observer_never_stops_a_run() {
+        let h = Harness::new();
+        let plan = three_sender_plan();
+
+        let outcome = execute_run(
+            &plan,
+            &RunContext {
+                observer: &NoopRunObserver,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("archive succeeds");
+
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.results.len(), 3);
+    }
+
+    #[test]
+    fn the_observer_hears_the_short_attempt_list_a_cancelled_run_produced() {
+        let h = Harness::new();
+        let observer = RecordingObserver::default();
+        // A separate observer decides the cancelling; this one only listens.
+        let canceller = CancelAfter::new(1);
+        let both = PairObserver {
+            listener: &observer,
+            canceller: &canceller,
+        };
+
+        let _ = execute_run(
+            &three_sender_plan(),
+            &RunContext {
+                observer: &both,
+                ..h.ctx()
+            },
+            &policy(false),
+        )
+        .expect("archive succeeds");
+
+        assert!(
+            observer.calls().contains(&"unsubscribe_done:1:1".to_string()),
+            "planned and results are the same length, got {:?}",
+            observer.calls()
+        );
+        assert!(observer.calls().contains(&"unsubscribe_start:3".to_string()));
+    }
+
+    /// Reports to one observer while a second decides when to stop.
+    struct PairObserver<'a> {
+        listener: &'a RecordingObserver,
+        canceller: &'a CancelAfter,
+    }
+
+    impl RunObserver for PairObserver<'_> {
+        fn on_unsubscribe_start(&self, sender_count: u32) {
+            self.listener.on_unsubscribe_start(sender_count);
+        }
+        fn on_sender_result(&self, planned: &PlannedSender, result: &UnsubscribeResult) {
+            self.listener.on_sender_result(planned, result);
+            self.canceller.on_sender_result(planned, result);
+        }
+        fn on_unsubscribe_done(&self, planned: &[PlannedSender], results: &[UnsubscribeResult]) {
+            self.listener.on_unsubscribe_done(planned, results);
+        }
+        fn on_archive_start(&self, message_count: u32, email_count: u32) {
+            self.listener.on_archive_start(message_count, email_count);
+        }
+        fn on_archive_done(&self, archived: u32) {
+            self.listener.on_archive_done(archived);
+        }
+        fn on_warning(&self, warning: &RunWarning) {
+            self.listener.on_warning(warning);
+        }
+        fn should_cancel(&self) -> bool {
+            self.canceller.should_cancel()
+        }
+    }
+
     #[test]
     fn a_run_with_nothing_to_unsubscribe_still_announces_the_phase() {
         // Zero is reported so the consumer decides for itself whether to print

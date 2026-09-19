@@ -368,7 +368,9 @@ impl RunShared {
         *self.planned.lock().expect("run planned lock")
     }
 
-    fn push(&self, event: RunEvent) {
+    /// Append one line to the log. `pub(super)` so the run screen's tests can
+    /// stage a log without a worker thread.
+    pub(super) fn push(&self, event: RunEvent) {
         self.events.lock().expect("run events lock").push(event);
     }
 }
@@ -484,5 +486,389 @@ fn warning_text(warning: &RunWarning) -> String {
         RunWarning::ResumptionNotRecorded(e) => {
             format!("Could not record a resumed sender: {e}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unsubscribe_core::{
+        Escalation, Folder as CoreFolder, MessageId, NextStep, Rung, RungMethod, UnsubscribeMethod,
+        UnsubscribeResult,
+    };
+
+    fn folder(name: &str) -> CoreFolder {
+        CoreFolder::new(name)
+    }
+
+    fn progress(shared: &Arc<ScanShared>) -> ScanReporter {
+        ScanReporter(Arc::clone(shared))
+    }
+
+    fn named(shared: &ScanShared, name: &str) -> FolderProgress {
+        shared
+            .folders()
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no progress for {name}"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan progress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_scan_starts_with_nothing_to_show() {
+        let shared = ScanShared::new();
+
+        assert!(shared.folders().is_empty());
+        assert_eq!(shared.totals(), (0, 0));
+        assert!(!shared.cancel_requested());
+    }
+
+    #[test]
+    fn message_counts_accumulate_across_batches() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_folder_start(&folder("INBOX"), 500);
+        reporter.on_messages_scanned(&folder("INBOX"), 100);
+        reporter.on_messages_scanned(&folder("INBOX"), 100);
+        reporter.on_messages_scanned(&folder("INBOX"), 50);
+
+        let inbox = named(&shared, "INBOX");
+        assert_eq!(inbox.scanned, 250);
+        assert_eq!(inbox.total, 500);
+        assert!(!inbox.done);
+    }
+
+    #[test]
+    fn a_second_folder_start_updates_the_total_without_adding_a_row() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_folder_start(&folder("INBOX"), 500);
+        reporter.on_messages_scanned(&folder("INBOX"), 100);
+        reporter.on_folder_start(&folder("INBOX"), 600);
+
+        assert_eq!(shared.folders().len(), 1);
+        assert_eq!(named(&shared, "INBOX").total, 600);
+        assert_eq!(
+            named(&shared, "INBOX").scanned,
+            100,
+            "what was already read is not lost"
+        );
+    }
+
+    #[test]
+    fn a_batch_reported_before_its_folder_started_is_kept_not_dropped() {
+        // Adapters scan folders on their own threads; nothing guarantees the
+        // start arrives at the UI before the first batch does.
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_messages_scanned(&folder("Archive"), 40);
+        reporter.on_folder_start(&folder("Archive"), 200);
+
+        assert_eq!(named(&shared, "Archive").scanned, 40);
+        assert_eq!(named(&shared, "Archive").total, 200);
+    }
+
+    #[test]
+    fn a_folder_done_after_more_batches_keeps_the_final_count() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_folder_start(&folder("INBOX"), 100);
+        reporter.on_messages_scanned(&folder("INBOX"), 100);
+        reporter.on_folder_done(&folder("INBOX"));
+        // A duplicate ending must not undo anything.
+        reporter.on_folder_done(&folder("INBOX"));
+
+        let inbox = named(&shared, "INBOX");
+        assert!(inbox.done);
+        assert_eq!(inbox.scanned, 100);
+        assert_eq!(shared.folders().len(), 1);
+    }
+
+    #[test]
+    fn folders_keep_the_order_they_started_in() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_folder_start(&folder("INBOX"), 10);
+        reporter.on_folder_start(&folder("Archive"), 10);
+        reporter.on_folder_start(&folder("Spam"), 10);
+        reporter.on_messages_scanned(&folder("Spam"), 1);
+
+        let names: Vec<String> = shared.folders().into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["INBOX", "Archive", "Spam"]);
+    }
+
+    #[test]
+    fn each_folder_counts_only_its_own_messages() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_folder_start(&folder("INBOX"), 100);
+        reporter.on_folder_start(&folder("Archive"), 100);
+        reporter.on_messages_scanned(&folder("INBOX"), 30);
+        reporter.on_messages_scanned(&folder("Archive"), 5);
+
+        assert_eq!(named(&shared, "INBOX").scanned, 30);
+        assert_eq!(named(&shared, "Archive").scanned, 5);
+    }
+
+    #[test]
+    fn the_latest_totals_the_adapter_reports_are_the_ones_shown() {
+        // Only the adapter can count senders deduplicated across folders, so
+        // each report replaces the last rather than adding to it.
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        reporter.on_totals(12, 1);
+        reporter.on_totals(30, 4);
+
+        assert_eq!(shared.totals(), (30, 4));
+    }
+
+    #[test]
+    fn a_scan_polls_the_flag_the_screen_sets() {
+        let shared = ScanShared::new();
+        let reporter = progress(&shared);
+
+        assert!(!reporter.should_cancel());
+        shared.cancel();
+        assert!(reporter.should_cancel());
+        // Asking twice changes nothing.
+        shared.cancel();
+        assert!(reporter.should_cancel());
+    }
+
+    // -----------------------------------------------------------------------
+    // Run progress
+    // -----------------------------------------------------------------------
+
+    fn sender_info(email: &str) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+            unsubscribe_mailto: vec!["mailto:unsub@acme.example.com".to_string()],
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: 3,
+            messages: vec![unsubscribe_core::FolderMessage {
+                folder: folder("INBOX"),
+                message_id: MessageId::new("INBOX:1"),
+            }],
+            last_seen: None,
+        }
+    }
+
+    fn planned(email: &str, step: NextStep) -> PlannedSender {
+        PlannedSender {
+            sender: sender_info(email),
+            step,
+        }
+    }
+
+    fn result(email: &str, success: bool) -> UnsubscribeResult {
+        UnsubscribeResult {
+            email: email.to_string(),
+            method: UnsubscribeMethod::OneClickPost,
+            success,
+            detail: "HTTP 200".to_string(),
+            url: "https://acme.example.com/unsub".to_string(),
+            http_status: Some(200),
+            final_url: None,
+        }
+    }
+
+    fn escalation(from: Option<RungMethod>, to: RungMethod) -> NextStep {
+        NextStep::Escalate(Escalation {
+            rung: Rung::new(to, "https://acme.example.com/unsub"),
+            from,
+            follows_attempt_id: Some("a1".to_string()),
+        })
+    }
+
+    #[test]
+    fn a_run_starts_with_an_empty_log() {
+        let shared = RunShared::new();
+
+        assert!(shared.events().is_empty());
+        assert_eq!(shared.planned(), 0);
+        assert!(!shared.cancel_requested());
+    }
+
+    #[test]
+    fn the_run_log_keeps_every_phase_in_the_order_it_happened() {
+        let shared = RunShared::new();
+        let reporter = RunReporter(Arc::clone(&shared));
+
+        reporter.on_unsubscribe_start(2);
+        reporter.on_sender_result(&planned("one@acme.example.com", NextStep::FirstAttempt), &result("one@acme.example.com", true));
+        reporter.on_sender_result(&planned("two@acme.example.com", NextStep::FirstAttempt), &result("two@acme.example.com", false));
+        reporter.on_archive_start(6, 2);
+        reporter.on_archive_done(6);
+
+        assert_eq!(shared.planned(), 2);
+        let kinds: Vec<&str> = shared
+            .events()
+            .iter()
+            .map(|event| match event {
+                RunEvent::Sender { .. } => "sender",
+                RunEvent::Archiving { .. } => "archiving",
+                RunEvent::Archived { .. } => "archived",
+                RunEvent::Warning(_) => "warning",
+            })
+            .collect();
+        assert_eq!(kinds, ["sender", "sender", "archiving", "archived"]);
+    }
+
+    #[test]
+    fn a_sender_row_carries_the_result_the_pipeline_produced() {
+        let shared = RunShared::new();
+        let reporter = RunReporter(Arc::clone(&shared));
+
+        reporter.on_sender_result(
+            &planned("one@acme.example.com", NextStep::FirstAttempt),
+            &result("one@acme.example.com", false),
+        );
+
+        match &shared.events()[0] {
+            RunEvent::Sender {
+                email,
+                success,
+                method,
+                escalation,
+                ..
+            } => {
+                assert_eq!(email, "one@acme.example.com");
+                assert!(!success);
+                assert_eq!(method, UnsubscribeMethod::OneClickPost.label());
+                assert_eq!(escalation.as_deref(), None, "a first attempt climbs nothing");
+            }
+            other => panic!("expected a sender row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_archive_counts_reach_the_log_unchanged() {
+        let shared = RunShared::new();
+        let reporter = RunReporter(Arc::clone(&shared));
+
+        reporter.on_archive_start(41, 7);
+        reporter.on_archive_done(41);
+
+        assert!(matches!(
+            shared.events().as_slice(),
+            [
+                RunEvent::Archiving {
+                    messages: 41,
+                    emails: 7
+                },
+                RunEvent::Archived { archived: 41 }
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_run_polls_the_flag_the_screen_sets() {
+        let shared = RunShared::new();
+        let reporter = RunReporter(Arc::clone(&shared));
+
+        assert!(!reporter.should_cancel());
+        shared.cancel();
+        assert!(reporter.should_cancel());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wording
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_first_attempt_and_an_exhausted_sender_name_no_escalation() {
+        assert_eq!(
+            escalation_text(&planned("one@acme.example.com", NextStep::FirstAttempt)),
+            None
+        );
+        assert_eq!(
+            escalation_text(&planned("one@acme.example.com", NextStep::Exhausted)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_climb_names_what_was_ignored_and_what_is_being_tried_instead() {
+        let text = escalation_text(&planned(
+            "one@acme.example.com",
+            escalation(Some(RungMethod::OneClickPost), RungMethod::HttpFlow),
+        ))
+        .expect("an escalation has something to say");
+
+        assert!(text.contains(RungMethod::OneClickPost.label()), "{text}");
+        assert!(text.contains(RungMethod::HttpFlow.label()), "{text}");
+    }
+
+    #[test]
+    fn a_climb_from_an_unknown_rung_still_names_the_one_being_tried() {
+        let text = escalation_text(&planned(
+            "one@acme.example.com",
+            escalation(None, RungMethod::Mailto),
+        ))
+        .expect("an escalation has something to say");
+
+        assert_eq!(text, format!("escalated to {}", RungMethod::Mailto.label()));
+    }
+
+    #[test]
+    fn every_warning_becomes_one_line_that_keeps_the_underlying_reason() {
+        let warnings = [
+            RunWarning::CacheUnreadable("file is corrupt".to_string()),
+            RunWarning::CacheNotWritten("read-only".to_string()),
+            RunWarning::CacheNotPruned("locked".to_string()),
+            RunWarning::AttemptNotRecorded("db is locked".to_string()),
+            RunWarning::ResumptionNotRecorded("db is locked".to_string()),
+        ];
+
+        for warning in &warnings {
+            let text = warning_text(warning);
+            assert_eq!(text.lines().count(), 1, "{text:?} must be one row in a log");
+            assert!(!text.is_empty());
+        }
+        assert!(warning_text(&warnings[0]).contains("file is corrupt"));
+        assert!(warning_text(&warnings[3]).contains("db is locked"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy
+    // -----------------------------------------------------------------------
+
+    fn preferences() -> Preferences {
+        Preferences {
+            min_emails: 5,
+            stale_after_months: 9,
+            cache_max_age_days: 3,
+            grace_period_days: 21,
+        }
+    }
+
+    #[test]
+    fn a_dry_run_choice_is_carried_into_the_policy_the_run_uses() {
+        assert!(policy(&preferences(), true).dry_run);
+        assert!(!policy(&preferences(), false).dry_run);
+    }
+
+    #[test]
+    fn the_run_policy_is_the_users_preferences_and_nothing_invented() {
+        let policy = policy(&preferences(), false);
+
+        assert_eq!(policy.min_emails, 5);
+        assert_eq!(policy.stale_after_months, 9);
+        assert_eq!(policy.grace_period_days, 21);
     }
 }
