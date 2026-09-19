@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use imap::Session;
@@ -15,6 +16,28 @@ use unsubscribe_core::{
 /// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
 /// connections; we stay well under that to avoid throttling.
 const MAX_CONCURRENT_CONNECTIONS: usize = 5;
+
+/// Most message headers held in memory at once. This is the memory bound, and
+/// the largest fetch the scan will ever ask for.
+const MAX_FETCH_BATCH: u32 = 500;
+
+/// Smallest fetch the scan will drop to on a slow connection. Below this the
+/// round trips cost more than the extra progress detail is worth.
+const MIN_FETCH_BATCH: u32 = 25;
+
+/// What the first fetch of a folder asks for, before anything is known about
+/// how fast the connection is.
+const INITIAL_FETCH_BATCH: u32 = 50;
+
+/// How long a single fetch should ideally take.
+///
+/// A FETCH is atomic to us -- the imap crate returns the whole response or
+/// nothing -- so the fetch size *is* the progress granularity: nothing can be
+/// reported until the last message of the batch has arrived. Sizing each
+/// fetch by how long the previous one took keeps a fast connection on large
+/// batches (few round trips) and a slow one on small batches (a display that
+/// keeps moving), rather than fixing one size that is wrong for both.
+const TARGET_FETCH_TIME: Duration = Duration::from_millis(400);
 
 /// IMAP adapter for the `EmailProvider` trait.
 ///
@@ -250,8 +273,9 @@ fn scan_folder(
 
     let uid_validity = mailbox.uid_validity;
 
-    // Fetch in batches to bound memory usage on large mailboxes
-    let batch_size = 500u32;
+    // Fetch in batches to bound memory usage on large mailboxes, sized so a
+    // batch also lands often enough to keep the progress display moving.
+    let mut batch_size = INITIAL_FETCH_BATCH;
     let mut start = 1u32;
     while start <= total {
         // Between fetches, so a cancelled scan never abandons a request that
@@ -262,9 +286,11 @@ fn scan_folder(
         }
         let end = total.min(start + batch_size - 1);
         let sequence = format!("{start}:{end}");
+        let fetch_started = Instant::now();
         let messages = session
             .fetch(&sequence, "(UID INTERNALDATE BODY.PEEK[HEADER])")
             .with_context(|| format!("Failed to fetch messages {start}:{end}"))?;
+        batch_size = next_fetch_size(batch_size, fetch_started.elapsed());
 
         for msg in messages.iter() {
             progress.on_messages_scanned(folder, 1);
@@ -385,6 +411,23 @@ fn scan_folder(
     progress.on_folder_done(folder);
     session.logout().ok();
     Ok(FolderResult { senders, warnings })
+}
+
+/// How many messages the next fetch should ask for, given how long the last
+/// one took.
+///
+/// Scales toward [`TARGET_FETCH_TIME`] and never more than doubles in one
+/// step, so an unusually quick fetch cannot commit the next one to a long
+/// silence. The result is always within the memory bound.
+fn next_fetch_size(current: u32, elapsed: Duration) -> u32 {
+    // A fetch that registers as instant would otherwise divide by zero; one
+    // millisecond is close enough and still pushes the size upward.
+    let elapsed_ms = elapsed.as_millis().max(1);
+    let scaled = u128::from(current) * TARGET_FETCH_TIME.as_millis() / elapsed_ms;
+    let ceiling = u128::from(current)
+        .saturating_mul(2)
+        .clamp(u128::from(MIN_FETCH_BATCH), u128::from(MAX_FETCH_BATCH));
+    scaled.clamp(u128::from(MIN_FETCH_BATCH), ceiling) as u32
 }
 
 /// Merge a per-folder result into the combined sender map.
