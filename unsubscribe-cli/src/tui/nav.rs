@@ -119,6 +119,11 @@ impl Navigator {
 
     /// Answer a key while the nav has focus.
     pub fn on_action(&mut self, action: Action) -> NavOutcome {
+        // The nav is six rows long, so jumping five of them is not a movement
+        // anyone means: Ctrl with an arrow belongs to the lists.
+        if matches!(action, Action::JumpUp | Action::JumpDown) {
+            return NavOutcome::Stay;
+        }
         let last = Section::ALL.len() - 1;
         if let Some(cursor) = keys::move_cursor(action, self.cursor, last) {
             self.cursor = cursor;
@@ -216,6 +221,16 @@ mod tests {
             nav.on_action(Action::MoveDown);
         }
         assert_eq!(nav.section(), Section::Quit);
+    }
+
+    #[test]
+    fn the_nav_is_exempt_from_the_jump_keys() {
+        let mut nav = nav();
+
+        assert_eq!(nav.on_action(Action::JumpDown), NavOutcome::Stay);
+        assert_eq!(nav.section(), Section::Run, "six rows: nothing to jump");
+        assert_eq!(nav.on_action(Action::JumpUp), NavOutcome::Stay);
+        assert_eq!(nav.section(), Section::Run);
     }
 
     #[test]

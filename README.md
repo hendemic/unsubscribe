@@ -71,7 +71,7 @@ keys mean the same thing in every panel, sub-view and dialog.
 | Key | Does |
 |-----|------|
 | `↑` `↓` / `k` `j` | Move |
-| `Ctrl+↑` `Ctrl+↓` | Move five rows |
+| `Ctrl+↑` `Ctrl+↓` | Move five rows — in every list; the nav is six rows long and ignores it |
 | `PgUp` `PgDn` | Move a page |
 | `Home` `End` / `g` `G` | First / last row |
 | `Enter` | Open, confirm, or act on the highlighted row |

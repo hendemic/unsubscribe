@@ -396,15 +396,37 @@ impl SettingsApp {
     }
 
     fn on_action_browse(&mut self, action: Key) -> Action {
-        if keys::is_movement(action) {
-            // The rows are not a flat list -- headers are skipped -- so the
-            // screen keeps its own stepping rather than using the helper's
-            // index arithmetic.
-            match action {
-                Key::MoveUp | Key::PageUp | Key::JumpUp | Key::First => self.move_up(),
-                _ => self.move_down(),
+        // The rows are not a flat list -- headers are skipped -- so the screen
+        // steps for itself, as many rows as the key is worth, rather than
+        // using the helper's index arithmetic.
+        if let Some(steps) = keys::steps(action) {
+            for _ in 0..steps {
+                if keys::is_backwards(action) {
+                    self.move_up();
+                } else {
+                    self.move_down();
+                }
             }
             return Action::None;
+        }
+        match action {
+            Key::First => {
+                self.cursor = self
+                    .rows
+                    .iter()
+                    .position(|row| row.is_selectable())
+                    .unwrap_or_default();
+                return Action::None;
+            }
+            Key::Last => {
+                self.cursor = self
+                    .rows
+                    .iter()
+                    .rposition(|row| row.is_selectable())
+                    .unwrap_or_default();
+                return Action::None;
+            }
+            _ => {}
         }
         match action {
             Key::Back => {
@@ -507,10 +529,20 @@ impl SettingsApp {
             return Action::None;
         }
 
+        if let Some(steps) = keys::steps(action) {
+            for _ in 0..steps {
+                if keys::is_backwards(action) {
+                    picker.move_up();
+                } else {
+                    picker.move_down();
+                }
+            }
+            return Action::None;
+        }
         match action {
             Key::Back => self.mode = Mode::Browse,
-            Key::MoveUp | Key::PageUp | Key::JumpUp | Key::First => picker.move_up(),
-            Key::MoveDown | Key::PageDown | Key::JumpDown | Key::Last => picker.move_down(),
+            Key::First => picker.cursor = 0,
+            Key::Last => picker.cursor = picker.entries.len().saturating_sub(1),
             Key::Toggle => picker.toggle(),
             Key::Activate => self.commit_folders(),
             _ => {}
@@ -982,6 +1014,10 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn press_ctrl(app: &mut SettingsApp, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
     fn type_chars(app: &mut SettingsApp, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
@@ -1081,6 +1117,44 @@ mod tests {
         }
         visited.reverse();
         assert_eq!(visited, SELECTABLE_ORDER);
+    }
+
+    #[test]
+    fn ctrl_with_an_arrow_jumps_five_settings_and_clamps() {
+        let mut app = app();
+
+        press_ctrl(&mut app, KeyCode::Down);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[5]);
+        press_ctrl(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0]);
+        press_ctrl(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0], "clamped");
+    }
+
+    #[test]
+    fn a_jump_lands_on_a_setting_rather_than_on_a_section_header() {
+        // The rows are not a flat list, so a jump steps five selectable rows
+        // rather than five indices.
+        let mut app = app();
+
+        press_ctrl(&mut app, KeyCode::Down);
+        press_ctrl(&mut app, KeyCode::Down);
+
+        assert!(app.rows[app.cursor].is_selectable());
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[10]);
+    }
+
+    #[test]
+    fn g_and_shift_g_reach_the_first_and_last_setting() {
+        let mut app = app();
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(
+            app.rows[app.cursor],
+            SELECTABLE_ORDER[SELECTABLE_ORDER.len() - 1]
+        );
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.rows[app.cursor], SELECTABLE_ORDER[0]);
     }
 
     #[test]

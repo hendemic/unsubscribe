@@ -151,11 +151,28 @@ pub fn move_cursor(action: Action, cursor: usize, last: usize) -> Option<usize> 
     Some(moved.min(last))
 }
 
-/// Whether `action` moves a cursor, for a list whose rows are not a flat
-/// index range and which therefore steps for itself.
+/// How many rows a movement covers, for a list that has to step one row at a
+/// time because its rows are not a flat index range (headers, spacers).
+///
+/// `First` and `Last` are not steps and are not answered here: a list with an
+/// unselectable first row has its own idea of where "first" is.
 #[must_use]
-pub fn is_movement(action: Action) -> bool {
-    move_cursor(action, 0, 1).is_some()
+pub fn steps(action: Action) -> Option<usize> {
+    match action {
+        Action::MoveUp | Action::MoveDown => Some(1),
+        Action::JumpUp | Action::JumpDown => Some(JUMP),
+        Action::PageUp | Action::PageDown => Some(PAGE),
+        _ => None,
+    }
+}
+
+/// Whether a movement goes towards the top of a list.
+#[must_use]
+pub fn is_backwards(action: Action) -> bool {
+    matches!(
+        action,
+        Action::MoveUp | Action::JumpUp | Action::PageUp | Action::First
+    )
 }
 
 /// How an action is written in the footer and the help overlay.
@@ -219,9 +236,11 @@ fn rows(actions: &[Action]) -> Vec<Hint> {
 
 /// The movement keys every list answers, as the prefix of a panel's action
 /// list. Written once so no panel forgets a row.
-pub const LIST_MOVEMENT: [Action; 6] = [
+pub const LIST_MOVEMENT: [Action; 8] = [
     Action::MoveUp,
     Action::MoveDown,
+    Action::JumpUp,
+    Action::JumpDown,
     Action::PageUp,
     Action::PageDown,
     Action::First,
@@ -346,6 +365,54 @@ mod tests {
         assert_eq!(move_cursor(Action::JumpDown, 0, 9), Some(5));
         assert_eq!(move_cursor(Action::First, 7, 9), Some(0));
         assert_eq!(move_cursor(Action::Last, 0, 9), Some(9));
+    }
+
+    #[test]
+    fn a_jump_is_five_rows_and_clamps_like_every_other_movement() {
+        assert_eq!(move_cursor(Action::JumpDown, 0, 9), Some(JUMP));
+        assert_eq!(move_cursor(Action::JumpUp, 9, 9), Some(9 - JUMP));
+        assert_eq!(move_cursor(Action::JumpDown, 7, 9), Some(9));
+        assert_eq!(move_cursor(Action::JumpUp, 2, 9), Some(0));
+    }
+
+    #[test]
+    fn the_jump_is_advertised_by_every_list() {
+        let rows = help_rows(&list_actions(&[]));
+
+        assert!(
+            rows.iter().any(|(keys, _)| keys.contains("Ctrl")),
+            "got {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_counting_list_moves_the_same_distance_as_an_indexed_one() {
+        // The two ways a list can move must agree, or Ctrl+Down would cover a
+        // different distance in Settings than in the Logs.
+        for action in [
+            Action::MoveDown,
+            Action::JumpDown,
+            Action::PageDown,
+            Action::MoveUp,
+            Action::JumpUp,
+            Action::PageUp,
+        ] {
+            let steps = steps(action).expect("a movement");
+            let indexed = move_cursor(action, 50, 100).expect("a movement");
+            let stepped = if is_backwards(action) {
+                50 - steps
+            } else {
+                50 + steps
+            };
+            assert_eq!(indexed, stepped, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn first_and_last_are_not_steps_because_a_list_may_start_below_its_top() {
+        assert_eq!(steps(Action::First), None);
+        assert_eq!(steps(Action::Last), None);
+        assert_eq!(steps(Action::Activate), None);
     }
 
     #[test]

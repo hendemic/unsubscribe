@@ -171,6 +171,21 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_with_an_arrow_jumps_five_rows_and_clamps() {
+        let mut s = screen(30);
+
+        s.on_action(Action::JumpDown);
+        assert_eq!(s.cursor, 5);
+        s.on_action(Action::JumpDown);
+        assert_eq!(s.cursor, 10);
+        s.on_action(Action::JumpUp);
+        assert_eq!(s.cursor, 5);
+        s.on_action(Action::First);
+        s.on_action(Action::JumpUp);
+        assert_eq!(s.cursor, 0, "clamped at the top");
+    }
+
+    #[test]
     fn g_and_shift_g_jump_to_the_first_and_last_warning() {
         let mut s = screen(30);
 

@@ -659,6 +659,25 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_with_an_arrow_jumps_five_rows_and_clamps() {
+        let mut screen = HistoryScreen::new(
+            (0..25)
+                .map(|i| view(&format!("s{i:02}@acme.example.com"), None, 0))
+                .collect(),
+        );
+
+        screen.on_action(Action::JumpDown);
+        assert_eq!(screen.cursor, 5);
+        screen.on_action(Action::JumpUp);
+        assert_eq!(screen.cursor, 0);
+        screen.on_action(Action::JumpUp);
+        assert_eq!(screen.cursor, 0, "clamped at the top");
+        screen.on_action(Action::Last);
+        screen.on_action(Action::JumpDown);
+        assert_eq!(screen.cursor, 24, "clamped at the bottom");
+    }
+
+    #[test]
     fn esc_goes_back_one_level_and_q_is_never_back() {
         assert_eq!(nav_name(&listing().on_action(Action::Back)), "pop");
         assert_eq!(nav_name(&listing().on_action(Action::Quit)), "stay");
