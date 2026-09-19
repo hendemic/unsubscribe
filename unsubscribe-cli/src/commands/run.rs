@@ -321,3 +321,212 @@ fn attempt_from_result(
         result.detail.clone(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A sender carrying every piece of identity evidence an attempt records.
+    fn evidence_sender() -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: "news@acme.com".to_string(),
+            domain: "acme.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.com/unsub?t=abc".to_string()],
+            unsubscribe_mailto: vec!["mailto:unsub@acme.com".to_string()],
+            one_click: true,
+            list_id: Some("weekly.acme.com".to_string()),
+            list_unsubscribe_raw: Some(
+                "<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>".to_string(),
+            ),
+            email_count: 7,
+            messages: vec![],
+            last_seen: Some(1_700_000_000),
+        }
+    }
+
+    fn successful_result() -> UnsubscribeResult {
+        UnsubscribeResult {
+            email: "news@acme.com".to_string(),
+            method: UnsubscribeMethod::OneClickPost,
+            success: true,
+            detail: "HTTP 200".to_string(),
+            url: "https://acme.com/unsub?t=abc".to_string(),
+            http_status: Some(200),
+            final_url: Some("https://acme.com/unsub/done".to_string()),
+        }
+    }
+
+    /// Check a string against the RFC 4122 textual form: 8-4-4-4-12 lowercase
+    /// hex digits, with the version nibble set to 4 for a random UUID.
+    fn is_wellformed_uuid_v4(s: &str) -> bool {
+        let groups: Vec<&str> = s.split('-').collect();
+        if groups.len() != 5 {
+            return false;
+        }
+        if [8, 4, 4, 4, 12] != [
+            groups[0].len(),
+            groups[1].len(),
+            groups[2].len(),
+            groups[3].len(),
+            groups[4].len(),
+        ] {
+            return false;
+        }
+        if !groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+        {
+            return false;
+        }
+        // Version 4 lives in the first nibble of the third group; the variant
+        // bits put the fourth group's first character in 8..=b.
+        groups[2].starts_with('4')
+            && matches!(groups[3].chars().next(), Some('8' | '9' | 'a' | 'b'))
+    }
+
+    #[test]
+    fn attempt_copies_every_evidence_field_from_the_sender_and_the_result() {
+        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &successful_result());
+
+        assert_eq!(attempt.account, "me@example.com");
+        assert_eq!(attempt.sender_email, "news@acme.com");
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(attempt.method, "one_click_post");
+        assert!(attempt.success);
+        assert_eq!(attempt.http_status, Some(200));
+        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
+        assert_eq!(
+            attempt.final_url.as_deref(),
+            Some("https://acme.com/unsub/done")
+        );
+        assert_eq!(
+            attempt.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
+        );
+        assert_eq!(attempt.detail, "HTTP 200");
+    }
+
+    #[test]
+    fn attempt_records_the_senders_domain_not_the_accounts() {
+        // Both are email addresses; swapping them would silently file every
+        // attempt under the user's own domain.
+        let attempt =
+            attempt_from_result("me@gmail.com", &evidence_sender(), &successful_result());
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.account, "me@gmail.com");
+    }
+
+    #[test]
+    fn attempt_stores_the_stable_method_id_not_the_display_label() {
+        // MailtoSent is the case where the two differ: id "mailto_sent",
+        // label "mailto". Storing the label would break history on a rename.
+        let mut result = successful_result();
+        result.method = UnsubscribeMethod::MailtoSent;
+
+        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &result);
+
+        assert_eq!(attempt.method, "mailto_sent");
+        assert_ne!(
+            attempt.method,
+            UnsubscribeMethod::MailtoSent.label(),
+            "the display label must not be what gets stored"
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_maps_the_same_fields_as_a_successful_one() {
+        let result = UnsubscribeResult {
+            email: "news@acme.com".to_string(),
+            method: UnsubscribeMethod::Get,
+            success: false,
+            detail: "HTTP 410".to_string(),
+            url: "https://acme.com/unsub?t=abc".to_string(),
+            http_status: Some(410),
+            final_url: None,
+        };
+
+        let attempt = attempt_from_result("me@example.com", &evidence_sender(), &result);
+
+        assert!(!attempt.success);
+        assert_eq!(attempt.method, "get");
+        assert_eq!(attempt.http_status, Some(410));
+        assert_eq!(attempt.detail, "HTTP 410");
+        assert_eq!(attempt.final_url, None);
+        // The identity evidence is recorded whether or not the attempt worked.
+        assert_eq!(attempt.sender_email, "news@acme.com");
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            attempt.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
+        );
+        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
+    }
+
+    #[test]
+    fn a_sender_without_identity_headers_records_none_rather_than_empty_strings() {
+        let mut sender = evidence_sender();
+        sender.list_id = None;
+        sender.list_unsubscribe_raw = None;
+        let mut result = successful_result();
+        result.method = UnsubscribeMethod::MailtoSkipped;
+        result.http_status = None;
+        result.final_url = None;
+        result.url = String::new();
+
+        let attempt = attempt_from_result("me@example.com", &sender, &result);
+
+        assert_eq!(attempt.list_id, None);
+        assert_eq!(attempt.list_unsubscribe_raw, None);
+        assert_eq!(attempt.http_status, None);
+        assert_eq!(attempt.final_url, None);
+        assert_eq!(attempt.url, "");
+        assert_eq!(attempt.method, "mailto_skipped");
+    }
+
+    #[test]
+    fn each_attempt_gets_a_distinct_well_formed_uuid() {
+        // Histories from two devices merge as a union keyed by id, so a
+        // repeated id would silently drop an attempt.
+        let sender = evidence_sender();
+        let result = successful_result();
+        let ids: HashSet<String> = (0..64)
+            .map(|_| attempt_from_result("me@example.com", &sender, &result).id)
+            .collect();
+
+        assert_eq!(ids.len(), 64, "attempt ids must be unique");
+        for id in &ids {
+            assert!(
+                is_wellformed_uuid_v4(id),
+                "id is not an RFC 4122 v4 UUID: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn attempted_at_is_the_current_utc_time_in_seconds() {
+        // Derived independently of `now_unix_secs` so a unit mix-up (millis) or
+        // a local-time offset would show up as a large difference.
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_secs() as i64;
+
+        let attempt =
+            attempt_from_result("me@example.com", &evidence_sender(), &successful_result());
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_secs() as i64;
+
+        assert!(
+            (before..=after).contains(&attempt.attempted_at),
+            "attempted_at {} is outside [{before}, {after}]",
+            attempt.attempted_at
+        );
+    }
+}

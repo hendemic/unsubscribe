@@ -870,4 +870,268 @@ mod tests {
         assert_eq!(calls[2], ProgressCall::MessagesScanned { folder: "INBOX".to_string(), count: 50 });
         assert_eq!(calls[3], ProgressCall::FolderDone { folder: "INBOX".to_string() });
     }
+
+    // -----------------------------------------------------------------------
+    // Cross-folder identity merge (Issue #92 / #111)
+    // -----------------------------------------------------------------------
+
+    /// A one-sender folder result carrying the identity evidence a merge has to
+    /// arbitrate: the list id, the raw header, and the folder's newest message
+    /// date.
+    fn identity_folder(
+        email: &str,
+        last_seen: Option<i64>,
+        list_id: Option<&str>,
+        list_unsubscribe_raw: Option<&str>,
+    ) -> FolderResult {
+        let mut sender = make_sender(email, 1, vec![], vec![], false, "", vec![]);
+        sender.last_seen = last_seen;
+        sender.list_id = list_id.map(String::from);
+        sender.list_unsubscribe_raw = list_unsubscribe_raw.map(String::from);
+        FolderResult {
+            senders: HashMap::from([(email.to_string(), sender)]),
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn merge_takes_identity_from_the_folder_with_the_newer_last_seen() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_600_000_000),
+                Some("daily.acme.com"),
+                Some("<https://acme.com/unsub?t=old>"),
+            ),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_700_000_000),
+                Some("weekly.acme.com"),
+                Some("<https://acme.com/unsub?t=new>"),
+            ),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=new>")
+        );
+    }
+
+    #[test]
+    fn merge_keeps_the_newer_identity_when_an_older_folder_is_merged_after_it() {
+        // Folders are scanned in configuration order, not date order, so the
+        // arbitration has to be by `last_seen` rather than by merge order.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_700_000_000),
+                Some("weekly.acme.com"),
+                Some("<https://acme.com/unsub?t=new>"),
+            ),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_600_000_000),
+                Some("daily.acme.com"),
+                Some("<https://acme.com/unsub?t=old>"),
+            ),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(
+            sender.list_id.as_deref(),
+            Some("weekly.acme.com"),
+            "the older folder must not overwrite the newer folder's list id"
+        );
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=new>")
+        );
+        // The merged last_seen is still the newest date across both folders.
+        assert_eq!(sender.last_seen, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn merge_never_replaces_a_known_list_id_with_none() {
+        // A newer folder whose mail happened to carry no List-Id must not erase
+        // the identity an older folder supplied — history cannot be backfilled.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_600_000_000),
+                Some("weekly.acme.com"),
+                Some("<https://acme.com/unsub?t=old>"),
+            ),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder("news@acme.com", Some(1_700_000_000), None, None),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=old>")
+        );
+    }
+
+    #[test]
+    fn merge_adopts_an_older_folders_identity_when_the_newer_folder_has_none() {
+        // Same rule from the other direction: the first folder merged supplies
+        // nothing, so the second folder's value is taken even though it is older.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder("news@acme.com", Some(1_700_000_000), None, None),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_600_000_000),
+                Some("weekly.acme.com"),
+                Some("<https://acme.com/unsub?t=old>"),
+            ),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=old>")
+        );
+    }
+
+    #[test]
+    fn merge_prefers_a_dated_folder_over_an_undated_one() {
+        // An adapter that could not read a folder's dates leaves `last_seen`
+        // empty; that folder should not win the identity over one that has a
+        // real date behind it.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_700_000_000),
+                Some("weekly.acme.com"),
+                Some("<https://acme.com/unsub?t=dated>"),
+            ),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                None,
+                Some("undated.acme.com"),
+                Some("<https://acme.com/unsub?t=undated>"),
+            ),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=dated>")
+        );
+        assert_eq!(sender.last_seen, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn merge_with_equal_last_seen_takes_the_later_folder() {
+        // Two folders whose newest message is the same date are genuinely tied;
+        // the merge has to pick one deterministically rather than depend on
+        // HashMap iteration order.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_700_000_000),
+                Some("first.acme.com"),
+                Some("<https://acme.com/unsub?t=first>"),
+            ),
+        );
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "news@acme.com",
+                Some(1_700_000_000),
+                Some("second.acme.com"),
+                Some("<https://acme.com/unsub?t=second>"),
+            ),
+        );
+
+        let sender = &combined["news@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("second.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=second>")
+        );
+    }
+
+    #[test]
+    fn merge_carries_identity_through_for_a_sender_seen_in_one_folder_only() {
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        merge_folder_result(
+            &mut combined,
+            identity_folder(
+                "solo@acme.com",
+                Some(1_700_000_000),
+                Some("solo.acme.com"),
+                Some("<mailto:unsub@acme.com>"),
+            ),
+        );
+
+        let sender = &combined["solo@acme.com"];
+        assert_eq!(sender.list_id.as_deref(), Some("solo.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<mailto:unsub@acme.com>")
+        );
+    }
+
+    #[test]
+    fn merge_keeps_each_senders_identity_separate() {
+        // Two senders merged in the same pass must not cross-contaminate.
+        let mut combined: HashMap<String, SenderInfo> = HashMap::new();
+
+        let mut a = make_sender("a@a.com", 1, vec![], vec![], false, "", vec![]);
+        a.list_id = Some("list-a.a.com".to_string());
+        a.last_seen = Some(1_700_000_000);
+        let mut b = make_sender("b@b.com", 1, vec![], vec![], false, "", vec![]);
+        b.list_id = Some("list-b.b.com".to_string());
+        b.last_seen = Some(1_600_000_000);
+
+        merge_folder_result(
+            &mut combined,
+            FolderResult {
+                senders: HashMap::from([("a@a.com".to_string(), a), ("b@b.com".to_string(), b)]),
+                warnings: vec![],
+            },
+        );
+
+        assert_eq!(combined["a@a.com"].list_id.as_deref(), Some("list-a.a.com"));
+        assert_eq!(combined["b@b.com"].list_id.as_deref(), Some("list-b.b.com"));
+    }
 }
