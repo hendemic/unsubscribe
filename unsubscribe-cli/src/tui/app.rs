@@ -1344,13 +1344,23 @@ impl Shell {
 
     fn render(&mut self, f: &mut Frame) {
         let has_status = self.status.is_some();
+        // The footer is measured before the layout is split: several panels
+        // offer more keys than one line holds, and a footer given a fixed
+        // line would clip them rather than wrap.
+        let actions = self.focus_actions();
+        let footer = match (&self.dialog, self.nav.help) {
+            (Some(dialog), _) => vec![dialog.hints().to_string()],
+            (None, true) => vec![" any key: close help".to_string()],
+            (None, false) => keys::hint_lines(&actions, f.area().width),
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),                     // header
                 Constraint::Min(5),                        // nav + working area
                 Constraint::Length(u16::from(has_status)), // status
-                Constraint::Length(1),                     // footer
+                Constraint::Length(footer.len() as u16),   // footer
             ])
             .split(f.area());
 
@@ -1361,14 +1371,8 @@ impl Shell {
             render_status(f, chunks[2], status);
         }
 
-        let actions = self.focus_actions();
-        let footer = match (&self.dialog, self.nav.help) {
-            (Some(dialog), _) => dialog.hints().to_string(),
-            (None, true) => " any key: close help".to_string(),
-            (None, false) => keys::hints(&actions),
-        };
         f.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(footer.join("\n")).style(Style::default().fg(Color::DarkGray)),
             chunks[3],
         );
 
