@@ -1455,4 +1455,400 @@ mod tests {
             assert!(seen.contains(&order), "{order:?} is reachable by cycling");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // The flat event log
+    // -----------------------------------------------------------------------
+
+    /// An attempt that escalates from `earlier`, with its own method wording.
+    fn escalated(
+        id: &str,
+        email: &str,
+        at: i64,
+        earlier: &str,
+        method: UnsubscribeMethod,
+    ) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            follows_attempt_id: Some(earlier.to_string()),
+            method: method.as_id().to_string(),
+            ..attempt(id, email, None, at, false)
+        }
+    }
+
+    fn log_ids(entries: &[LogEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match &entry.event {
+                TimelineEvent::Attempt(attempt) => attempt.id.clone(),
+                TimelineEvent::Resumption(resumption) => resumption.id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_feed_lists_every_attempt_and_every_resumption_of_every_sender() {
+        let attempts = [
+            attempt("a1", "one@acme.example.com", None, T0 - 9 * DAY, true),
+            attempt("a2", "two@beta.example.org", None, T0 - 8 * DAY, false),
+        ];
+        let resumptions = [resumption("r1", "a1", "one@acme.example.com", None, T0 - 7 * DAY)];
+
+        let entries = event_log(&attempts, &resumptions);
+
+        assert_eq!(entries.len(), 3, "nothing is grouped away");
+        assert_eq!(log_ids(&entries), ["r1", "a2", "a1"]);
+    }
+
+    #[test]
+    fn the_feed_is_newest_first_across_senders_rather_than_per_sender() {
+        // Interleaved on purpose: a per-sender feed would keep one sender's
+        // two rows together, which is not what a chronological log means.
+        let attempts = [
+            attempt("old-a", "aaa@acme.example.com", None, T0 - 30 * DAY, true),
+            attempt("new-b", "zzz@beta.example.org", None, T0 - DAY, true),
+            attempt("mid-a", "aaa@acme.example.com", None, T0 - 10 * DAY, true),
+        ];
+
+        assert_eq!(
+            log_ids(&event_log(&attempts, &[])),
+            ["new-b", "mid-a", "old-a"]
+        );
+    }
+
+    #[test]
+    fn two_events_at_the_same_instant_are_ordered_by_address_however_the_store_returned_them() {
+        let forwards = [
+            attempt("z", "zoe@acme.example.com", None, T0, true),
+            attempt("a", "amy@acme.example.com", None, T0, true),
+        ];
+        let backwards = [forwards[1].clone(), forwards[0].clone()];
+
+        assert_eq!(log_ids(&event_log(&forwards, &[])), ["a", "z"]);
+        assert_eq!(
+            log_ids(&event_log(&backwards, &[])),
+            ["a", "z"],
+            "the order must not depend on the store"
+        );
+    }
+
+    #[test]
+    fn an_escalated_attempt_names_the_attempt_it_follows() {
+        let attempts = [
+            attempt("first", "news@acme.example.com", None, T0 - 20 * DAY, false),
+            escalated(
+                "second",
+                "news@acme.example.com",
+                T0 - 10 * DAY,
+                "first",
+                UnsubscribeMethod::Get,
+            ),
+        ];
+
+        let entries = event_log(&attempts, &[]);
+        let follows = entries[0].follows.as_ref().expect("the escalation");
+
+        assert_eq!(follows.attempt_id, "first");
+        assert_eq!(follows.at, T0 - 20 * DAY);
+        assert_eq!(follows.method, UnsubscribeMethod::OneClickPost.as_id());
+        assert_eq!(entries[1].follows, None, "the first attempt follows nothing");
+    }
+
+    #[test]
+    fn an_escalation_pointing_at_an_attempt_the_feed_does_not_hold_names_nothing() {
+        // The pointed-at row can be missing: attempts are filtered by account
+        // and by `--since` before they reach the feed.
+        let attempts = [escalated(
+            "second",
+            "news@acme.example.com",
+            T0,
+            "pruned",
+            UnsubscribeMethod::Get,
+        )];
+
+        assert_eq!(event_log(&attempts, &[])[0].follows, None);
+    }
+
+    #[test]
+    fn a_resumption_never_claims_to_follow_an_attempt_even_though_it_names_one() {
+        // A resumption carries `attempt_id`, but it escalates nothing -- it is
+        // the observation that the attempt did not work.
+        let resumptions = [resumption("r1", "a1", "news@acme.example.com", None, T0)];
+
+        assert_eq!(event_log(&[], &resumptions)[0].follows, None);
+    }
+
+    #[test]
+    fn a_resumption_takes_its_domain_from_the_address_it_is_about() {
+        let resumptions = [resumption("r1", "a1", "news@acme.example.com", None, T0)];
+
+        assert_eq!(event_log(&[], &resumptions)[0].sender_domain, "acme.example.com");
+    }
+
+    #[test]
+    fn a_resumption_about_an_address_with_no_domain_part_is_still_listed() {
+        let resumptions = [resumption("r1", "a1", "postmaster", None, T0)];
+
+        let entries = event_log(&[], &resumptions);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sender_domain, "");
+    }
+
+    #[test]
+    fn a_resumption_is_dated_by_when_it_was_observed_not_by_the_mail_that_proved_it() {
+        let resumptions = [resumption("r1", "a1", "news@acme.example.com", None, T0)];
+
+        let entry = &event_log(&[], &resumptions)[0];
+
+        assert_eq!(entry.at, T0);
+        assert_eq!(entry.at - DAY, resumption("r1", "a1", "x", None, T0).last_seen);
+    }
+
+    #[test]
+    fn an_empty_history_yields_an_empty_feed() {
+        assert!(event_log(&[], &[]).is_empty());
+    }
+
+    // -- what counts as a failure -------------------------------------------
+
+    #[test]
+    fn a_failed_attempt_and_a_resumption_are_both_failures_and_a_success_is_not() {
+        let attempts = [
+            attempt("ok", "one@acme.example.com", None, T0 - 3 * DAY, true),
+            attempt("bad", "two@acme.example.com", None, T0 - 2 * DAY, false),
+        ];
+        let resumptions = [resumption("r1", "ok", "one@acme.example.com", None, T0 - DAY)];
+
+        let entries = event_log(&attempts, &resumptions);
+        let failures: Vec<bool> = entries.iter().map(LogEntry::is_failure).collect();
+        let resumed: Vec<bool> = entries.iter().map(LogEntry::is_resumption).collect();
+
+        // Newest first: r1, bad, ok.
+        assert_eq!(failures, [true, true, false]);
+        assert_eq!(resumed, [true, false, false]);
+    }
+
+    // -- the filter ----------------------------------------------------------
+
+    fn feed() -> Vec<LogEntry> {
+        let attempts = [
+            attempt("ok", "one@acme.example.com", Some("news.acme"), T0 - 3 * DAY, true),
+            attempt("bad", "two@beta.example.org", None, T0 - 2 * DAY, false),
+        ];
+        let resumptions = [resumption("r1", "ok", "one@acme.example.com", Some("news.acme"), T0 - DAY)];
+        event_log(&attempts, &resumptions)
+    }
+
+    fn shown(entries: &[LogEntry], filter: &LogFilter) -> Vec<String> {
+        visible_log(entries, filter)
+            .into_iter()
+            .map(|index| log_ids(&entries[index..=index]).remove(0))
+            .collect()
+    }
+
+    #[test]
+    fn the_default_listing_shows_everything_in_feed_order() {
+        let entries = feed();
+
+        assert_eq!(shown(&entries, &LogFilter::default()), ["r1", "bad", "ok"]);
+    }
+
+    #[test]
+    fn the_failures_listing_keeps_what_did_not_work_and_drops_what_did() {
+        let entries = feed();
+        let filter = LogFilter {
+            kind: LogKind::Failures,
+            ..LogFilter::default()
+        };
+
+        assert_eq!(shown(&entries, &filter), ["r1", "bad"]);
+    }
+
+    #[test]
+    fn the_resumptions_listing_drops_failed_attempts_too() {
+        let entries = feed();
+        let filter = LogFilter {
+            kind: LogKind::Resumptions,
+            ..LogFilter::default()
+        };
+
+        assert_eq!(shown(&entries, &filter), ["r1"]);
+    }
+
+    #[test]
+    fn the_filter_cycle_visits_every_kind_and_comes_back_to_everything() {
+        let mut kind = LogKind::default();
+        let mut seen = Vec::new();
+        for _ in 0..LogKind::ALL.len() {
+            seen.push(kind);
+            kind = kind.next();
+        }
+
+        assert_eq!(kind, LogKind::All, "the cycle closes");
+        for expected in LogKind::ALL {
+            assert!(seen.contains(&expected), "{expected:?} is reachable");
+        }
+    }
+
+    #[test]
+    fn visible_log_returns_indices_into_the_feed_it_was_handed() {
+        let entries = feed();
+        let filter = LogFilter {
+            kind: LogKind::Resumptions,
+            ..LogFilter::default()
+        };
+
+        let visible = visible_log(&entries, &filter);
+
+        assert_eq!(visible, [0], "the resumption is the newest row");
+        assert!(entries[visible[0]].is_resumption());
+    }
+
+    #[test]
+    fn filtering_never_reorders_the_feed() {
+        let entries = feed();
+        let filter = LogFilter {
+            kind: LogKind::Failures,
+            ..LogFilter::default()
+        };
+
+        let visible = visible_log(&entries, &filter);
+
+        assert!(visible.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn since_keeps_an_event_landing_exactly_on_the_boundary() {
+        let entries = feed();
+        let filter = LogFilter {
+            since: Some(T0 - 2 * DAY),
+            ..LogFilter::default()
+        };
+
+        assert_eq!(shown(&entries, &filter), ["r1", "bad"]);
+    }
+
+    // -- search --------------------------------------------------------------
+
+    fn matches(needle: &str) -> Vec<String> {
+        let entries = feed();
+        let filter = LogFilter {
+            search: needle.to_string(),
+            ..LogFilter::default()
+        };
+        shown(&entries, &filter)
+    }
+
+    #[test]
+    fn a_blank_search_matches_every_event() {
+        assert_eq!(matches("").len(), 3);
+        assert_eq!(matches("   ").len(), 3, "a needle of spaces is still blank");
+    }
+
+    #[test]
+    fn a_search_matches_the_address_whatever_case_it_is_typed_in() {
+        assert_eq!(matches("TWO@BETA"), ["bad"]);
+        assert_eq!(matches("two@beta"), ["bad"]);
+    }
+
+    #[test]
+    fn a_search_matches_the_domain_and_the_list_id() {
+        assert_eq!(matches("beta.example.org"), ["bad"]);
+        assert_eq!(matches("news.acme"), ["r1", "ok"]);
+    }
+
+    #[test]
+    fn a_search_matches_the_method_and_the_recorded_detail_of_an_attempt() {
+        let entries = feed();
+        let method = LogFilter {
+            search: UnsubscribeMethod::OneClickPost.as_id().to_string(),
+            ..LogFilter::default()
+        };
+
+        assert_eq!(shown(&entries, &method), ["bad", "ok"], "resumptions have no method");
+        assert_eq!(matches("HTTP 200"), ["bad", "ok"]);
+    }
+
+    #[test]
+    fn a_resumption_is_found_by_the_word_the_feed_uses_for_it() {
+        assert_eq!(matches("resumed"), ["r1"]);
+    }
+
+    #[test]
+    fn a_log_search_that_matches_nothing_shows_nothing() {
+        assert!(matches("nobody@nowhere.invalid").is_empty());
+    }
+
+    #[test]
+    fn a_needle_is_trimmed_before_it_is_matched() {
+        assert_eq!(matches("  beta  "), ["bad"]);
+    }
+
+    #[test]
+    fn a_sender_with_no_list_id_is_never_matched_by_a_list_search() {
+        // "beta" is in two@beta's domain; the list needle must not leak.
+        assert!(matches("news.acme").iter().all(|id| id != "bad"));
+    }
+
+    #[test]
+    fn the_kind_and_the_needle_narrow_together_rather_than_one_replacing_the_other() {
+        let entries = feed();
+        let filter = LogFilter {
+            kind: LogKind::Failures,
+            search: "acme".to_string(),
+            ..LogFilter::default()
+        };
+
+        assert_eq!(shown(&entries, &filter), ["r1"], "the failed attempt is at beta");
+    }
+
+    // -- a log with real volume in it ---------------------------------------
+
+    #[test]
+    fn a_few_thousand_events_stay_in_order_and_filter_correctly() {
+        const N: i64 = 2_000;
+        let attempts: Vec<UnsubscribeAttempt> = (0..N)
+            .map(|i| {
+                attempt(
+                    &format!("a{i}"),
+                    &format!("s{i:04}@acme.example.com"),
+                    None,
+                    T0 + i,
+                    i % 2 == 0,
+                )
+            })
+            .collect();
+        let resumptions: Vec<Resumption> = (0..N)
+            .map(|i| {
+                resumption(
+                    &format!("r{i}"),
+                    &format!("a{i}"),
+                    &format!("s{i:04}@acme.example.com"),
+                    None,
+                    T0 + N + i,
+                )
+            })
+            .collect();
+
+        let entries = event_log(&attempts, &resumptions);
+
+        assert_eq!(entries.len(), 4_000);
+        assert!(
+            entries.windows(2).all(|pair| pair[0].at >= pair[1].at),
+            "newest first, all the way down"
+        );
+        // Half the attempts failed, and every resumption is a failure.
+        let failures = LogFilter {
+            kind: LogKind::Failures,
+            ..LogFilter::default()
+        };
+        assert_eq!(visible_log(&entries, &failures).len(), 1_000 + 2_000);
+        // The addresses are zero-padded, so exactly one sender matches.
+        let one = LogFilter {
+            search: "s0007@".to_string(),
+            ..LogFilter::default()
+        };
+        assert_eq!(visible_log(&entries, &one).len(), 2, "its attempt and its resumption");
+    }
+
 }

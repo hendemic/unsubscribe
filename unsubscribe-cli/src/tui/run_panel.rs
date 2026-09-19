@@ -569,4 +569,60 @@ mod tests {
 
         assert_eq!(panel.selected(), RunChoice::FromLastScan);
     }
+
+    #[test]
+    #[ignore = "the panel answers the page and jump keys but advertises only the arrows"]
+    fn every_movement_the_panel_answers_is_one_it_advertises() {
+        let advertised = panel(with_cache()).actions();
+
+        for action in keys::LIST_MOVEMENT {
+            let mut moved = panel(with_cache());
+            moved.on_action(action);
+            if moved.cursor != 0 {
+                assert!(
+                    advertised.contains(&action),
+                    "{action:?} moves the cursor but is not in the footer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_page_and_jump_keys_move_the_cursor_here_as_they_do_in_every_list() {
+        for action in [Action::PageDown, Action::JumpDown, Action::Last] {
+            let mut panel = panel(with_cache());
+            panel.on_action(action);
+            assert_eq!(panel.selected(), RunChoice::FromLastScan, "{action:?}");
+        }
+        for action in [Action::PageUp, Action::JumpUp, Action::First] {
+            let mut panel = panel(with_cache());
+            panel.on_action(Action::Last);
+            panel.on_action(action);
+            assert_eq!(panel.selected(), RunChoice::ScanAndUnsubscribe, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn space_does_not_start_a_run_by_accident() {
+        // Space is the app's "tick the row" key; the Run panel has nothing to
+        // tick, and starting a pipeline is Enter's job alone.
+        let mut panel = panel(with_cache());
+
+        assert_eq!(nav_name(&panel.on_action(Action::Toggle)), "stay");
+    }
+
+    #[test]
+    fn refreshed_stats_replace_what_the_panel_shows_without_moving_the_cursor() {
+        // What the shell does after a run: the numbers are recomputed and the
+        // user is left looking at the same action.
+        let mut panel = panel(RunStats::default());
+        panel.on_action(Action::MoveDown);
+        assert!(!panel.selected().is_available(&panel.stats));
+
+        panel.stats = with_cache();
+
+        assert_eq!(panel.selected(), RunChoice::FromLastScan);
+        assert!(panel.selected().is_available(&panel.stats));
+        assert_eq!(nav_name(&panel.on_action(Action::Activate)), "review");
+    }
 }

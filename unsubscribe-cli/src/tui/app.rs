@@ -1620,4 +1620,787 @@ mod tests {
 
         assert_eq!(lines.last().map(String::as_str), Some("0 emails in total."));
     }
+
+
+    // -----------------------------------------------------------------------
+    // The narrow-terminal rule
+    // -----------------------------------------------------------------------
+    //
+    // The decision itself lives inline in `Shell::render_columns`
+    // (`if area.width < NARROW`), so it cannot be exercised without a frame.
+    // What can be pinned is that the threshold is consistent with the split it
+    // guards: above it, both columns must still be worth drawing.
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_narrow_threshold_leaves_room_for_both_columns_when_it_is_cleared() {
+        const MIN_PANEL: u16 = 20; // the Min() the horizontal split uses
+
+        assert!(
+            NARROW >= NAV_WIDTH + MIN_PANEL,
+            "at {NARROW} columns the panel would be squeezed below {MIN_PANEL}"
+        );
+    }
+
+    // =======================================================================
+    // The shell's navigation state machine
+    // =======================================================================
+    //
+    // `Shell::on_key` cannot be driven from a test: it takes `&mut Tui`
+    // (= `Terminal<CrosstermBackend<Stdout>>`) purely so it can forward two
+    // settings effects, and `Terminal::new` asks the backend for a size, which
+    // fails when the test harness's stdout is a pipe. Everything below the
+    // preamble is reachable, so these tests drive `dispatch_action` (which
+    // picks the focus and hands it the action) and `apply` (the pure half of
+    // carrying the answer out) -- between them, every transition the user can
+    // make with a key that is not `Ctrl-C` or `?`.
+
+    mod state_machine {
+        use super::*;
+        use std::sync::OnceLock;
+        use unsubscribe_core::{AuthType, ProviderType};
+
+        /// One temporary home for every store the shell tests open, so no test
+        /// ever reads the real config dir, data dir or databases.
+        fn sandbox() -> &'static tempfile::TempDir {
+            static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+            DIR.get_or_init(|| {
+                let dir = tempfile::tempdir().expect("a temp dir");
+                // `FileDataStore` resolves its directory from the environment
+                // at construction, and offers no other way to point it
+                // somewhere else.
+                unsafe { std::env::set_var("XDG_DATA_HOME", dir.path()) };
+                dir
+            })
+        }
+
+        fn account() -> AccountConfig {
+            AccountConfig {
+                account_id: "user@example.com".to_string(),
+                provider_type: ProviderType::Imap,
+                host: Some("imap.example.com".to_string()),
+                port: Some(993),
+                username: "user@example.com".to_string(),
+                auth_type: AuthType::Password,
+                scan_folders: vec!["INBOX".to_string()],
+                archive_folder: "Unsubscribed".to_string(),
+                smtp_host: None,
+                smtp_port: None,
+            }
+        }
+
+        /// A shell over empty stores in a sandbox, with no panel built yet.
+        pub(super) fn shell() -> Shell {
+            let dir = sandbox().path();
+            let stamp = format!("{:?}", std::thread::current().id());
+            let ctx = Context {
+                config_dir: dir.to_path_buf(),
+                account: account(),
+                credential: Credential::Password("secret".to_string()),
+                preferences: Preferences::default(),
+                data: FileDataStore::new(),
+                cache: SqliteCacheStore::open(dir.join(format!("cache-{stamp}.db")))
+                    .expect("a cache in the sandbox"),
+                history: SqliteHistoryStore::open(dir.join(format!("history-{stamp}.db"))).ok(),
+            };
+            Shell::new(ctx)
+        }
+
+        /// Press one key's worth of action and carry out the pure half of the
+        /// answer, the way the event loop does.
+        pub(super) fn press(shell: &mut Shell, action: Action) -> Option<&'static str> {
+            let nav = shell.dispatch_action(action);
+            let name = nav_name(&nav);
+            shell.apply(nav).map(|_| name)
+        }
+
+        pub(super) fn section(shell: &Shell) -> Section {
+            shell.nav.section()
+        }
+
+        /// Walk the nav highlight onto `target` and move focus into it.
+        pub(super) fn open(shell: &mut Shell, target: Section) {
+            while section(shell) != target {
+                press(shell, Action::MoveDown);
+            }
+            press(shell, Action::Activate);
+            assert!(!shell.nav.nav_has_focus(), "{target:?} should take focus");
+        }
+
+        /// The sections with a working area to focus.
+        pub(super) fn panels() -> impl Iterator<Item = Section> {
+            Section::ALL.into_iter().filter(|s| s.has_panel())
+        }
+
+        // -- where focus starts ---------------------------------------------
+
+        #[test]
+        fn the_app_opens_on_run_with_the_nav_in_focus_and_nothing_stacked() {
+            let shell = shell();
+
+            assert_eq!(section(&shell), Section::Run);
+            assert!(shell.nav.nav_has_focus());
+            assert_eq!(shell.depth(), 0);
+            assert!(!shell.quit);
+        }
+
+        #[test]
+        fn walking_the_nav_previews_a_section_without_giving_it_focus() {
+            let mut shell = shell();
+
+            press(&mut shell, Action::MoveDown);
+
+            assert_eq!(section(&shell), Section::List);
+            assert!(shell.nav.nav_has_focus(), "the preview is read-only");
+        }
+
+        #[test]
+        fn enter_and_right_both_move_focus_into_every_section_that_has_a_panel() {
+            for target in panels() {
+                for enter in [Action::Activate, Action::FocusIn] {
+                    let mut shell = shell();
+                    while section(&shell) != target {
+                        press(&mut shell, Action::MoveDown);
+                    }
+                    press(&mut shell, enter);
+
+                    assert!(!shell.nav.nav_has_focus(), "{target:?} via {enter:?}");
+                    assert_eq!(section(&shell), target);
+                }
+            }
+        }
+
+        // -- Esc climbs exactly one level, and never past the nav ------------
+
+        #[test]
+        fn esc_at_a_panels_top_level_returns_focus_to_the_nav() {
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+
+                press(&mut shell, Action::Back);
+
+                assert!(shell.nav.nav_has_focus(), "{target:?}");
+                assert_eq!(section(&shell), target, "the highlight stays put");
+                assert!(!shell.quit);
+            }
+        }
+
+        #[test]
+        fn left_at_a_panels_top_level_is_the_same_one_level_step_as_esc() {
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+
+                press(&mut shell, Action::FocusOut);
+
+                assert!(shell.nav.nav_has_focus(), "{target:?}");
+            }
+        }
+
+        #[test]
+        fn esc_climbs_one_level_per_press_from_the_bottom_of_a_stack() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            shell.apply(Nav::Push(selection_view()));
+            assert_eq!(shell.depth(), 2);
+
+            press(&mut shell, Action::Back);
+            assert_eq!(shell.depth(), 1, "one sub-view closed, not both");
+            assert!(!shell.nav.nav_has_focus());
+
+            press(&mut shell, Action::Back);
+            assert_eq!(shell.depth(), 0);
+            assert!(!shell.nav.nav_has_focus(), "the panel's top level");
+
+            press(&mut shell, Action::Back);
+            assert!(shell.nav.nav_has_focus());
+        }
+
+        #[test]
+        fn esc_at_the_nav_does_nothing_at_all_however_often_it_is_pressed() {
+            let mut shell = shell();
+
+            for _ in 0..20 {
+                press(&mut shell, Action::Back);
+            }
+
+            assert!(!shell.quit, "Esc is never a way out of the app");
+            assert!(shell.nav.nav_has_focus());
+            assert_eq!(section(&shell), Section::Run);
+        }
+
+        #[test]
+        fn esc_at_the_nav_leaves_a_stack_that_is_still_running_alone() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::Back); // back to the panel
+            press(&mut shell, Action::Back); // back to the nav
+
+            press(&mut shell, Action::Back);
+
+            assert!(shell.nav.nav_has_focus());
+            assert!(!shell.quit);
+        }
+
+        // -- q, and only at the nav -----------------------------------------
+
+        #[test]
+        fn q_quits_from_the_nav() {
+            let mut shell = shell();
+
+            press(&mut shell, Action::Quit);
+
+            assert!(shell.quit);
+        }
+
+        #[test]
+        fn q_does_nothing_at_all_inside_any_panel() {
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+
+                press(&mut shell, Action::Quit);
+
+                assert!(!shell.quit, "q quit from {target:?}");
+                assert!(!shell.nav.nav_has_focus(), "q acted as back in {target:?}");
+                assert_eq!(shell.depth(), 0, "q opened or closed something");
+            }
+        }
+
+        #[test]
+        fn q_does_nothing_inside_a_sub_view_either() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+
+            press(&mut shell, Action::Quit);
+
+            assert!(!shell.quit);
+            assert_eq!(shell.depth(), 1, "still in the selection");
+        }
+
+        #[test]
+        fn the_quit_section_is_the_one_place_enter_leaves_the_app() {
+            let mut shell = shell();
+            while section(&shell) != Section::Quit {
+                press(&mut shell, Action::MoveDown);
+            }
+
+            press(&mut shell, Action::Activate);
+
+            assert!(shell.quit);
+        }
+
+        // -- the sub-view stack belongs to a section ------------------------
+
+        #[test]
+        fn a_pushed_sub_view_highlights_and_focuses_the_section_it_belongs_to() {
+            let mut shell = shell();
+
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            assert_eq!(section(&shell), Section::List, "a timeline is a List view");
+            assert!(!shell.nav.nav_has_focus());
+            assert_eq!(shell.depth(), 1);
+        }
+
+        #[test]
+        #[ignore = "no key reaches the nav without unwinding the sub-view -- see the report"]
+        fn runs_sub_view_stack_survives_walking_the_nav_away_and_back() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+
+            // Esc is the only key that leaves the working area, and inside a
+            // sub-view it closes that sub-view first -- so this sequence
+            // throws the selection away instead of parking it.
+            press(&mut shell, Action::Back); // meant: to the panel
+            press(&mut shell, Action::Back); // meant: to the nav
+            press(&mut shell, Action::MoveDown); // preview the list
+            press(&mut shell, Action::Activate); // and look at it
+            press(&mut shell, Action::Back);
+            press(&mut shell, Action::MoveUp); // back to Run
+            press(&mut shell, Action::Activate);
+
+            assert_eq!(shell.depth(), 1, "the selection is still open");
+            assert_eq!(
+                shell.active_sub_view().map(SubView::title).as_deref(),
+                Some("Select senders"),
+                "and it is the same one"
+            );
+        }
+
+        #[test]
+        fn esc_inside_a_sub_view_closes_it_rather_than_parking_it_at_the_nav() {
+            // What the key sequence above actually does today. Pinned so the
+            // shape of the gap is recorded rather than only its absence.
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+
+            press(&mut shell, Action::Back);
+
+            assert_eq!(shell.depth(), 0, "the selection was thrown away");
+            assert!(!shell.nav.nav_has_focus(), "and focus is still in Run");
+        }
+
+        #[test]
+        #[ignore = "a running scan answers Esc with a cancel question, so the nav is unreachable -- see the report"]
+        fn the_nav_is_reachable_while_a_scan_is_running() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (_tx, rx) = mpsc::channel();
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+
+            // Esc asks whether to cancel; answering no leaves focus where it
+            // was, and there is no other key that reaches the nav.
+            press(&mut shell, Action::Back);
+
+            assert!(shell.nav.nav_has_focus(), "the scan should keep running");
+            assert_eq!(shell.depth(), 0, "and stay on Run's stack");
+        }
+
+        #[test]
+        fn a_stack_belonging_to_another_section_is_out_of_reach_of_the_keys() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            // Parked without a key: Esc would close it (see the ignored test
+            // above), and this is the state the shell's own transitions --
+            // a worker finishing while the user is elsewhere -- produce.
+            shell.nav.focus_nav();
+            open(&mut shell, Section::Logs);
+
+            assert_eq!(shell.depth(), 0, "the Logs panel has no sub-view");
+            assert!(
+                shell.active_sub_view().is_none(),
+                "Run's selection must not answer keys while Logs has focus"
+            );
+            // And Esc here backs out of Logs, not out of Run's selection.
+            press(&mut shell, Action::Back);
+            assert!(shell.nav.nav_has_focus());
+            assert_eq!(shell.stack.len(), 1, "Run's stack is untouched");
+        }
+
+        #[test]
+        fn opening_a_view_under_another_section_replaces_the_stack_rather_than_interleaving_it() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            shell.apply(Nav::Push(selection_view()));
+
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            assert_eq!(shell.stack_section, Section::List);
+            assert_eq!(shell.depth(), 1, "only the timeline is left");
+        }
+
+        // -- text fields ----------------------------------------------------
+
+        #[test]
+        fn the_nav_never_reports_a_text_field_even_while_a_panel_is_searching() {
+            let mut shell = shell();
+            open(&mut shell, Section::Logs);
+            press(&mut shell, Action::Search);
+            assert!(shell.captures_text());
+
+            press(&mut shell, Action::Back); // Esc leaves the field
+            press(&mut shell, Action::Back); // and then the panel
+
+            assert!(shell.nav.nav_has_focus());
+            assert!(!shell.captures_text(), "the nav takes no free text");
+        }
+
+        #[test]
+        fn a_sub_view_never_reports_a_text_field_even_over_a_searching_panel() {
+            let mut shell = shell();
+            open(&mut shell, Section::List);
+            press(&mut shell, Action::Search);
+            assert!(shell.captures_text());
+
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            assert!(
+                !shell.captures_text(),
+                "the timeline on top has no field of its own"
+            );
+        }
+
+        #[test]
+        fn a_search_field_types_the_letters_that_would_otherwise_act() {
+            for target in [Section::List, Section::Logs] {
+                let mut shell = shell();
+                open(&mut shell, target);
+                press(&mut shell, Action::Search);
+
+                for c in ['q', 'j', 'k', 'g', '?', '/', 's'] {
+                    let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                    let action = keys::action(key, shell.captures_text()).expect("a key");
+                    assert_eq!(action, Action::Type(c), "{c} in {target:?}");
+                    press(&mut shell, action);
+                }
+
+                assert!(!shell.quit, "a typed q quit the app in {target:?}");
+                assert!(shell.captures_text(), "the field closed in {target:?}");
+                assert_eq!(shell.depth(), 0);
+            }
+        }
+
+        // -- what the footer and the overlay advertise ----------------------
+
+        #[test]
+        fn the_nav_is_the_only_focus_that_advertises_quit() {
+            assert!(shell().focus_actions().contains(&Action::Quit));
+
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+
+                assert!(
+                    !shell.focus_actions().contains(&Action::Quit),
+                    "{target:?} advertises q"
+                );
+            }
+        }
+
+        #[test]
+        fn every_focus_advertises_a_way_to_see_the_keys_and_a_way_back() {
+            assert!(shell().focus_actions().contains(&Action::Help));
+
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+                let actions = shell.focus_actions();
+
+                assert!(actions.contains(&Action::Help), "{target:?} hides ?");
+                assert!(actions.contains(&Action::Back), "{target:?} hides Esc");
+                assert!(!keys::hints(&actions).trim().is_empty(), "{target:?}");
+            }
+        }
+
+        #[test]
+        fn the_working_area_is_titled_by_the_sub_view_on_top_and_otherwise_by_the_section() {
+            let mut shell = shell();
+            open(&mut shell, Section::List);
+            assert_eq!(shell.panel_title(), "Unsubscribe List");
+
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            assert_eq!(shell.panel_title(), "Sender timeline");
+        }
+
+        // -- questions are about what is on screen --------------------------
+
+        #[test]
+        fn closing_a_sub_view_dismisses_the_question_that_was_about_it() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            shell.dialog = Some(Dialog::confirm("Confirm run", ["anything".to_string()]));
+            shell.pending = Some(Pending::CancelRun);
+
+            press(&mut shell, Action::Back);
+
+            assert!(shell.dialog.is_none(), "the question outlived its subject");
+            assert!(shell.pending.is_none());
+        }
+
+        #[test]
+        fn leaving_a_panel_for_the_nav_dismisses_its_question_too() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.dialog = Some(Dialog::confirm("Use the cached scan?", ["x".to_string()]));
+
+            press(&mut shell, Action::Back);
+
+            assert!(shell.dialog.is_none());
+            assert!(shell.pending.is_none());
+        }
+    }
+
+
+    // =======================================================================
+    // The key contract, run over every focus the app has
+    // =======================================================================
+    //
+    // One table, every panel and every sub-view: the reserved keys must mean
+    // the same thing wherever they are pressed. A per-panel test can only say
+    // that one screen got it right; this says no screen got it wrong.
+
+    mod key_contract {
+        use super::state_machine::{open, shell};
+        use super::*;
+
+        /// Every place a key can land: each section's panel, and each
+        /// sub-view, stacked on the section it belongs to.
+        fn focuses() -> Vec<(&'static str, Box<dyn Fn() -> Shell>)> {
+            let mut places: Vec<(&'static str, Box<dyn Fn() -> Shell>)> = Vec::new();
+            for target in Section::ALL.into_iter().filter(|s| s.has_panel()) {
+                places.push((
+                    target.label(),
+                    Box::new(move || {
+                        let mut shell = shell();
+                        open(&mut shell, target);
+                        shell
+                    }),
+                ));
+            }
+            places.push((
+                "Select senders",
+                Box::new(|| {
+                    let mut shell = shell();
+                    open(&mut shell, Section::Run);
+                    shell.apply(Nav::Push(selection_view()));
+                    shell
+                }),
+            ));
+            places.push((
+                "Sender timeline",
+                Box::new(|| {
+                    let mut shell = shell();
+                    open(&mut shell, Section::List);
+                    shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                        DetailScreen::new(timeline_view()),
+                    ))));
+                    shell
+                }),
+            ));
+            places.push((
+                "Scan",
+                Box::new(|| {
+                    let mut shell = shell();
+                    open(&mut shell, Section::Run);
+                    let (tx, rx) = mpsc::channel();
+                    // Held so the worker channel never reports "disconnected".
+                    std::mem::forget(tx);
+                    shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                        ScanShared::new(),
+                        rx,
+                    )))));
+                    shell
+                }),
+            ));
+            places.push((
+                "Run",
+                Box::new(|| {
+                    let mut shell = shell();
+                    open(&mut shell, Section::Run);
+                    let (tx, rx) = mpsc::channel();
+                    std::mem::forget(tx);
+                    shell.apply(Nav::Push(SubView::Running(Box::new(RunScreen::new(
+                        RunShared::new(),
+                        rx,
+                        PlanCounts::default(),
+                        false,
+                    )))));
+                    shell
+                }),
+            ));
+            places
+        }
+
+        /// The keys whose meaning is fixed for the whole app.
+        const MOVEMENT: [Action; 8] = keys::LIST_MOVEMENT;
+
+        #[test]
+        fn q_never_quits_and_never_goes_back_outside_the_nav() {
+            for (name, build) in focuses() {
+                let mut shell = build();
+                let depth = shell.depth();
+                let section = shell.nav.section();
+
+                let nav = shell.dispatch_action(Action::Quit);
+                shell.apply(nav);
+
+                assert!(!shell.quit, "q quit from {name}");
+                assert!(!shell.nav.nav_has_focus(), "q acted as back in {name}");
+                assert_eq!(shell.depth(), depth, "q changed the stack in {name}");
+                assert_eq!(shell.nav.section(), section, "q moved the nav in {name}");
+            }
+        }
+
+        #[test]
+        fn esc_never_quits_wherever_it_is_pressed() {
+            for (name, build) in focuses() {
+                let mut shell = build();
+
+                for _ in 0..5 {
+                    let nav = shell.dispatch_action(Action::Back);
+                    shell.apply(nav);
+                    assert!(!shell.quit, "Esc quit from {name}");
+                }
+            }
+        }
+
+        #[test]
+        fn movement_never_quits_never_opens_anything_and_never_changes_section() {
+            for (name, build) in focuses() {
+                for action in MOVEMENT {
+                    let mut shell = build();
+                    let depth = shell.depth();
+                    let section = shell.nav.section();
+
+                    let nav = shell.dispatch_action(action);
+                    let effect = shell.apply(nav);
+
+                    assert!(effect.is_none(), "{action:?} asked for an effect in {name}");
+                    assert!(!shell.quit, "{action:?} quit from {name}");
+                    assert!(!shell.nav.nav_has_focus(), "{action:?} left {name}");
+                    assert_eq!(shell.depth(), depth, "{action:?} changed the stack in {name}");
+                    assert_eq!(shell.nav.section(), section, "{action:?} in {name}");
+                }
+            }
+        }
+
+        #[test]
+        fn space_and_search_never_quit_and_never_leave_the_working_area() {
+            for (name, build) in focuses() {
+                for action in [Action::Toggle, Action::Search] {
+                    let mut shell = build();
+                    let depth = shell.depth();
+
+                    let nav = shell.dispatch_action(action);
+                    shell.apply(nav);
+
+                    assert!(!shell.quit, "{action:?} quit from {name}");
+                    assert!(!shell.nav.nav_has_focus(), "{action:?} left {name}");
+                    assert_eq!(shell.depth(), depth, "{action:?} in {name}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_help_key_is_the_shells_and_no_panel_acts_on_it() {
+            // The shell answers `?` before the key map reaches a panel; this
+            // is what keeps that safe if the interception ever moves.
+            for (name, build) in focuses() {
+                let mut shell = build();
+                let depth = shell.depth();
+
+                let nav = shell.dispatch_action(Action::Help);
+                let effect = shell.apply(nav);
+
+                assert!(effect.is_none(), "{name} acted on ?");
+                assert!(!shell.quit, "{name}");
+                assert_eq!(shell.depth(), depth, "{name}");
+                assert!(!shell.nav.nav_has_focus(), "{name}");
+            }
+        }
+
+        #[test]
+        fn the_help_overlay_leaves_the_state_underneath_exactly_as_it_was() {
+            for (name, build) in focuses() {
+                let mut shell = build();
+                let before = (shell.depth(), shell.nav.section(), shell.panel_title());
+                let actions = shell.focus_actions();
+
+                shell.nav.help = true;
+
+                assert_eq!(
+                    (shell.depth(), shell.nav.section(), shell.panel_title()),
+                    before,
+                    "{name}"
+                );
+                assert_eq!(shell.focus_actions(), actions, "{name}");
+                assert!(!shell.nav.nav_has_focus(), "{name}");
+            }
+        }
+
+        #[test]
+        fn the_footer_and_the_overlay_say_the_same_thing_about_every_focus() {
+            for (name, build) in focuses() {
+                let shell = build();
+                let actions = shell.focus_actions();
+                let footer = keys::hints(&actions);
+                let rows = keys::help_rows(&actions);
+
+                assert!(!rows.is_empty(), "{name} lists no keys");
+                for (key, what) in rows {
+                    assert!(footer.contains(key), "{name}: {key} missing from {footer}");
+                    assert!(footer.contains(what), "{name}: {what} missing from {footer}");
+                }
+            }
+        }
+
+        #[test]
+        fn no_focus_advertises_a_key_that_has_no_wording() {
+            for (name, build) in focuses() {
+                let shell = build();
+
+                for action in shell.focus_actions() {
+                    let describable = matches!(
+                        action,
+                        Action::FocusIn | Action::FocusOut | Action::Type(_) | Action::Erase
+                    ) || keys::describe(action).is_some();
+                    assert!(describable, "{name} advertises {action:?} with no wording");
+                }
+            }
+        }
+
+        #[test]
+        fn every_panel_letter_a_focus_advertises_is_one_of_the_apps_letters() {
+            for (name, build) in focuses() {
+                let shell = build();
+
+                for action in shell.focus_actions() {
+                    if let Action::Mnemonic(c) = action {
+                        assert!(
+                            keys::MNEMONICS
+                                .iter()
+                                .any(|(letter, _)| letter.chars().next() == Some(c)),
+                            "{name} advertises an off-budget letter {c}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_letter_a_focus_does_not_offer_is_inert_rather_than_borrowed() {
+            // Every letter in the budget, pressed in every focus: one that a
+            // panel does not offer must do nothing at all, not something else.
+            for (name, build) in focuses() {
+                let offered: Vec<char> = build()
+                    .focus_actions()
+                    .into_iter()
+                    .filter_map(|action| match action {
+                        Action::Mnemonic(c) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+
+                for (letter, _) in keys::MNEMONICS {
+                    let c = letter.chars().next().expect("a letter");
+                    if offered.contains(&c) {
+                        continue;
+                    }
+                    let mut shell = build();
+                    let depth = shell.depth();
+
+                    let nav = shell.dispatch_action(Action::Mnemonic(c));
+                    let effect = shell.apply(nav);
+
+                    assert!(effect.is_none(), "{name} acted on an unoffered {c}");
+                    assert!(!shell.quit, "{name}: {c}");
+                    assert_eq!(shell.depth(), depth, "{name}: {c}");
+                    assert!(!shell.nav.nav_has_focus(), "{name}: {c}");
+                }
+            }
+        }
+    }
+
 }
