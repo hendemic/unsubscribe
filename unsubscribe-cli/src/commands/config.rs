@@ -26,16 +26,16 @@ pub fn cmd_config(config_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
     let preferences = store.read_preferences()?;
 
-    let io_ops = ConfigIo {
-        config_dir: config_dir.to_path_buf(),
-        account: RefCell::new(account.clone()),
-    };
+    let io_ops = ConfigIo::new(config_dir, &account);
 
     run(&account, &preferences, &io_ops)
 }
 
 /// The settings screen's side effects, against the real config directory.
-struct ConfigIo {
+///
+/// Public to the crate so the app shell can open the same screen with the same
+/// side effects rather than a second, subtly different wiring.
+pub(crate) struct ConfigIo {
     config_dir: PathBuf,
     /// The account as last persisted. Folder listing authenticates as this
     /// account, not as whatever the user is part-way through typing.
@@ -43,6 +43,13 @@ struct ConfigIo {
 }
 
 impl ConfigIo {
+    pub(crate) fn new(config_dir: &Path, account: &AccountConfig) -> Self {
+        Self {
+            config_dir: config_dir.to_path_buf(),
+            account: RefCell::new(account.clone()),
+        }
+    }
+
     fn store(&self) -> TomlConfigStore {
         TomlConfigStore::new(&self.config_dir)
     }
