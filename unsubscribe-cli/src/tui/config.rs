@@ -6,12 +6,13 @@
 //! listing folders, re-authenticating) to a [`SettingsIo`] implementation.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use unsubscribe_core::{AccountConfig, Preferences};
 
+use super::keys::{self, Action as Key};
 use super::{suspended, TerminalGuard};
 
 // ---------------------------------------------------------------------------
@@ -346,18 +347,67 @@ impl SettingsApp {
     }
 
     /// Handle one key press and report any side effect the caller must run.
+    ///
+    /// Raw keys come in and are mapped once, here, so the standalone
+    /// `unsubscribe config` screen and the Settings panel inside the app
+    /// answer to exactly the same bindings.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        match &self.mode {
-            Mode::Browse => self.on_key_browse(key),
-            Mode::Editing { .. } => self.on_key_editing(key),
-            Mode::Folders(_) => self.on_key_folders(key),
-            Mode::ConfirmQuit => self.on_key_confirm_quit(key),
+        match keys::action(key, self.captures_text()) {
+            Some(action) => self.on_action(action),
+            None => Action::None,
         }
     }
 
-    fn on_key_browse(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+    /// Whether a field is taking free text right now.
+    #[must_use]
+    pub fn captures_text(&self) -> bool {
+        match &self.mode {
+            Mode::Editing { .. } => true,
+            Mode::Folders(picker) => picker.free_text.is_some(),
+            _ => false,
+        }
+    }
+
+    pub fn on_action(&mut self, action: Key) -> Action {
+        match &self.mode {
+            Mode::Browse => self.on_action_browse(action),
+            Mode::Editing { .. } => self.on_action_editing(action),
+            Mode::Folders(_) => self.on_action_folders(action),
+            Mode::ConfirmQuit => self.on_action_confirm_quit(action),
+        }
+    }
+
+    /// The actions this screen answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Key> {
+        match &self.mode {
+            Mode::Editing { .. } => vec![Key::Activate, Key::Back],
+            Mode::Folders(picker) if picker.free_text.is_some() => {
+                vec![Key::Activate, Key::Back]
+            }
+            Mode::Folders(_) => keys::list_actions(&[Key::Toggle, Key::Activate]),
+            Mode::ConfirmQuit => vec![Key::Mnemonic('y'), Key::Mnemonic('n')],
+            Mode::Browse => keys::list_actions(&[
+                Key::Activate,
+                Key::Mnemonic('w'),
+                Key::Mnemonic('x'),
+            ]),
+        }
+    }
+
+    fn on_action_browse(&mut self, action: Key) -> Action {
+        if keys::is_movement(action) {
+            // The rows are not a flat list -- headers are skipped -- so the
+            // screen keeps its own stepping rather than using the helper's
+            // index arithmetic.
+            match action {
+                Key::MoveUp | Key::PageUp | Key::JumpUp | Key::First => self.move_up(),
+                _ => self.move_down(),
+            }
+            return Action::None;
+        }
+        match action {
+            Key::Back => {
                 if self.is_dirty() {
                     self.mode = Mode::ConfirmQuit;
                     Action::None
@@ -365,23 +415,15 @@ impl SettingsApp {
                     Action::Quit
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                Action::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                Action::None
-            }
-            KeyCode::Char('s') => Action::Save,
-            KeyCode::Char('r') => {
+            Key::Mnemonic('w') => Action::Save,
+            Key::Mnemonic('x') => {
                 if self.is_dirty() {
                     self.revert();
                     self.set_status(StatusKind::Info, "Reverted to the saved settings.");
                 }
                 Action::None
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
+            Key::Activate | Key::Toggle => self.activate(),
             _ => Action::None,
         }
     }
@@ -411,19 +453,19 @@ impl SettingsApp {
         }
     }
 
-    fn on_key_editing(&mut self, key: KeyEvent) -> Action {
+    fn on_action_editing(&mut self, action: Key) -> Action {
         let Mode::Editing { field, buffer, .. } = &mut self.mode else {
             return Action::None;
         };
         let field = *field;
 
-        match key.code {
-            KeyCode::Esc => self.mode = Mode::Browse,
-            KeyCode::Char(c) => buffer.push(c),
-            KeyCode::Backspace => {
+        match action {
+            Key::Back => self.mode = Mode::Browse,
+            Key::Type(c) => buffer.push(c),
+            Key::Erase => {
                 buffer.pop();
             }
-            KeyCode::Enter => {
+            Key::Activate => {
                 // Validate against a copy so a rejected value never lands in
                 // the draft and never counts as an unsaved change.
                 let candidate = buffer.clone();
@@ -446,31 +488,31 @@ impl SettingsApp {
         Action::None
     }
 
-    fn on_key_folders(&mut self, key: KeyEvent) -> Action {
+    fn on_action_folders(&mut self, action: Key) -> Action {
         let Mode::Folders(picker) = &mut self.mode else {
             return Action::None;
         };
 
         // Free-text mode is a single-line editor; the list mode is a checklist.
         if let Some(text) = &mut picker.free_text {
-            match key.code {
-                KeyCode::Esc => self.mode = Mode::Browse,
-                KeyCode::Char(c) => text.push(c),
-                KeyCode::Backspace => {
+            match action {
+                Key::Back => self.mode = Mode::Browse,
+                Key::Type(c) => text.push(c),
+                Key::Erase => {
                     text.pop();
                 }
-                KeyCode::Enter => self.commit_folders(),
+                Key::Activate => self.commit_folders(),
                 _ => {}
             }
             return Action::None;
         }
 
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Browse,
-            KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
-            KeyCode::Char(' ') => picker.toggle(),
-            KeyCode::Enter => self.commit_folders(),
+        match action {
+            Key::Back => self.mode = Mode::Browse,
+            Key::MoveUp | Key::PageUp | Key::JumpUp | Key::First => picker.move_up(),
+            Key::MoveDown | Key::PageDown | Key::JumpDown | Key::Last => picker.move_down(),
+            Key::Toggle => picker.toggle(),
+            Key::Activate => self.commit_folders(),
             _ => {}
         }
         Action::None
@@ -491,9 +533,10 @@ impl SettingsApp {
         self.mode = Mode::Browse;
     }
 
-    fn on_key_confirm_quit(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Action::Quit,
+    fn on_action_confirm_quit(&mut self, action: Key) -> Action {
+        // The same answer keys as every other confirmation in the app.
+        match action {
+            Key::Mnemonic('y') | Key::Activate => Action::Quit,
             _ => {
                 self.mode = Mode::Browse;
                 Action::None
@@ -633,7 +676,7 @@ fn draw(f: &mut Frame, app: &mut SettingsApp) {
     render(f, chunks[1], app);
 
     f.render_widget(
-        Paragraph::new(hints(app)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(keys::hints(&app.actions())).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }
@@ -653,27 +696,6 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &mut SettingsApp) {
     }
 
     draw_status(f, chunks[1], app);
-}
-
-/// Whether the screen is currently taking free text, in which case every
-/// printable key belongs to it and none to the shell's global shortcuts.
-pub(crate) fn is_editing(app: &SettingsApp) -> bool {
-    match &app.mode {
-        Mode::Editing { .. } => true,
-        Mode::Folders(picker) => picker.free_text.is_some(),
-        Mode::Browse | Mode::ConfirmQuit => false,
-    }
-}
-
-/// The key hints for whatever the screen is currently doing.
-pub(crate) fn hints(app: &SettingsApp) -> &'static str {
-    match &app.mode {
-        Mode::Browse => " Enter: edit | s: save | r: revert | j/k: move | q: quit",
-        Mode::Editing { .. } => " Enter: accept | Esc: cancel",
-        Mode::Folders(picker) if picker.free_text.is_some() => " Enter: accept | Esc: cancel",
-        Mode::Folders(_) => " Space: toggle | Enter: accept | j/k: move | Esc: cancel",
-        Mode::ConfirmQuit => " y: discard changes and quit | any other key: keep editing",
-    }
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &mut SettingsApp) {
@@ -858,7 +880,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::cell::RefCell;
     use unsubscribe_core::{AuthType, ProviderType};
 
@@ -1371,7 +1393,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::Host, "imap.elsewhere.example.com");
         edit(&mut app, Field::MinEmails, "1");
-        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('x'));
 
         assert!(!app.is_dirty());
         assert_eq!(app.draft.host, "imap.example.com");
@@ -1382,16 +1404,16 @@ mod tests {
     #[test]
     fn revert_on_a_clean_screen_says_nothing() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.status(), None, "there was nothing to revert");
     }
 
     // ─── saving ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn s_asks_the_event_loop_to_save() {
+    fn w_asks_the_event_loop_to_save() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::Save);
+        assert_eq!(press(&mut app, KeyCode::Char('w')), Action::Save);
     }
 
     #[test]
@@ -1459,35 +1481,36 @@ mod tests {
     // ─── quitting ───────────────────────────────────────────────────────────
 
     #[test]
-    fn quitting_a_clean_screen_needs_no_confirmation() {
+    fn leaving_a_clean_screen_needs_no_confirmation() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
     }
 
     #[test]
-    fn escape_also_quits_a_clean_screen() {
+    fn q_is_never_back_here_so_it_does_nothing() {
         let mut app = app();
-        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
     }
 
     #[test]
     fn quitting_with_unsaved_changes_asks_first() {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
         assert!(matches!(app.mode, Mode::ConfirmQuit));
     }
 
     #[test]
     fn confirming_the_prompt_quits_and_discards() {
-        for confirm in ['y', 'Y'] {
+        // The same answer keys as every other confirmation in the app.
+        for confirm in [KeyCode::Char('y'), KeyCode::Enter] {
             let mut app = app();
             edit(&mut app, Field::ArchiveFolder, "Archive");
-            press(&mut app, KeyCode::Char('q'));
+            press(&mut app, KeyCode::Esc);
             assert_eq!(
-                press(&mut app, KeyCode::Char(confirm)),
+                press(&mut app, confirm),
                 Action::Quit,
-                "{confirm} should confirm"
+                "{confirm:?} should confirm"
             );
         }
     }
@@ -1496,7 +1519,7 @@ mod tests {
     fn any_other_key_at_the_prompt_returns_to_editing_with_the_changes_intact() {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
-        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Esc);
 
         assert_eq!(press(&mut app, KeyCode::Char('n')), Action::None);
         assert!(is_browsing(&app));
@@ -1509,7 +1532,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
         save(&mut app, &FakeIo::new());
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
     }
 
     #[test]
@@ -1517,7 +1540,7 @@ mod tests {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
         save(&mut app, &FakeIo::failing());
-        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::None);
         assert!(matches!(app.mode, Mode::ConfirmQuit));
     }
 

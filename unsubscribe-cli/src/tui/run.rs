@@ -9,12 +9,12 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unsubscribe_core::{RunOutcome, RunPlan};
 
 use super::app::{Effect, Nav};
+use super::keys::{self, Action};
 use super::worker::{RunEvent, RunResult, RunShared};
 
 /// The parts of a plan the screen still needs once the plan itself has been
@@ -132,50 +132,58 @@ impl RunScreen {
             .collect()
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Nav {
+    pub fn on_action(&mut self, action: Action) -> Nav {
+        // The inspection pop-up is one level of its own: Esc closes it before
+        // anything else can read the key.
         if self.detail.is_some() {
-            self.detail = None;
+            if matches!(action, Action::Back | Action::Activate) {
+                self.detail = None;
+            }
             return Nav::Stay;
         }
         let last = self.attempts().len().saturating_sub(1);
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(last),
-            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
-            KeyCode::End | KeyCode::Char('G') => self.cursor = last,
-            KeyCode::Enter if self.state == RunState::Finished => {
+        if let Some(cursor) = keys::move_cursor(action, self.cursor, last) {
+            self.cursor = cursor;
+            return Nav::Stay;
+        }
+        match action {
+            Action::Activate if self.state == RunState::Finished => {
                 self.detail = Some(self.cursor);
+                Nav::Stay
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                return match self.state {
-                    // Finishing returns Home; the counts there are already
-                    // refreshed by the time the user gets back.
-                    RunState::Finished => Nav::Pop,
-                    RunState::Running => Nav::Effect(Effect::ConfirmCancelRun),
-                    // Already stopping: asking again would change nothing.
-                    RunState::Cancelling => Nav::Stay,
-                };
-            }
-            _ => {}
+            Action::Back => match self.state {
+                // Finishing goes back to the Run panel; its counts are
+                // already refreshed by the time the user gets there.
+                RunState::Finished => Nav::Pop,
+                RunState::Running => Nav::Effect(Effect::ConfirmCancelRun),
+                // Already stopping: asking again would change nothing.
+                RunState::Cancelling => Nav::Stay,
+            },
+            _ => Nav::Stay,
         }
-        Nav::Stay
     }
 
-    pub fn hints(&self) -> &'static str {
+    /// The actions this sub-view answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Action> {
+        if self.detail.is_some() {
+            return vec![Action::Back];
+        }
         match self.state {
-            RunState::Running => " j/k: scroll | Esc: cancel the run | ?: keys",
-            RunState::Cancelling => " stopping after the current sender\u{2026}",
-            RunState::Finished if self.detail.is_some() => " any key: close",
-            RunState::Finished => " j/k: move | Enter: inspect | Esc: back to Home",
+            RunState::Cancelling => vec![Action::Help],
+            RunState::Running => keys::list_actions(&[]),
+            RunState::Finished => keys::list_actions(&[Action::Activate]),
         }
     }
 
-    pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("j / k / \u{2191}\u{2193}", "scroll the attempts"),
-            ("Enter", "inspect the highlighted attempt"),
-            ("Esc / q", "cancel while running, back when finished"),
-        ]
+    /// A word for what the run is doing, for the working area's title.
+    #[must_use]
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            RunState::Running => "running",
+            RunState::Cancelling => "stopping after the current sender",
+            RunState::Finished => "finished",
+        }
     }
 
     fn scroll_into_view(&mut self, height: usize) {
@@ -474,15 +482,10 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::mpsc;
     use unsubscribe_core::{
         Folder, FolderMessage, MessageId, NextStep, PlannedSender, RunOutcome, SenderInfo,
     };
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     /// What a `Nav` is, for asserting on without a shell.
     fn nav_name(nav: &Nav) -> &'static str {
@@ -600,11 +603,9 @@ mod tests {
     fn esc_while_running_asks_before_stopping() {
         let (mut screen, _shared, _tx) = screen_with(1);
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "confirm cancel");
-        assert_eq!(
-            nav_name(&screen.on_key(key(KeyCode::Char('q')))),
-            "confirm cancel"
-        );
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "confirm cancel");
+        // q is never "back", so it cannot silently abandon a run.
+        assert_eq!(nav_name(&screen.on_action(Action::Quit)), "stay");
     }
 
     #[test]
@@ -622,21 +623,22 @@ mod tests {
         let (mut screen, _shared, _tx) = screen_with(1);
         screen.request_cancel();
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "stay");
         assert_eq!(screen.state, RunState::Cancelling);
     }
 
     #[test]
-    fn the_footer_says_the_run_is_stopping_after_the_current_sender() {
+    fn the_working_area_says_the_run_is_stopping_after_the_current_sender() {
         let (mut screen, _shared, _tx) = screen_with(1);
-        assert!(screen.hints().contains("cancel"));
+        assert_eq!(screen.state_label(), "running");
+        assert!(screen.actions().contains(&Action::Back), "cancel is offered");
 
         screen.request_cancel();
 
         assert!(
-            screen.hints().contains("stopping after the current sender"),
+            screen.state_label().contains("stopping after the current sender"),
             "got {:?}",
-            screen.hints()
+            screen.state_label()
         );
     }
 
@@ -662,10 +664,10 @@ mod tests {
     // -- leaving -------------------------------------------------------------
 
     #[test]
-    fn esc_after_the_run_finished_goes_back_to_home() {
+    fn esc_after_the_run_finished_goes_back_to_the_run_panel() {
         let mut screen = finished(RunResult::Done(Box::default()));
 
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "pop");
     }
 
     // -- the attempt list ----------------------------------------------------
@@ -677,7 +679,7 @@ mod tests {
         let (mut screen, _shared, _tx) = screen_with(3);
 
         for _ in 0..10 {
-            screen.on_key(key(KeyCode::Down));
+            screen.on_action(Action::MoveDown);
         }
 
         assert_eq!(screen.cursor, 2, "three attempts, so the last index is 2");
@@ -686,10 +688,10 @@ mod tests {
     #[test]
     fn moving_up_stops_at_the_first_attempt() {
         let (mut screen, _shared, _tx) = screen_with(3);
-        screen.on_key(key(KeyCode::Char('G')));
+        screen.on_action(Action::Last);
 
         for _ in 0..10 {
-            screen.on_key(key(KeyCode::Char('k')));
+            screen.on_action(Action::MoveUp);
         }
 
         assert_eq!(screen.cursor, 0);
@@ -699,9 +701,9 @@ mod tests {
     fn g_and_shift_g_jump_to_the_first_and_last_attempt() {
         let (mut screen, _shared, _tx) = screen_with(4);
 
-        screen.on_key(key(KeyCode::End));
+        screen.on_action(Action::Last);
         assert_eq!(screen.cursor, 3);
-        screen.on_key(key(KeyCode::Home));
+        screen.on_action(Action::First);
         assert_eq!(screen.cursor, 0);
     }
 
@@ -711,8 +713,13 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let mut screen = RunScreen::new(shared, rx, PlanCounts::default(), false);
 
-        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('G'), KeyCode::Char('g')] {
-            screen.on_key(key(code));
+        for action in [
+            Action::MoveDown,
+            Action::MoveUp,
+            Action::Last,
+            Action::First,
+        ] {
+            screen.on_action(action);
             assert_eq!(screen.cursor, 0);
         }
     }
@@ -723,34 +730,37 @@ mod tests {
     fn an_attempt_can_only_be_inspected_once_the_run_has_finished() {
         let (mut screen, _shared, _tx) = screen_with(2);
 
-        screen.on_key(key(KeyCode::Enter));
+        screen.on_action(Action::Activate);
 
         assert_eq!(screen.detail, None, "the list is still moving");
     }
 
     #[test]
-    fn enter_inspects_the_highlighted_attempt_and_any_key_closes_it() {
+    fn enter_inspects_the_highlighted_attempt_and_esc_closes_it() {
         let mut screen = finished(RunResult::Done(Box::default()));
-        screen.on_key(key(KeyCode::Down));
+        screen.on_action(Action::MoveDown);
 
-        screen.on_key(key(KeyCode::Enter));
+        screen.on_action(Action::Activate);
         assert_eq!(screen.detail, Some(1));
 
-        screen.on_key(key(KeyCode::Char('z')));
+        // Only the one level: the inspection closes, the screen stays.
+        screen.on_action(Action::Toggle);
+        assert_eq!(screen.detail, Some(1), "an unrelated key changes nothing");
+        screen.on_action(Action::Back);
         assert_eq!(screen.detail, None);
     }
 
     #[test]
     fn a_key_that_closes_the_detail_does_not_also_leave_the_screen() {
         let mut screen = finished(RunResult::Done(Box::default()));
-        screen.on_key(key(KeyCode::Enter));
+        screen.on_action(Action::Activate);
 
         assert_eq!(
-            nav_name(&screen.on_key(key(KeyCode::Esc))),
+            nav_name(&screen.on_action(Action::Back)),
             "stay",
             "Esc closes the overlay; leaving takes a second press"
         );
-        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "pop");
     }
 
     // -- plan counts ---------------------------------------------------------

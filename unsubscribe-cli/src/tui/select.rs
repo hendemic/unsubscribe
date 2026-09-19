@@ -5,7 +5,7 @@
 //! the bottom of the file, and [`select_senders`] is the standalone entry point
 //! the `run` command still uses.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
@@ -13,6 +13,7 @@ use unsubscribe_core::{
     AnnotatedSenders, NextStep, Preferences, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
+use super::keys::{self, Action};
 use crate::time::{is_scan_stale, utc_to_local_display, MONTH_NAMES};
 
 /// Number of selectable rows Ctrl+Up/Ctrl+Down jumps at a time.
@@ -323,33 +324,46 @@ pub(crate) enum SelectAction {
 impl App {
     /// Apply one keypress. Pure: no terminal, no I/O, so the whole screen can
     /// be driven from a test.
-    pub(crate) fn on_key(&mut self, key: KeyEvent) -> SelectAction {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return SelectAction::Cancel,
-            KeyCode::Enter => return SelectAction::Confirm,
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_up_by(JUMP_ROWS)
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.move_down_by(JUMP_ROWS)
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('a') => self.select_all(),
-            KeyCode::Char('n') => self.deselect_all(),
-            KeyCode::Home | KeyCode::Char('g') => self.cursor = self.first_selectable(),
-            KeyCode::End | KeyCode::Char('G') => {
-                self.cursor = self.total_rows().saturating_sub(1);
-            }
+    pub(crate) fn on_action(&mut self, action: Action) -> SelectAction {
+        match action {
+            Action::Back => return SelectAction::Cancel,
+            Action::Activate => return SelectAction::Confirm,
+            Action::JumpUp => self.move_up_by(JUMP_ROWS),
+            Action::JumpDown => self.move_down_by(JUMP_ROWS),
+            Action::MoveUp => self.move_up(),
+            Action::MoveDown => self.move_down(),
+            // The headers and spacers between the sections are not rows the
+            // page helper can land on, so paging steps rather than jumps.
+            Action::PageUp => self.move_up_by(keys::PAGE),
+            Action::PageDown => self.move_down_by(keys::PAGE),
+            Action::Toggle => self.toggle(),
+            Action::Mnemonic('a') => self.select_all(),
+            Action::Mnemonic('n') => self.deselect_all(),
+            Action::First => self.cursor = self.first_selectable(),
+            Action::Last => self.cursor = self.total_rows().saturating_sub(1),
             _ => {}
         }
         SelectAction::None
     }
 
-    /// The key hints this screen contributes to the footer.
-    pub(crate) fn hints(&self) -> &'static str {
-        " Space: toggle | a: all | n: none | j/k: move | Ctrl+\u{2191}/\u{2193}: jump 5 | Enter: confirm | Esc: back"
+    /// Apply one raw keypress, for the standalone entry point that owns its
+    /// own event loop.
+    pub(crate) fn on_key(&mut self, key: KeyEvent) -> SelectAction {
+        keys::action(key, false)
+            .map(|action| self.on_action(action))
+            .unwrap_or(SelectAction::None)
+    }
+
+    /// The actions this screen answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub(crate) fn actions(&self) -> Vec<Action> {
+        keys::list_actions(&[
+            Action::JumpUp,
+            Action::Toggle,
+            Action::Mnemonic('a'),
+            Action::Mnemonic('n'),
+            Action::Activate,
+        ])
     }
 }
 
@@ -1410,7 +1424,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     render(f, chunks[1], app);
 
     f.render_widget(
-        Paragraph::new(app.hints()).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(keys::hints(&app.actions())).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }
@@ -1730,6 +1744,7 @@ fn civil_from_unix(ts: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod key_handling_tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use unsubscribe_core::{
         annotate_senders, now_unix_secs, AnnotatedSenders, RunPolicy, SenderInfo,
     };
@@ -1792,9 +1807,9 @@ mod key_handling_tests {
     }
 
     #[test]
-    fn esc_and_q_back_out_without_running() {
+    fn esc_backs_out_without_running_and_q_is_never_back() {
         assert_eq!(app().on_key(key(KeyCode::Esc)), SelectAction::Cancel);
-        assert_eq!(app().on_key(key(KeyCode::Char('q'))), SelectAction::Cancel);
+        assert_eq!(app().on_key(key(KeyCode::Char('q'))), SelectAction::None);
     }
 
     #[test]

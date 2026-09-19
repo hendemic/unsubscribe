@@ -4,11 +4,11 @@
 //! Read-only, and deliberately the same list the `warnings` command prints --
 //! both read it from the `DataStore`.
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::app::Nav;
+use super::keys::{self, Action};
 
 /// The warning list and where the viewport sits in it.
 #[derive(Debug, Clone, Default)]
@@ -32,31 +32,21 @@ impl WarningsScreen {
         self.warnings.len().saturating_sub(1)
     }
 
-    pub fn on_key(&mut self, key: KeyEvent) -> Nav {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.cursor = (self.cursor + 1).min(self.last()),
-            KeyCode::PageUp => self.cursor = self.cursor.saturating_sub(10),
-            KeyCode::PageDown => self.cursor = (self.cursor + 10).min(self.last()),
-            KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
-            KeyCode::End | KeyCode::Char('G') => self.cursor = self.last(),
-            KeyCode::Esc | KeyCode::Char('q') => return Nav::Pop,
-            _ => {}
+    pub fn on_action(&mut self, action: Action) -> Nav {
+        if let Some(cursor) = keys::move_cursor(action, self.cursor, self.last()) {
+            self.cursor = cursor;
+            return Nav::Stay;
         }
-        Nav::Stay
+        match action {
+            Action::Back => Nav::Pop,
+            _ => Nav::Stay,
+        }
     }
 
-    pub fn hints(&self) -> &'static str {
-        " j/k: move | ?: keys | Esc: back"
-    }
-
-    pub fn keys(&self) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("j / k / \u{2191}\u{2193}", "scroll"),
-            ("PgUp / PgDn", "scroll a page"),
-            ("g / G", "first / last"),
-            ("Esc / q", "back"),
-        ]
+    /// The actions this panel answers, for the footer and the `?` overlay.
+    #[must_use]
+    pub fn actions(&self) -> Vec<Action> {
+        keys::list_actions(&[])
     }
 
     /// Keep the cursor inside the viewport. Called at draw time, when the
@@ -123,11 +113,6 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut WarningsScreen) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     fn is_pop(nav: &Nav) -> bool {
         matches!(nav, Nav::Pop)
@@ -147,7 +132,7 @@ mod tests {
         let mut s = screen(3);
 
         for _ in 0..10 {
-            s.on_key(key(KeyCode::Down));
+            s.on_action(Action::MoveDown);
         }
 
         assert_eq!(s.cursor, 2);
@@ -156,10 +141,10 @@ mod tests {
     #[test]
     fn moving_up_stops_at_the_top() {
         let mut s = screen(3);
-        s.on_key(key(KeyCode::Char('G')));
+        s.on_action(Action::Last);
 
         for _ in 0..10 {
-            s.on_key(key(KeyCode::Char('k')));
+            s.on_action(Action::MoveUp);
         }
 
         assert_eq!(s.cursor, 0);
@@ -169,13 +154,13 @@ mod tests {
     fn a_page_moves_ten_rows_and_clamps_at_the_ends() {
         let mut s = screen(30);
 
-        s.on_key(key(KeyCode::PageDown));
+        s.on_action(Action::PageDown);
         assert_eq!(s.cursor, 10);
-        s.on_key(key(KeyCode::PageDown));
+        s.on_action(Action::PageDown);
         assert_eq!(s.cursor, 20);
-        s.on_key(key(KeyCode::PageDown));
+        s.on_action(Action::PageDown);
         assert_eq!(s.cursor, 29, "the last row, not row 30");
-        s.on_key(key(KeyCode::PageUp));
+        s.on_action(Action::PageUp);
         assert_eq!(s.cursor, 19);
     }
 
@@ -183,45 +168,45 @@ mod tests {
     fn g_and_shift_g_jump_to_the_first_and_last_warning() {
         let mut s = screen(30);
 
-        s.on_key(key(KeyCode::End));
+        s.on_action(Action::Last);
         assert_eq!(s.cursor, 29);
-        s.on_key(key(KeyCode::Home));
+        s.on_action(Action::First);
         assert_eq!(s.cursor, 0);
-        s.on_key(key(KeyCode::Char('G')));
+        s.on_action(Action::Last);
         assert_eq!(s.cursor, 29);
-        s.on_key(key(KeyCode::Char('g')));
+        s.on_action(Action::First);
         assert_eq!(s.cursor, 0);
     }
 
     #[test]
-    fn esc_and_q_go_back_to_the_screen_underneath() {
-        assert!(is_pop(&screen(3).on_key(key(KeyCode::Esc))));
-        assert!(is_pop(&screen(3).on_key(key(KeyCode::Char('q')))));
+    fn esc_goes_back_one_level_and_q_is_never_back() {
+        assert!(is_pop(&screen(3).on_action(Action::Back)));
+        assert!(!is_pop(&screen(3).on_action(Action::Quit)));
     }
 
     #[test]
     fn navigating_an_empty_list_does_not_panic_or_move() {
         let mut s = screen(0);
 
-        for code in [
-            KeyCode::Down,
-            KeyCode::Up,
-            KeyCode::PageDown,
-            KeyCode::PageUp,
-            KeyCode::Char('G'),
-            KeyCode::Char('g'),
+        for action in [
+            Action::MoveDown,
+            Action::MoveUp,
+            Action::PageDown,
+            Action::PageUp,
+            Action::Last,
+            Action::First,
         ] {
-            s.on_key(key(code));
+            s.on_action(action);
             assert_eq!(s.cursor, 0);
         }
     }
 
     #[test]
-    fn an_unrecognised_key_changes_nothing() {
+    fn an_action_this_panel_does_not_answer_changes_nothing() {
         let mut s = screen(3);
-        s.on_key(key(KeyCode::Down));
+        s.on_action(Action::MoveDown);
 
-        s.on_key(key(KeyCode::Char('z')));
+        s.on_action(Action::Toggle);
 
         assert_eq!(s.cursor, 1);
     }
