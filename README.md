@@ -68,6 +68,16 @@ highlighted.
 quits: the app is left with `q` from the nav, or `Ctrl-C` from anywhere. These
 keys mean the same thing in every panel, sub-view and dialog.
 
+Inside the **Run** workflow — the scan, the sender selection, the run and its
+results — `Esc` means something slightly different: it hands focus back to the
+nav and leaves the screen standing. A scan or a run keeps going on its worker,
+the nav marks Run with what it has waiting (`Run (scanning…)`, `Run ●`), and
+coming back to Run finds the same screen with the same cursor, ticks and
+progress. Stopping is never something `Esc` does by accident: cancelling is
+`c`, which asks first whenever there is work or a choice to lose. Quitting
+while a scan or a run is going asks too, then stops the worker cleanly — an
+attempt in flight is always finished first.
+
 | Key | Does |
 |-----|------|
 | `↑` `↓` / `k` `j` | Move |
@@ -76,7 +86,7 @@ keys mean the same thing in every panel, sub-view and dialog.
 | `Home` `End` / `g` `G` | First / last row |
 | `Enter` | Open, confirm, or act on the highlighted row |
 | `→` | Move focus from the nav into the working area |
-| `Esc` / `←` | Back one level; from a panel's top level, back to the nav |
+| `Esc` / `←` | Back one level; from a panel's top level, back to the nav. In the Run workflow, back to the nav with the screen left standing |
 | `q` | Quit — only when the nav has focus; never "back" |
 | `Ctrl-C` | Quit from anywhere |
 | `?` | Show the keys for whatever has focus |
@@ -89,6 +99,7 @@ Panel actions are single letters. A letter means one thing throughout the app:
 |-----|------|-------|
 | `a` | Select all | Sender selection |
 | `n` | Select none; also "no" at a confirmation | Sender selection, dialogs |
+| `c` | Cancel what is in front of you: stop a scan or a run, discard a selection, close the results | Scan, sender selection, run, results |
 | `y` | Confirm (same as `Enter`) | Dialogs |
 | `s` | Cycle the sort order | Unsubscribe List |
 | `r` | Show only senders that resumed | Unsubscribe List |
