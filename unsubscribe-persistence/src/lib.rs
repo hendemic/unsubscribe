@@ -1,9 +1,11 @@
+mod cache;
 mod config;
 mod credential;
 mod data;
 mod history;
 mod sqlite;
 
+pub use cache::{SqliteCacheStore, CACHE_DB_FILE};
 pub use config::TomlConfigStore;
 pub use credential::KeyringCredentialStore;
 pub use data::FileDataStore;

@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use unsubscribe_core::{
-    AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, ScanWatermark, SenderInfo,
+    AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, ScanCacheStore,
+    ScanWatermark, SenderInfo,
 };
 
 use crate::terminal::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
@@ -15,6 +16,7 @@ pub fn do_scan(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
     min_emails: u32,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
@@ -63,7 +65,10 @@ pub fn do_scan(
             adapter_state: None,
         },
     };
-    store.write_scan_cache(&cache)?;
+    // The cache is disposable: failing to write it costs a rescan, not a run.
+    if let Err(e) = cache_store.write_scan_cache(&cache) {
+        eprintln!("{YELLOW}Warning: could not write scan cache: {e}{RESET}");
+    }
 
     let senders: Vec<_> = scan_result
         .senders
@@ -76,11 +81,11 @@ pub fn do_scan(
 
 /// Load cached scan results, applying min_emails filter.
 pub fn load_cached_scan(
-    store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
     account: &str,
     min_emails: u32,
 ) -> Result<(Vec<SenderInfo>, String)> {
-    let cache = store
+    let cache = cache_store
         .read_scan_cache(account)?
         .ok_or_else(|| {
             anyhow::anyhow!("No cached scan results found. Run `unsubscribe scan` first.")
@@ -110,9 +115,10 @@ pub fn cmd_scan(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
     min_emails: u32,
 ) -> Result<()> {
-    let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
+    let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -175,16 +181,17 @@ pub fn cmd_export(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
     output: &Path,
     min_emails: u32,
     cached: bool,
 ) -> Result<()> {
     let senders = if cached {
-        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        let (senders, timestamp) = load_cached_scan(cache_store, &account.account_id, min_emails)?;
         eprintln!("{DIM}Using cached scan from {timestamp}{RESET}");
         senders
     } else {
-        let (senders, _) = do_scan(account, credential, store, min_emails)?;
+        let (senders, _) = do_scan(account, credential, store, cache_store, min_emails)?;
         senders
     };
 

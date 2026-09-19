@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, Credential, CredentialStore, ProviderType};
 use unsubscribe_persistence::{
-    FileDataStore, KeyringCredentialStore, SqliteHistoryStore, TomlConfigStore,
+    FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
 };
 
 use crate::terminal::{prompt, prompt_password, BOLD, DIM, GREEN, RESET, YELLOW};
@@ -266,6 +266,10 @@ pub fn cmd_uninstall(config_dir: &Path) -> Result<()> {
     eprintln!(
         "  - History: {} {DIM}(your record of past unsubscribes){RESET}",
         SqliteHistoryStore::default_path().display()
+    );
+    eprintln!(
+        "  - Cache:   {} {DIM}(disposable scan cache){RESET}",
+        SqliteCacheStore::default_path().display()
     );
     eprintln!("  - Keychain entry");
     eprintln!(

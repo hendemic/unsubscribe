@@ -12,7 +12,9 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, ProviderType};
-use unsubscribe_persistence::{FileDataStore, KeyringCredentialStore, TomlConfigStore};
+use unsubscribe_persistence::{
+    FileDataStore, KeyringCredentialStore, SqliteCacheStore, TomlConfigStore,
+};
 
 #[derive(Parser)]
 #[command(name = "unsubscribe", about = "Bulk unsubscribe from email lists", version)]
@@ -115,6 +117,15 @@ fn main() -> Result<()> {
 
     let (account, credential) = load_account(&config_dir)?;
     let store = FileDataStore::new();
+    // A corrupt cache should be reported, not worked around silently -- but it
+    // costs the user nothing to fix, so say so.
+    let cache_store = SqliteCacheStore::open_default().with_context(|| {
+        format!(
+            "Failed to open the scan cache at {}.\n\n\
+             The cache is disposable: deleting that file is safe and the next scan rebuilds it.",
+            SqliteCacheStore::default_path().display()
+        )
+    })?;
 
     match cli.command {
         Commands::Run {
@@ -122,13 +133,32 @@ fn main() -> Result<()> {
             min_emails,
             cached,
             mailto,
-        } => commands::run::cmd_run(&account, &credential, &store, dry_run, min_emails, cached, mailto),
-        Commands::Scan { min_emails } => commands::scan::cmd_scan(&account, &credential, &store, min_emails),
+        } => commands::run::cmd_run(
+            &account,
+            &credential,
+            &store,
+            &cache_store,
+            dry_run,
+            min_emails,
+            cached,
+            mailto,
+        ),
+        Commands::Scan { min_emails } => {
+            commands::scan::cmd_scan(&account, &credential, &store, &cache_store, min_emails)
+        }
         Commands::Export {
             output,
             min_emails,
             cached,
-        } => commands::scan::cmd_export(&account, &credential, &store, &output, min_emails, cached),
+        } => commands::scan::cmd_export(
+            &account,
+            &credential,
+            &store,
+            &cache_store,
+            &output,
+            min_emails,
+            cached,
+        ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential),
         Commands::Warnings
         | Commands::Update { .. }

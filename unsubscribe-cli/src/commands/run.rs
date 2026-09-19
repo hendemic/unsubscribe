@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use unsubscribe_core::{
-    AccountConfig, Credential, DataStore, Folder, HistoryStore, SenderInfo, UnsubscribeAttempt,
-    UnsubscribeMethod, UnsubscribeResult,
+    AccountConfig, Credential, DataStore, Folder, HistoryStore, ScanCacheStore, SenderInfo,
+    UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
 };
 use unsubscribe_persistence::SqliteHistoryStore;
 
@@ -18,6 +18,7 @@ pub fn cmd_run(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
     dry_run: bool,
     min_emails: u32,
     cached: bool,
@@ -29,11 +30,11 @@ pub fn cmd_run(
 
     // Phase 1: Scan (or load from cache)
     let (senders, warnings, scan_timestamp) = if cached {
-        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        let (senders, timestamp) = load_cached_scan(cache_store, &account.account_id, min_emails)?;
         eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
         (senders, Vec::new(), Some(timestamp))
     } else {
-        let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
+        let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
         let timestamp = now_iso8601();
         (senders, warnings, Some(timestamp))
     };
@@ -254,6 +255,21 @@ pub fn cmd_run(
         "{GREEN}Archived {archived} emails{RESET} to '{}'.",
         account.archive_folder
     );
+
+    // The archived messages have moved, so the cached rows now point at message
+    // ids that are no longer where the cache says they are. Pruning also keeps a
+    // sender that was just handled from reappearing on the next cached run.
+    // Only a real archive prunes: a dry run changed nothing.
+    if !dry_run {
+        let archived_senders: Vec<String> = all_to_archive
+            .iter()
+            .map(|s| s.email.clone())
+            .collect();
+        if let Err(e) = cache_store.remove_cached_senders(&account.account_id, &archived_senders) {
+            eprintln!("{YELLOW}Warning: could not prune the scan cache: {e}{RESET}");
+            eprintln!("{DIM}Run `unsubscribe scan` to rebuild it.{RESET}");
+        }
+    }
 
     if !cached {
         print_warnings_summary(&warnings);
