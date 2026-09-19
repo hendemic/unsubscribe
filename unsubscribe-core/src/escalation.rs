@@ -8,7 +8,7 @@
 //! Everything here is pure. The pipeline decides *when* to ask; this decides
 //! *what* to ask, from the sender's headers and its own history.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::history::{attempts_about, resumptions_about, Resumption, UnsubscribeAttempt};
 use crate::types::{SenderInfo, UnsubscribeMethod};
@@ -66,7 +66,8 @@ impl RungMethod {
 ///
 /// The target is part of the identity on purpose. A sender that rotates its
 /// unsubscribe URL offers a rung nobody has tried yet, which is exactly how a
-/// rung that kept failing becomes worth trying again.
+/// rung that kept failing becomes worth trying again. A rung that was honoured
+/// and then ignored gets no such second life -- see [`next_step`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rung {
     pub method: RungMethod,
@@ -173,17 +174,30 @@ const BROKEN_AFTER_FAILURES: usize = 2;
 /// - a rung is **spent** once an attempt using it succeeded and a resumption
 ///   was later recorded against that attempt -- the sender said yes and kept
 ///   mailing, so asking the same way again is theatre;
+/// - a spent rung stays spent when the sender rotates the target it was aimed
+///   at. Unsubscribe URLs carry per-message tokens, so the very mail that
+///   proves a request was ignored also offers a "new" URL for the same request;
+///   a spent rung whose target is no longer offered therefore spends the next
+///   otherwise-untried rung of its method instead;
 /// - a rung is **broken** when its two most recent attempts both failed (a 404,
 ///   a timeout). Broken rungs are skipped, but a rung is identified by its
 ///   target, so a sender that changes its URL offers an untried rung again;
-/// - with nothing spent and nothing broken there is no reason to narrow the
-///   attempt, so the sender gets the full flow it would have got anyway.
+/// - a sender with no rungs at all has nothing to ask and is exhausted from the
+///   start;
+/// - otherwise, with nothing spent and nothing broken there is no reason to
+///   narrow the attempt, so the sender gets the full flow it would have got
+///   anyway.
 #[must_use]
 pub fn next_step(
     sender: &SenderInfo,
     attempts: &[UnsubscribeAttempt],
     resumptions: &[Resumption],
 ) -> NextStep {
+    let ladder = build_ladder(sender);
+    if ladder.is_empty() {
+        return NextStep::Exhausted;
+    }
+
     let mine: Vec<&UnsubscribeAttempt> = attempts_about(sender, attempts).collect();
     let ignored: HashSet<&str> = resumptions_about(sender, resumptions)
         .map(|r| r.attempt_id.as_str())
@@ -201,9 +215,7 @@ pub fn next_step(
         .rev()
         .find(|a| a.success && ignored.contains(a.id.as_str()));
 
-    build_ladder(sender)
-        .into_iter()
-        .find(|rung| !spent.contains(rung) && !broken.contains(rung))
+    first_untried_rung(ladder, &spent, &broken)
         .map_or(NextStep::Exhausted, |rung| {
             NextStep::Escalate(Escalation {
                 rung,
@@ -212,6 +224,37 @@ pub fn next_step(
                     .and_then(RungMethod::of_attempt),
                 follows_attempt_id: ignored_attempt.map(|a| a.id.clone()),
             })
+        })
+}
+
+/// The best rung that is neither spent nor broken.
+///
+/// Each spent rung whose target the sender no longer offers is carried over to
+/// the first otherwise-eligible rung of the same method: that is where a
+/// rotated target reappears in the ladder. Broken rungs carry nothing over -- a
+/// changed target is exactly what makes a failing rung worth another try.
+fn first_untried_rung(
+    ladder: Vec<Rung>,
+    spent: &HashSet<Rung>,
+    broken: &HashSet<Rung>,
+) -> Option<Rung> {
+    let mut carried_over = spent.iter().filter(|rung| !ladder.contains(rung)).fold(
+        HashMap::<RungMethod, usize>::new(),
+        |mut per_method, rung| {
+            *per_method.entry(rung.method).or_default() += 1;
+            per_method
+        },
+    );
+
+    ladder
+        .into_iter()
+        .filter(|rung| !spent.contains(rung) && !broken.contains(rung))
+        .find(|rung| match carried_over.get_mut(&rung.method) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                false
+            }
+            _ => true,
         })
 }
 
@@ -231,7 +274,7 @@ fn broken_rungs(mine: &[&UnsubscribeAttempt]) -> HashSet<Rung> {
     mine.iter()
         .filter_map(|a| rung_of(a).map(|rung| (rung, a.success)))
         .fold(
-            std::collections::HashMap::<Rung, Vec<bool>>::new(),
+            HashMap::<Rung, Vec<bool>>::new(),
             |mut per_rung, (rung, success)| {
                 per_rung.entry(rung).or_default().push(success);
                 per_rung
@@ -554,6 +597,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // next_step: a spent rung survives a rotated target (#113)
+    // -----------------------------------------------------------------------
+
+    /// The same endpoints as `U1` / `M1` with a fresh per-message token.
+    const U1_ROTATED: &str = "https://acme.example.com/unsub?id=99";
+    const U2_ROTATED: &str = "https://acme.example.com/other?id=98";
+    const M1_ROTATED: &str = "mailto:unsub+tok99@acme.example.com";
+
+    #[test]
+    fn an_ignored_one_click_is_not_repeated_at_a_rotated_url() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true)];
+        let step = next_step(&sender(true, &[U1_ROTATED], &[M1]), &attempts, &[ignored("a1")]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U1_ROTATED));
+    }
+
+    #[test]
+    fn a_rotated_spent_url_spends_only_the_first_rung_of_its_method() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::Get, U1, true)];
+        let step = next_step(
+            &sender(false, &[U1_ROTATED, U2_ROTATED], &[M1]),
+            &attempts,
+            &[ignored("a1")],
+        );
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U2_ROTATED));
+    }
+
+    #[test]
+    fn every_rung_ignored_is_exhausted_even_after_every_target_rotates() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U1, true),
+            attempt("a3", 3_000, UnsubscribeMethod::MailtoSent, M1, true),
+        ];
+        let resumptions = vec![ignored("a1"), ignored("a2"), ignored("a3")];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1_ROTATED], &[M1_ROTATED]), &attempts, &resumptions),
+            NextStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn a_rotated_spent_rung_does_not_spend_a_rung_of_another_method() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::MailtoSent, M1, true)];
+        let step = next_step(
+            &sender(false, &[U1], &[M1_ROTATED, M2]),
+            &attempts,
+            &[ignored("a1")],
+        );
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U1));
+    }
+
+    #[test]
+    fn a_carried_over_rung_skips_past_a_broken_one() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::Get, U1, true),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U2, false),
+            attempt("a3", 3_000, UnsubscribeMethod::Get, U2, false),
+        ];
+        let step = next_step(
+            &sender(false, &[U2, U1_ROTATED], &[M1]),
+            &attempts,
+            &[ignored("a1")],
+        );
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::Mailto, M1));
+    }
+
+    // -----------------------------------------------------------------------
     // next_step: what an escalation answers
     // -----------------------------------------------------------------------
 
@@ -707,14 +822,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: next_step returns FirstAttempt for a sender with an empty ladder (issue #99)"]
     fn a_sender_with_no_targets_at_all_has_nothing_to_try() {
         // Reachable: a message whose `List-Unsubscribe` header is present but
         // yields no usable URL or mailto still becomes a scanned sender. Its
-        // ladder is empty, so there is nothing to ask -- but `next_step`
-        // short-circuits to `FirstAttempt` before it ever builds the ladder,
-        // so the sender is attempted (and recorded as a `none` failure) on
-        // every run and never reaches the exhausted list.
+        // ladder is empty, so there is nothing to ask, and attempting it would
+        // only record a `none` failure on every run (#113).
         assert_eq!(
             next_step(&sender(false, &[], &[]), &[], &[]),
             NextStep::Exhausted

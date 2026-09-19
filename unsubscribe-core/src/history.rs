@@ -225,6 +225,9 @@ fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
 pub struct LatestAttempts {
     by_list_id: HashMap<String, UnsubscribeAttempt>,
     by_email: HashMap<String, UnsubscribeAttempt>,
+    /// Attempts recorded without a `List-Id` -- the only ones a sender that
+    /// carries one may still be recognised by address from.
+    by_email_unlisted: HashMap<String, UnsubscribeAttempt>,
 }
 
 impl LatestAttempts {
@@ -234,19 +237,34 @@ impl LatestAttempts {
         Self {
             by_list_id: latest_successful_attempts_by_list_id(attempts),
             by_email: latest_successful_attempts(attempts),
+            by_email_unlisted: latest_successful_by(attempts, |attempt| {
+                normalized_list_id(attempt.list_id.as_deref())
+                    .is_none()
+                    .then(|| attempt.sender_email.to_lowercase())
+            }),
         }
     }
 
     /// The successful attempt this sender's history hangs off.
     ///
-    /// `List-Id` wins when both the sender and a recorded attempt carry one,
-    /// since the address may since have rotated; otherwise the address decides,
-    /// case-insensitively.
+    /// The same rule as [`UnsubscribeAttempt::is_about`], so the sections, the
+    /// verdicts and the escalation all agree on whose history is whose:
+    /// `List-Id` decides when both the sender and a recorded attempt carry one,
+    /// since the address may since have rotated; otherwise the address does,
+    /// case-insensitively. An attempt recorded against a *different* list at
+    /// the same address is another list's history and never matches.
     #[must_use]
     pub fn for_sender(&self, sender: &SenderInfo) -> Option<&UnsubscribeAttempt> {
-        normalized_list_id(sender.list_id.as_deref())
-            .and_then(|id| self.by_list_id.get(&id))
-            .or_else(|| self.by_email.get(&sender.email.to_lowercase()))
+        let email = sender.email.to_lowercase();
+        match normalized_list_id(sender.list_id.as_deref()) {
+            Some(list_id) => self
+                .by_list_id
+                .get(&list_id)
+                .into_iter()
+                .chain(self.by_email_unlisted.get(&email))
+                .max_by_key(|attempt| attempt.attempted_at),
+            None => self.by_email.get(&email),
+        }
     }
 
     /// Whether the account has any successful unsubscribe on record.
@@ -1382,16 +1400,11 @@ mod outcome_tests {
     }
 
     #[test]
-    #[ignore = "bug: LatestAttempts::for_sender falls back to the address even when both sides carry a different list id (issue #99)"]
     fn a_different_list_id_on_the_same_address_is_not_previously_unsubscribed() {
         // `UnsubscribeAttempt::is_about` says these are two different lists, so
-        // the sections must agree. They do not: `for_sender` only consults the
-        // list index when the *scanned* list id is a key in it, and otherwise
-        // falls through to the address, matching an attempt recorded against a
-        // different list. The sender is then judged against an attempt that
-        // `next_step` does not consider its own, so the row reads "resumed"
-        // while the next step reads "full flow" -- and a resumption is recorded
-        // blaming an unsubscribe for another list.
+        // the sections must agree. Falling back to the address here would judge
+        // the sender against an attempt `next_step` does not consider its own,
+        // and record a resumption blaming an unsubscribe for another list (#113).
         let mut recorded_attempt = success("s1", "news@acme.example.com", UNSUB);
         recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
         let scanned = with_list_id(
@@ -1413,6 +1426,39 @@ mod outcome_tests {
 
         assert!(sections.previously_unsubscribed.is_empty());
         assert_eq!(sections.remaining.len(), 1);
+    }
+
+    #[test]
+    fn a_sender_that_gained_a_list_id_is_still_matched_to_its_unlisted_attempt() {
+        let latest = LatestAttempts::from_history(&[success("s1", "news@acme.example.com", UNSUB)]);
+        let scanned = with_list_id(sender("news@acme.example.com", None), "daily.acme.example.com");
+
+        assert_eq!(latest.for_sender(&scanned).map(|a| a.id.as_str()), Some("s1"));
+    }
+
+    #[test]
+    fn the_newer_of_a_list_match_and_an_unlisted_address_match_wins() {
+        let mut listed = success("listed", "old@acme.example.com", UNSUB);
+        listed.list_id = Some("daily.acme.example.com".to_string());
+        let unlisted = success("unlisted", "news@acme.example.com", UNSUB + DAY);
+        let latest = LatestAttempts::from_history(&[listed, unlisted]);
+        let scanned = with_list_id(sender("news@acme.example.com", None), "daily.acme.example.com");
+
+        assert_eq!(latest.for_sender(&scanned).map(|a| a.id.as_str()), Some("unlisted"));
+    }
+
+    #[test]
+    fn a_sender_without_a_list_id_is_matched_by_address_whatever_the_attempt_carried() {
+        let mut listed = success("listed", "news@acme.example.com", UNSUB);
+        listed.list_id = Some("daily.acme.example.com".to_string());
+        let latest = LatestAttempts::from_history(&[listed]);
+
+        assert_eq!(
+            latest
+                .for_sender(&sender("news@acme.example.com", None))
+                .map(|a| a.id.as_str()),
+            Some("listed")
+        );
     }
 
     // -----------------------------------------------------------------------
