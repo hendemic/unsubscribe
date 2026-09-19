@@ -41,7 +41,7 @@ unsubscribe <command> [options]
 | Command | Description |
 |---------|-------------|
 | `run` | Scan mailbox, select senders in a TUI, unsubscribe, and archive emails. `--dry-run` to preview without changes. `-m <n>` to set minimum email count (default: 3). |
-| `scan` | List senders that have unsubscribe links. `-m <n>` for minimum email count. |
+| `scan` | List senders that have unsubscribe links. `-m <n>` for minimum email count. Always performs a full scan. |
 | `export` | Export scan results to CSV. `-o <file>` for output path (default: `unsubscribe_senders.csv`). |
 | `warnings` | Show unparseable List-Unsubscribe headers from the last scan. |
 | `update` | Self-update to the latest GitHub release. |
@@ -62,6 +62,33 @@ By default, only senders with 3 or more emails are shown. Use `--min-emails` / `
 unsubscribe run --min-emails 5
 unsubscribe scan -m 1
 ```
+
+### Cached scans
+
+Scanning a large mailbox takes a while, so `run` and `export` remember the last
+scan. When one is available they ask whether to reuse it:
+
+```
+Last scan: Sep 12, 2026 (6 days ago) — 214 senders. [U]se cached / [r]escan:
+```
+
+Enter reuses the cached scan, unless it is more than a week old, in which case
+the default flips to a rescan. `--cached` and `--rescan` answer the question up
+front and skip the prompt. Senders are dropped from the cache once their emails
+are archived, so a cached run never offers senders you have already handled.
+
+### Where your data lives
+
+In `~/.local/share/email-unsubscribe` (or `$XDG_DATA_HOME`):
+
+| File | Contents |
+|------|----------|
+| `history.db` | Every unsubscribe attempt, kept permanently. Senders you have unsubscribed from before appear in their own section in the TUI, so you can see who started mailing again. |
+| `cache.db` | The last scan. Disposable — deleting it only costs a rescan. |
+| `warnings.log` | Headers the last scan could not parse. |
+| `unsubscribe_log.csv` | The last run's results, rewritten each run. |
+
+`unsubscribe uninstall` removes all of it, along with the config and the binary.
 
 ## Config
 

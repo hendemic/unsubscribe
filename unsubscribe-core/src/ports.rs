@@ -2,9 +2,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::history::UnsubscribeAttempt;
 use crate::types::{
     AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult, SenderInfo,
-    UnsubscribeResult,
 };
 
 /// Port for scan progress reporting.
@@ -113,6 +113,25 @@ pub trait CredentialStore {
 }
 
 // ---------------------------------------------------------------------------
+// HistoryStore: durable record of unsubscribe attempts
+// ---------------------------------------------------------------------------
+
+/// Port for the append-only unsubscribe history.
+///
+/// Deliberately separate from `DataStore`: a server or an iOS client wants the
+/// history without the file-oriented warnings and scan-cache methods, and the
+/// two have opposite durability guarantees -- the cache is disposable, the
+/// history is not. The methods are coarse enough that an HTTP-backed
+/// implementation could sit behind this trait later.
+pub trait HistoryStore {
+    /// Append one attempt. Implementations never update or delete.
+    fn record_attempt(&self, attempt: &UnsubscribeAttempt) -> Result<()>;
+
+    /// All attempts recorded for an account, oldest first.
+    fn attempts_for_account(&self, account: &str) -> Result<Vec<UnsubscribeAttempt>>;
+}
+
+// ---------------------------------------------------------------------------
 // DataStore: scan warnings, action logs, and cached scan results
 // ---------------------------------------------------------------------------
 
@@ -147,7 +166,7 @@ pub struct CachedScan {
     pub watermark: ScanWatermark,
 }
 
-/// Port for persisting scan data, warnings, action logs, and cached results.
+/// Port for persisting scan warnings.
 ///
 /// CLI implements this with XDG data dir files. iOS would use CoreData/SwiftData.
 /// The persistence crate (`unsubscribe-persistence`) provides the CLI implementation.
@@ -157,13 +176,26 @@ pub trait DataStore {
 
     /// Read previously persisted scan warnings.
     fn read_warnings(&self) -> Result<Vec<String>>;
+}
 
-    /// Persist unsubscribe action log entries.
-    fn write_action_log(&self, results: &[UnsubscribeResult]) -> Result<()>;
-
-    /// Write cached scan results after a successful scan.
-    fn write_scan_cache(&self, cache: &CachedScan) -> Result<()>;
-
+/// Port for the scan cache.
+///
+/// Separate from both `DataStore` and `HistoryStore`: the cache is disposable
+/// -- discarding it costs a rescan and nothing else -- while warnings are
+/// display state and the history is evidence that must never be lost.
+pub trait ScanCacheStore {
     /// Read cached scan results for the given account, if any exist.
     fn read_scan_cache(&self, account: &str) -> Result<Option<CachedScan>>;
+
+    /// Replace the cached scan for the account the cache names.
+    fn write_scan_cache(&self, cache: &CachedScan) -> Result<()>;
+
+    /// Drop the named senders from an account's cache, leaving the scan
+    /// timestamp and watermarks alone.
+    ///
+    /// Called after a run archives a sender's messages: those messages have
+    /// moved, so leaving the sender cached would offer stale message ids and
+    /// make a sender that was just handled look like it reappeared. Unknown
+    /// senders are ignored; matching is case-insensitive.
+    fn remove_cached_senders(&self, account: &str, sender_emails: &[String]) -> Result<()>;
 }

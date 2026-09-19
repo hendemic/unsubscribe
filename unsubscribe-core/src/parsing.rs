@@ -161,6 +161,46 @@ pub fn parse_list_unsubscribe(header_value: &str, sender_email: &str) -> ParsedU
     }
 }
 
+/// Extract the normalized list identifier from an RFC 2919 `List-Id` header value.
+///
+/// The header carries an optional descriptive phrase followed by the identifier
+/// in angle brackets (`Acme News <news.acme.example.com>`); the phrase may be
+/// RFC 2047 encoded and the header may be folded across lines. The returned
+/// value is the text inside the brackets, lowercased, so it is stable across
+/// the casing variations senders use.
+///
+/// Senders that omit the brackets entirely are still accepted when the value is
+/// a single dotted token, since that is unambiguous. Anything else -- an empty
+/// value, unbalanced brackets, a multi-word bare value -- returns `None`; the
+/// caller decides whether that deserves a scan warning.
+#[must_use]
+pub fn parse_list_id(header_value: &str) -> Option<String> {
+    let decoded = decode_rfc2047(header_value);
+    let trimmed = decoded.trim();
+
+    let candidate = match (trimmed.rfind('<'), trimmed.rfind('>')) {
+        (Some(open), Some(close)) if close > open + 1 => &trimmed[open + 1..close],
+        (None, None) if trimmed.contains('.') => trimmed,
+        _ => return None,
+    };
+
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(candidate.to_lowercase())
+}
+
+/// Build the scan warning for a `List-Id` header that was present but unparseable.
+///
+/// Mirrors the `sender: value` shape of the List-Unsubscribe warnings so the
+/// `warnings` command renders them uniformly.
+#[must_use]
+pub fn list_id_warning(sender_email: &str, header_value: &str) -> String {
+    let decoded = decode_rfc2047(header_value);
+    format!("{sender_email}: unparseable List-Id: {}", decoded.trim())
+}
+
 /// Parse a RFC 5322 From header value into `(display_name, email)`.
 ///
 /// Handles the common formats found in real-world email:

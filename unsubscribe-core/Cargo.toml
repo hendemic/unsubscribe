@@ -12,3 +12,4 @@ encoding_rs = "0.8"
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 url = "2"
+uuid = { version = "1.26.1", features = ["v4"] }

@@ -20,11 +20,11 @@ pub fn append_log_entry(result: &UnsubscribeResult, path: &Path) -> Result<()> {
         wtr.write_record(["email", "method", "success", "detail", "url"])?;
     }
     wtr.write_record([
-        &result.email,
-        &result.method,
+        result.email.as_str(),
+        result.method.label(),
         &result.success.to_string(),
-        &result.detail,
-        &result.url,
+        result.detail.as_str(),
+        result.url.as_str(),
     ])?;
     wtr.flush()?;
     Ok(())
@@ -35,7 +35,13 @@ pub(crate) fn write_log(results: &[UnsubscribeResult], path: &Path) -> Result<()
     let mut wtr = csv::Writer::from_path(path)?;
     wtr.write_record(["email", "method", "success", "detail", "url"])?;
     for r in results {
-        wtr.write_record([&r.email, &r.method, &r.success.to_string(), &r.detail, &r.url])?;
+        wtr.write_record([
+            r.email.as_str(),
+            r.method.label(),
+            &r.success.to_string(),
+            r.detail.as_str(),
+            r.url.as_str(),
+        ])?;
     }
     wtr.flush()?;
     Ok(())
@@ -44,14 +50,23 @@ pub(crate) fn write_log(results: &[UnsubscribeResult], path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unsubscribe_core::UnsubscribeMethod;
 
-    fn make_result(email: &str, method: &str, success: bool, detail: &str, url: &str) -> UnsubscribeResult {
+    fn make_result(
+        email: &str,
+        method: UnsubscribeMethod,
+        success: bool,
+        detail: &str,
+        url: &str,
+    ) -> UnsubscribeResult {
         UnsubscribeResult {
             email: email.to_string(),
-            method: method.to_string(),
+            method,
             success,
             detail: detail.to_string(),
             url: url.to_string(),
+            http_status: None,
+            final_url: None,
         }
     }
 
@@ -85,8 +100,20 @@ mod tests {
         let path = dir.path().join("log.csv");
 
         let results = vec![
-            make_result("user@example.com", "one-click POST", true, "HTTP 200", "https://example.com/unsub"),
-            make_result("other@lists.io", "GET", false, "HTTP 404", "https://lists.io/unsub"),
+            make_result(
+                "user@example.com",
+                UnsubscribeMethod::OneClickPost,
+                true,
+                "HTTP 200",
+                "https://example.com/unsub",
+            ),
+            make_result(
+                "other@lists.io",
+                UnsubscribeMethod::Get,
+                false,
+                "HTTP 404",
+                "https://lists.io/unsub",
+            ),
         ];
 
         write_log(&results, &path).unwrap();
@@ -112,7 +139,7 @@ mod tests {
         // A detail string containing a comma must be quoted in the CSV output
         let results = vec![make_result(
             "user@example.com",
-            "GET",
+            UnsubscribeMethod::Get,
             true,
             "redirect, then confirmed",
             "https://example.com/unsub",
@@ -133,7 +160,7 @@ mod tests {
 
         let results = vec![make_result(
             "user@example.com",
-            "GET",
+            UnsubscribeMethod::Get,
             false,
             r#"Error: "connection refused""#,
             "https://example.com/unsub",

@@ -70,6 +70,19 @@ pub struct SenderInfo {
     pub unsubscribe_mailto: Vec<String>,
     /// Whether RFC 8058 one-click unsubscribe is supported
     pub one_click: bool,
+    /// RFC 2919 `List-Id` of the mailing list, normalized (angle brackets
+    /// stripped, lowercased).
+    ///
+    /// Senders rotate From addresses and send through ESPs; the list identifier
+    /// is the stable thing a user actually unsubscribed from, so unsubscribe
+    /// history records it as evidence. `None` when the header was absent or
+    /// unparseable. Taken from the most recent message seen for this sender.
+    #[serde(default)]
+    pub list_id: Option<String>,
+    /// The `List-Unsubscribe` header exactly as received on the most recent
+    /// message, kept verbatim so a later violation report can quote it.
+    #[serde(default)]
+    pub list_unsubscribe_raw: Option<String>,
     /// Total number of emails from this sender
     pub email_count: u32,
     /// All messages from this sender, each tagged with its folder
@@ -104,6 +117,8 @@ mod tests {
             unsubscribe_urls: urls.into_iter().map(str::to_string).collect(),
             unsubscribe_mailto: mailtos.into_iter().map(str::to_string).collect(),
             one_click,
+            list_id: None,
+            list_unsubscribe_raw: None,
             email_count: 1,
             messages: Vec::new(),
             last_seen: None,
@@ -185,20 +200,114 @@ pub struct ScanResult {
     pub warnings: Vec<String>,
 }
 
+/// How an unsubscribe attempt was carried out.
+///
+/// Each variant has two string forms: `as_id` is the stable identifier written
+/// to the unsubscribe history and must never be renamed, `label` is the
+/// human-readable text shown in the CLI and the CSV action log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnsubscribeMethod {
+    /// RFC 8058 one-click POST to the `List-Unsubscribe` URL.
+    OneClickPost,
+    /// Plain GET of the `List-Unsubscribe` URL.
+    Get,
+    /// POST of a confirmation form found on the unsubscribe page.
+    FormPost,
+    /// GET of a confirmation form found on the unsubscribe page.
+    FormGet,
+    /// A confirmation link followed from the unsubscribe page.
+    ConfirmLink,
+    /// Unsubscribe email sent to the `mailto:` target.
+    MailtoSent,
+    /// Sending the unsubscribe email failed.
+    MailtoFailed,
+    /// Only a `mailto:` target was available and no sender was configured.
+    MailtoSkipped,
+    /// No usable unsubscribe mechanism was found.
+    None,
+    /// Nothing was attempted because the run was a dry run.
+    DryRun,
+}
+
+impl UnsubscribeMethod {
+    /// Stable identifier for storage. Changing these breaks existing history.
+    #[must_use]
+    pub fn as_id(&self) -> &'static str {
+        match self {
+            Self::OneClickPost => "one_click_post",
+            Self::Get => "get",
+            Self::FormPost => "form_post",
+            Self::FormGet => "form_get",
+            Self::ConfirmLink => "confirm_link",
+            Self::MailtoSent => "mailto_sent",
+            Self::MailtoFailed => "mailto_failed",
+            Self::MailtoSkipped => "mailto_skipped",
+            Self::None => "none",
+            Self::DryRun => "dry_run",
+        }
+    }
+
+    /// Human-readable label for CLI output and the CSV action log.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OneClickPost => "one-click POST",
+            Self::Get => "GET",
+            Self::FormPost => "form POST",
+            Self::FormGet => "form GET",
+            Self::ConfirmLink => "confirm link",
+            Self::MailtoSent => "mailto (sent)",
+            Self::MailtoFailed => "mailto (failed)",
+            Self::MailtoSkipped => "mailto (skipped)",
+            Self::None => "none",
+            Self::DryRun => "dry-run",
+        }
+    }
+
+    /// Recover a method from its stable identifier, for reading history back.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        let method = match id {
+            "one_click_post" => Self::OneClickPost,
+            "get" => Self::Get,
+            "form_post" => Self::FormPost,
+            "form_get" => Self::FormGet,
+            "confirm_link" => Self::ConfirmLink,
+            "mailto_sent" => Self::MailtoSent,
+            "mailto_failed" => Self::MailtoFailed,
+            "mailto_skipped" => Self::MailtoSkipped,
+            "none" => Self::None,
+            "dry_run" => Self::DryRun,
+            _ => return None,
+        };
+        Some(method)
+    }
+}
+
+impl fmt::Display for UnsubscribeMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Outcome of an unsubscribe attempt for a single sender.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use]
 pub struct UnsubscribeResult {
     /// Sender email address
     pub email: String,
-    /// Method used (e.g. "one-click POST", "GET", "form POST", "mailto (skipped)")
-    pub method: String,
+    /// How the attempt was carried out
+    pub method: UnsubscribeMethod,
     /// Whether the unsubscribe appeared to succeed
     pub success: bool,
     /// Human-readable detail (e.g. "HTTP 200", "Form submit error: ...")
     pub detail: String,
     /// The URL that was used for the attempt
     pub url: String,
+    /// Status code of the final HTTP response, when the attempt made one
+    pub http_status: Option<u16>,
+    /// The URL the attempt ended on after redirects, when the client reports it
+    pub final_url: Option<String>,
 }
 
 /// Response from an HTTP request, returned by `HttpClient` implementations.
@@ -208,6 +317,10 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response body as a string
     pub body: String,
+    /// The URL the request ended on after following redirects.
+    ///
+    /// `None` when the client cannot report it; it is evidence, never control flow.
+    pub final_url: Option<String>,
 }
 
 /// Which email provider protocol/API to use for an account.

@@ -6,6 +6,9 @@ use unsubscribe_core::{HttpClient, HttpResponse};
 /// Reqwest-based HTTP client adapter for the `HttpClient` trait.
 ///
 /// Uses a 60-second timeout and 5-redirect limit to match legacy behavior.
+///
+/// Every response carries the URL it ended on so unsubscribe history can record
+/// where a redirect chain actually landed.
 pub struct ReqwestHttpClient {
     client: reqwest::blocking::Client,
 }
@@ -31,9 +34,14 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("GET request failed: {url}"))?;
 
         let status = resp.status().as_u16();
+        let final_url = Some(resp.url().to_string());
         let body = resp.text().context("failed to read response body")?;
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            final_url,
+        })
     }
 
     fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
@@ -46,9 +54,14 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("GET request failed: {url}"))?;
 
         let status = resp.status().as_u16();
+        let final_url = Some(resp.url().to_string());
         let body = resp.text().context("failed to read response body")?;
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            final_url,
+        })
     }
 
     fn post_form(&self, url: &str, params: &[(&str, &str)]) -> Result<HttpResponse> {
@@ -60,9 +73,14 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST form request failed: {url}"))?;
 
         let status = resp.status().as_u16();
+        let final_url = Some(resp.url().to_string());
         let body = resp.text().context("failed to read response body")?;
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            final_url,
+        })
     }
 
     fn post_body(&self, url: &str, content_type: &str, body: &str) -> Result<HttpResponse> {
@@ -75,11 +93,13 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST body request failed: {url}"))?;
 
         let status = resp.status().as_u16();
+        let final_url = Some(resp.url().to_string());
         let resp_body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse {
             status,
             body: resp_body,
+            final_url,
         })
     }
 
@@ -103,11 +123,13 @@ impl HttpClient for ReqwestHttpClient {
             .with_context(|| format!("POST body request failed: {url}"))?;
 
         let status = resp.status().as_u16();
+        let final_url = Some(resp.url().to_string());
         let resp_body = resp.text().context("failed to read response body")?;
 
         Ok(HttpResponse {
             status,
             body: resp_body,
+            final_url,
         })
     }
 }

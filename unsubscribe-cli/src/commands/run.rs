@@ -2,42 +2,60 @@
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
-use unsubscribe_core::{AccountConfig, Credential, DataStore, Folder, SenderInfo, UnsubscribeResult};
+use unsubscribe_core::{
+    AccountConfig, Credential, DataStore, Folder, HistoryStore, ScanCacheStore, SenderInfo,
+    UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
+};
 
 use crate::action_log::append_log_entry;
-use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
+use crate::commands::load_history;
+use crate::commands::scan::{print_warnings_summary, resolve_scan};
 use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
-use crate::time::{is_stale, now_iso8601};
+use crate::time::{is_stale, now_unix_secs};
 use crate::{http, make_email_sender, make_provider, tui};
 
 pub fn cmd_run(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
+    history: Option<&dyn HistoryStore>,
     dry_run: bool,
     min_emails: u32,
     cached: bool,
+    rescan: bool,
     mailto: bool,
 ) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
     }
 
-    // Phase 1: Scan (or load from cache)
-    let (senders, warnings, scan_timestamp) = if cached {
-        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
-        eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
-        (senders, Vec::new(), Some(timestamp))
-    } else {
-        let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
-        let timestamp = now_iso8601();
-        (senders, warnings, Some(timestamp))
-    };
+    // Phase 1: Scan, or reuse a cached scan the user chose to keep
+    let resolved = resolve_scan(
+        account,
+        credential,
+        store,
+        cache_store,
+        cached,
+        rescan,
+        min_emails,
+    )?;
+    let from_cache = resolved.from_cache;
+    let warnings = resolved.warnings;
+    let senders = resolved.senders;
+    // The TUI header shows when the senders on screen were found, cached or not.
+    let scan_timestamp = Some(resolved.scanned_at);
+
+    if from_cache {
+        eprintln!(
+            "{BOLD}Using cached scan from {}{RESET}\n",
+            scan_timestamp.as_deref().unwrap_or_default()
+        );
+    }
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
-        if !cached {
+        if !from_cache {
             print_warnings_summary(&warnings);
         }
         return Ok(());
@@ -48,9 +66,12 @@ pub fn cmd_run(
         senders.len()
     );
 
-    // Phase 2: TUI selection
+    // Phase 2: TUI selection. Senders we already unsubscribed from get their own
+    // section, so a sender that ignored an unsubscribe is the first thing seen.
+    let attempts = load_history(history, &account.account_id);
+
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders, scan_timestamp.as_deref())? {
+    let selections = match tui::select_senders(senders, &attempts, scan_timestamp.as_deref())? {
         Some(s) => s,
         None => {
             eprintln!("{YELLOW}Cancelled.{RESET}");
@@ -94,7 +115,7 @@ pub fn cmd_run(
     // Phase 3: Unsubscribe — only active (non-stale) senders get HTTP unsubscribe.
     // Results are written incrementally so a later archive failure does not lose
     // the record of which senders were already unsubscribed.
-    let log_path = data_dir().join("unsubscribe_log.csv");
+    let log_path = unsubscribe_persistence::data_dir().join("unsubscribe_log.csv");
     std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
 
     // Remove any previous run's log to start fresh.
@@ -117,10 +138,12 @@ pub fn cmd_run(
                     .to_string();
                 UnsubscribeResult {
                     email: s.email.clone(),
-                    method: "dry-run".to_string(),
+                    method: UnsubscribeMethod::DryRun,
                     success: true,
                     detail: "Would unsubscribe".to_string(),
                     url,
+                    http_status: None,
+                    final_url: None,
                 }
             })
             .collect()
@@ -158,6 +181,18 @@ pub fn cmd_run(
                 // does not abort the unsubscribe run.
                 if let Err(e) = append_log_entry(&result, &log_path) {
                     eprintln!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
+                }
+                // Attempt records cannot be backfilled -- their timestamp is
+                // now -- so each one is written as soon as it is known.
+                // The history is evidence, not a prerequisite: an unavailable
+                // one costs the record, not the unsubscribe.
+                if let Some(history) = history {
+                    let attempt = attempt_from_result(&account.account_id, sender, &result);
+                    if let Err(e) = history.record_attempt(&attempt) {
+                        eprintln!(
+                            "{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}"
+                        );
+                    }
                 }
                 result
             })
@@ -230,20 +265,49 @@ pub fn cmd_run(
         account.archive_folder
     );
 
-    if !cached {
+    // The archived messages have moved, so the cached rows now point at message
+    // ids that are no longer where the cache says they are. Pruning also keeps a
+    // sender that was just handled from reappearing on the next cached run.
+    // Only a real archive prunes: a dry run changed nothing.
+    if !dry_run {
+        let archived_senders: Vec<String> = all_to_archive
+            .iter()
+            .map(|s| s.email.clone())
+            .collect();
+        if let Err(e) = cache_store.remove_cached_senders(&account.account_id, &archived_senders) {
+            eprintln!("{YELLOW}Warning: could not prune the scan cache: {e}{RESET}");
+            eprintln!("{DIM}Run `unsubscribe scan` to rebuild it.{RESET}");
+        }
+    }
+
+    if !from_cache {
         print_warnings_summary(&warnings);
     }
 
     Ok(())
 }
 
-fn data_dir() -> PathBuf {
-    let dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-            home.push(".local/share");
-            home
-        });
-    dir.join("email-unsubscribe")
+/// Build the history record for a completed attempt.
+///
+/// The sender supplies the identity evidence (domain, list id, the raw
+/// `List-Unsubscribe` header) and the result supplies what the attempt did.
+fn attempt_from_result(
+    account: &str,
+    sender: &SenderInfo,
+    result: &UnsubscribeResult,
+) -> UnsubscribeAttempt {
+    UnsubscribeAttempt::new(
+        account.to_string(),
+        sender.email.clone(),
+        sender.domain.clone(),
+        sender.list_id.clone(),
+        now_unix_secs(),
+        result.method,
+        result.success,
+        result.http_status,
+        result.url.clone(),
+        result.final_url.clone(),
+        sender.list_unsubscribe_raw.clone(),
+        result.detail.clone(),
+    )
 }

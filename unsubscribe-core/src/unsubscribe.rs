@@ -3,7 +3,7 @@ use url::{Url, form_urlencoded};
 
 use crate::parsing::parse_mailto;
 use crate::ports::{EmailSender, HttpClient};
-use crate::types::{SenderInfo, UnsubscribeResult};
+use crate::types::{SenderInfo, UnsubscribeMethod, UnsubscribeResult};
 
 // ---------------------------------------------------------------------------
 // Unsubscribe orchestration
@@ -41,6 +41,18 @@ pub fn unsubscribe(
         .collect()
 }
 
+/// What a confirmation-page follow-through produced.
+///
+/// Kept separate from `UnsubscribeResult` because the sender and the original
+/// unsubscribe URL are filled in by the caller, not by the follow-through.
+struct ConfirmOutcome {
+    method: UnsubscribeMethod,
+    success: bool,
+    detail: String,
+    http_status: Option<u16>,
+    final_url: Option<String>,
+}
+
 /// Run the unsubscribe flow for a single sender.
 fn unsubscribe_one(
     sender: &SenderInfo,
@@ -63,10 +75,12 @@ fn unsubscribe_one(
                 Ok(resp) => {
                     return UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "one-click POST".to_string(),
+                        method: UnsubscribeMethod::OneClickPost,
                         success: (200..300).contains(&resp.status),
                         detail: format!("HTTP {}", resp.status),
                         url: fallback_url,
+                        http_status: Some(resp.status),
+                        final_url: resp.final_url,
                     };
                 }
                 Err(_) => {
@@ -83,42 +97,48 @@ fn unsubscribe_one(
                 let status = resp.status;
                 if (200..300).contains(&status) {
                     // Check if the page is a confirmation form we need to submit
-                    if let Some((method, success, detail)) =
-                        try_confirm_page(http, url, &resp.body)
-                    {
+                    if let Some(outcome) = try_confirm_page(http, url, &resp.body) {
                         return UnsubscribeResult {
                             email: sender.email.clone(),
-                            method,
-                            success,
-                            detail,
+                            method: outcome.method,
+                            success: outcome.success,
+                            detail: outcome.detail,
                             url: fallback_url,
+                            http_status: outcome.http_status,
+                            final_url: outcome.final_url,
                         };
                     }
                     // No confirmation needed -- the GET itself was the unsubscribe
                     return UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "GET".to_string(),
+                        method: UnsubscribeMethod::Get,
                         success: true,
                         detail: format!("HTTP {status}"),
                         url: fallback_url,
+                        http_status: Some(status),
+                        final_url: resp.final_url,
                     };
                 } else {
                     return UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "GET".to_string(),
+                        method: UnsubscribeMethod::Get,
                         success: (300..400).contains(&status),
                         detail: format!("HTTP {status}"),
                         url: fallback_url,
+                        http_status: Some(status),
+                        final_url: resp.final_url,
                     };
                 }
             }
             Err(e) => {
                 return UnsubscribeResult {
                     email: sender.email.clone(),
-                    method: "GET".to_string(),
+                    method: UnsubscribeMethod::Get,
                     success: false,
                     detail: format!("Error: {e}"),
                     url: fallback_url,
+                    http_status: None,
+                    final_url: None,
                 };
             }
         }
@@ -142,17 +162,21 @@ fn unsubscribe_one(
                 return match sender_impl.send_email(&parsed.to, &subject, &body) {
                     Ok(()) => UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "mailto (sent)".to_string(),
+                        method: UnsubscribeMethod::MailtoSent,
                         success: true,
                         detail: format!("Email sent to {}", parsed.to),
                         url: fallback_url,
+                        http_status: None,
+                        final_url: None,
                     },
                     Err(e) => UnsubscribeResult {
                         email: sender.email.clone(),
-                        method: "mailto (failed)".to_string(),
+                        method: UnsubscribeMethod::MailtoFailed,
                         success: false,
                         detail: format!("Send failed: {e}"),
                         url: fallback_url,
+                        http_status: None,
+                        final_url: None,
                     },
                 };
             }
@@ -161,20 +185,24 @@ fn unsubscribe_one(
         // No EmailSender provided or mailto URI unparseable
         return UnsubscribeResult {
             email: sender.email.clone(),
-            method: "mailto (skipped)".to_string(),
+            method: UnsubscribeMethod::MailtoSkipped,
             success: false,
-            detail: "Only mailto unsubscribe available — requires sending email".to_string(),
+            detail: "Only mailto unsubscribe available \u{2014} requires sending email".to_string(),
             url: fallback_url,
+            http_status: None,
+            final_url: None,
         };
     }
 
     // No unsubscribe mechanism at all
     UnsubscribeResult {
         email: sender.email.clone(),
-        method: "none".to_string(),
+        method: UnsubscribeMethod::None,
         success: false,
         detail: "No unsubscribe URL found".to_string(),
         url: fallback_url,
+        http_status: None,
+        final_url: None,
     }
 }
 
@@ -184,12 +212,12 @@ fn unsubscribe_one(
 /// 1. Find and submit forms that contain unsubscribe-related keywords
 /// 2. Follow links that contain unsubscribe-related keywords
 ///
-/// Returns `Some((method, success, detail))` if a follow-through was attempted.
+/// Returns `Some(outcome)` if a follow-through was attempted.
 fn try_confirm_page(
     http: &dyn HttpClient,
     page_url: &str,
     body: &str,
-) -> Option<(String, bool, String)> {
+) -> Option<ConfirmOutcome> {
     let document = Html::parse_document(body);
 
     // Strategy 1: Submit unsubscribe-related forms
@@ -206,7 +234,7 @@ fn try_submit_form(
     http: &dyn HttpClient,
     page_url: &str,
     document: &Html,
-) -> Option<(String, bool, String)> {
+) -> Option<ConfirmOutcome> {
     let form_sel = Selector::parse("form").ok()?;
     let input_sel = Selector::parse("input").ok()?;
 
@@ -250,7 +278,8 @@ fn try_submit_form(
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        let result = if method == "GET" {
+        let is_get = method == "GET";
+        let result = if is_get {
             // Build the URL with query params for GET forms
             let get_url = if param_refs.is_empty() {
                 form_url.clone()
@@ -266,17 +295,27 @@ fn try_submit_form(
             http.post_form(&form_url, &param_refs)
         };
 
+        let form_method = if is_get {
+            UnsubscribeMethod::FormGet
+        } else {
+            UnsubscribeMethod::FormPost
+        };
+
         return match result {
-            Ok(resp) => Some((
-                format!("form {method}"),
-                (200..300).contains(&resp.status),
-                format!("HTTP {} (confirmation form)", resp.status),
-            )),
-            Err(e) => Some((
-                format!("form {method}"),
-                false,
-                format!("Form submit error: {e}"),
-            )),
+            Ok(resp) => Some(ConfirmOutcome {
+                method: form_method,
+                success: (200..300).contains(&resp.status),
+                detail: format!("HTTP {} (confirmation form)", resp.status),
+                http_status: Some(resp.status),
+                final_url: resp.final_url,
+            }),
+            Err(e) => Some(ConfirmOutcome {
+                method: form_method,
+                success: false,
+                detail: format!("Form submit error: {e}"),
+                http_status: None,
+                final_url: None,
+            }),
         };
     }
 
@@ -288,7 +327,7 @@ fn try_follow_link(
     http: &dyn HttpClient,
     page_url: &str,
     document: &Html,
-) -> Option<(String, bool, String)> {
+) -> Option<ConfirmOutcome> {
     let link_sel = Selector::parse("a[href]").ok()?;
 
     for link in document.select(&link_sel) {
@@ -305,16 +344,20 @@ fn try_follow_link(
         let link_url = resolve_url(page_url, href);
 
         return match http.get(&link_url) {
-            Ok(resp) => Some((
-                "confirm link".to_string(),
-                (200..300).contains(&resp.status),
-                format!("HTTP {} (confirmation link)", resp.status),
-            )),
-            Err(e) => Some((
-                "confirm link".to_string(),
-                false,
-                format!("Confirm link error: {e}"),
-            )),
+            Ok(resp) => Some(ConfirmOutcome {
+                method: UnsubscribeMethod::ConfirmLink,
+                success: (200..300).contains(&resp.status),
+                detail: format!("HTTP {} (confirmation link)", resp.status),
+                http_status: Some(resp.status),
+                final_url: resp.final_url,
+            }),
+            Err(e) => Some(ConfirmOutcome {
+                method: UnsubscribeMethod::ConfirmLink,
+                success: false,
+                detail: format!("Confirm link error: {e}"),
+                http_status: None,
+                final_url: None,
+            }),
         };
     }
 
@@ -389,6 +432,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: *status,
                     body: body.clone(),
+                    final_url: Some(url.to_string()),
                 })
             } else {
                 bail!("No mock response configured for {url}");
@@ -434,6 +478,8 @@ mod tests {
             unsubscribe_urls: urls.into_iter().map(String::from).collect(),
             unsubscribe_mailto: mailtos.into_iter().map(String::from).collect(),
             one_click,
+            list_id: None,
+            list_unsubscribe_raw: None,
             email_count: 1,
             messages: vec![],
             last_seen: None,
@@ -457,7 +503,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
-        assert_eq!(result.method, "one-click POST");
+        assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
         assert_eq!(result.detail, "HTTP 200");
     }
 
@@ -474,7 +520,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
-        assert_eq!(result.method, "one-click POST");
+        assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
     }
 
     #[test]
@@ -498,7 +544,7 @@ mod tests {
         let result = unsubscribe_one(&sender, &http, None);
         // POST errored, fell through to GET, GET also errored
         assert!(!result.success);
-        assert_eq!(result.method, "GET");
+        assert_eq!(result.method, UnsubscribeMethod::Get);
         assert!(result.detail.contains("Error:"));
     }
 
@@ -515,7 +561,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
-        assert_eq!(result.method, "GET");
+        assert_eq!(result.method, UnsubscribeMethod::Get);
         assert_eq!(result.detail, "HTTP 200");
     }
 
@@ -539,7 +585,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
-        assert_eq!(result.method, "form POST");
+        assert_eq!(result.method, UnsubscribeMethod::FormPost);
         assert!(result.detail.contains("confirmation form"));
     }
 
@@ -560,7 +606,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
-        assert_eq!(result.method, "confirm link");
+        assert_eq!(result.method, UnsubscribeMethod::ConfirmLink);
     }
 
     #[test]
@@ -576,7 +622,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(result.success);
-        assert_eq!(result.method, "GET");
+        assert_eq!(result.method, UnsubscribeMethod::Get);
     }
 
     #[test]
@@ -640,7 +686,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
-        assert_eq!(result.method, "GET");
+        assert_eq!(result.method, UnsubscribeMethod::Get);
         assert!(result.detail.contains("DNS resolution failed"));
     }
 
@@ -656,7 +702,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
-        assert_eq!(result.method, "mailto (skipped)");
+        assert_eq!(result.method, UnsubscribeMethod::MailtoSkipped);
         assert!(result.detail.contains("mailto"));
     }
 
@@ -667,7 +713,7 @@ mod tests {
 
         let result = unsubscribe_one(&sender, &http, None);
         assert!(!result.success);
-        assert_eq!(result.method, "none");
+        assert_eq!(result.method, UnsubscribeMethod::None);
         assert!(result.detail.contains("No unsubscribe URL found"));
     }
 
@@ -684,7 +730,7 @@ mod tests {
         );
 
         let result = unsubscribe_one(&sender, &http, None);
-        assert_eq!(result.method, "one-click POST");
+        assert_eq!(result.method, UnsubscribeMethod::OneClickPost);
         assert!(result.success);
     }
 
@@ -722,9 +768,9 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (method, success, _) = result.unwrap();
-        assert_eq!(method, "form POST");
-        assert!(success);
+        let outcome = result.unwrap();
+        assert_eq!(outcome.method, UnsubscribeMethod::FormPost);
+        assert!(outcome.success);
     }
 
     #[test]
@@ -762,8 +808,7 @@ mod tests {
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
         // First unsub form was unsub1
-        let (_, success, _) = result.unwrap();
-        assert!(success);
+        assert!(result.unwrap().success);
     }
 
     #[test]
@@ -783,9 +828,9 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (method, success, _) = result.unwrap();
-        assert_eq!(method, "form GET");
-        assert!(success);
+        let outcome = result.unwrap();
+        assert_eq!(outcome.method, UnsubscribeMethod::FormGet);
+        assert!(outcome.success);
     }
 
     #[test]
@@ -802,8 +847,7 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (method, _, _) = result.unwrap();
-        assert_eq!(method, "form POST");
+        assert_eq!(result.unwrap().method, UnsubscribeMethod::FormPost);
     }
 
     #[test]
@@ -834,8 +878,7 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (_, success, _) = result.unwrap();
-        assert!(success);
+        assert!(result.unwrap().success);
     }
 
     #[test]
@@ -948,9 +991,9 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (method, success, _) = result.unwrap();
-        assert_eq!(method, "confirm link");
-        assert!(success);
+        let outcome = result.unwrap();
+        assert_eq!(outcome.method, UnsubscribeMethod::ConfirmLink);
+        assert!(outcome.success);
     }
 
     #[test]
@@ -963,8 +1006,7 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (method, _, _) = result.unwrap();
-        assert_eq!(method, "confirm link");
+        assert_eq!(result.unwrap().method, UnsubscribeMethod::ConfirmLink);
     }
 
     #[test]
@@ -989,8 +1031,7 @@ mod tests {
 
         let result = try_confirm_page(&http, "https://example.com/page", html);
         assert!(result.is_some());
-        let (_, success, _) = result.unwrap();
-        assert!(success);
+        assert!(result.unwrap().success);
     }
 
     // -----------------------------------------------------------------------
