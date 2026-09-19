@@ -569,7 +569,14 @@ impl SettingsApp {
     fn on_action_confirm_quit(&mut self, action: Key) -> Action {
         // The same answer keys as every other confirmation in the app.
         match action {
-            Key::Mnemonic('y') | Key::Activate => Action::Quit,
+            Key::Mnemonic('y') | Key::Activate => {
+                // Inside the shell the panel outlives the answer, so the
+                // discard has to actually happen: otherwise the prompt and the
+                // edits are still there and `y` looks like it did nothing.
+                self.revert();
+                self.mode = Mode::Browse;
+                Action::Quit
+            }
             _ => {
                 self.mode = Mode::Browse;
                 Action::None
@@ -871,11 +878,21 @@ fn draw_folder_picker(f: &mut Frame, area: Rect, picker: &mut FolderPicker) {
     );
 }
 
+/// The unsaved-changes hint, built from the real save key rather than a
+/// literal letter -- the two drifted apart once already (the status line
+/// said `s` while the footer, generated from [`keys::MNEMONICS`], said `w`).
+fn unsaved_hint() -> String {
+    let key = keys::describe(Key::Mnemonic('w'))
+        .map(|hint| hint.keys)
+        .unwrap_or("w");
+    format!(" Unsaved changes. Press {key} to save.")
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
     let (style, text) = match &app.mode {
         Mode::ConfirmQuit => (
             Style::default().fg(Color::Yellow),
-            " Discard unsaved changes and quit? [y/N]".to_string(),
+            " Discard unsaved changes and leave? [y/N]".to_string(),
         ),
         _ => match app.status() {
             Some((kind, message)) => {
@@ -893,7 +910,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
             ),
             None if app.is_dirty() => (
                 Style::default().fg(Color::Yellow),
-                " Unsaved changes. Press s to save.".to_string(),
+                unsaved_hint(),
             ),
             None => (
                 Style::default().fg(Color::DarkGray),
@@ -1492,6 +1509,25 @@ mod tests {
     }
 
     #[test]
+    fn s_does_not_save_here_it_belongs_to_the_sort_order_elsewhere() {
+        // `s` is spoken for in the shared letter budget (History's sort
+        // order); Settings never offers it, so it must be a no-op rather
+        // than something that looks like it half-works.
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::None);
+        assert!(app.is_dirty(), "s must not have saved or discarded anything");
+    }
+
+    #[test]
+    fn the_unsaved_hint_names_the_key_that_actually_saves() {
+        // Regression: this hint once said "Press s to save" while the real
+        // binding -- and the footer built from it -- was `w`.
+        assert_eq!(unsaved_hint(), " Unsaved changes. Press w to save.");
+        assert_eq!(press(&mut app(), KeyCode::Char('w')), Action::Save);
+    }
+
+    #[test]
     fn a_successful_save_hands_over_the_edited_values_and_clears_the_unsaved_state() {
         let mut app = app();
         edit(&mut app, Field::ArchiveFolder, "Archive");
@@ -1587,6 +1623,8 @@ mod tests {
                 Action::Quit,
                 "{confirm:?} should confirm"
             );
+            assert!(is_browsing(&app), "the prompt should be gone");
+            assert!(!app.is_dirty(), "{confirm:?} should discard the edit");
         }
     }
 
