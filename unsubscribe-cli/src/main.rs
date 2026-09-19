@@ -1,7 +1,10 @@
 mod action_log;
 mod commands;
+mod exit;
 mod http;
+mod json;
 mod oauth;
+mod output;
 mod progress;
 mod terminal;
 mod time;
@@ -13,18 +16,39 @@ use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{
     AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, HistoryStore,
-    Preferences, ProviderType,
+    Preferences, ProviderType, SelectionPolicy,
 };
 use unsubscribe_persistence::{
     FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
 };
 
+use crate::commands::run::RunRequest;
+use crate::exit::{exit_code, Exit, ExitError, EXIT_CODE_HELP};
+use crate::terminal::{decide_colors, Tty, RED, RESET};
+
 #[derive(Parser)]
-#[command(name = "unsubscribe", about = "Bulk unsubscribe from email lists", version)]
+#[command(
+    name = "unsubscribe",
+    about = "Bulk unsubscribe from email lists",
+    version,
+    after_help = EXIT_CODE_HELP,
+)]
 pub(crate) struct Cli {
     /// Path to config file (default: ~/.config/email-unsubscribe/config.toml)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// Write the command's result to stdout as a single JSON document
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Suppress progress and status messages (errors are still reported)
+    #[arg(long, global = true)]
+    quiet: bool,
+
+    /// Disable ANSI colours (also honours the NO_COLOR environment variable)
+    #[arg(long, global = true)]
+    no_color: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -33,6 +57,10 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Scan mailbox, select senders, unsubscribe, and archive
+    ///
+    /// With no selection flag and a terminal, this opens the selection screen.
+    /// Any selection flag makes the run non-interactive: no screen, no
+    /// prompts, and an exit code a script can branch on.
     Run {
         /// Don't actually unsubscribe or archive — just show what would happen
         #[arg(long)]
@@ -47,6 +75,28 @@ enum Commands {
         /// Rescan the mailbox without asking, ignoring any cached scan
         #[arg(long, conflicts_with = "cached")]
         rescan: bool,
+        /// Select senders that ignored a previous unsubscribe
+        #[arg(long)]
+        resumed: bool,
+        /// Select every non-stale sender not previously unsubscribed from
+        #[arg(long)]
+        all_active: bool,
+        /// Select stale senders, which are archived without an attempt
+        #[arg(long)]
+        stale: bool,
+        /// Select one sender by address (repeatable)
+        #[arg(long = "sender", value_name = "EMAIL")]
+        senders: Vec<String>,
+        /// Select senders listed in a file, one address per line (`#` comments)
+        #[arg(long, value_name = "PATH")]
+        senders_file: Option<PathBuf>,
+        /// Answer every confirmation with yes
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Refuse to act on more than this many senders in one non-interactive
+        /// run. 0 lifts the cap
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        max_senders: u32,
     },
     /// Only scan and list senders with unsubscribe links
     Scan {
@@ -99,8 +149,27 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Output policy is settled before anything can print.
+    let tty = Tty::detect();
+    terminal::set_colors_enabled(decide_colors(
+        cli.no_color,
+        std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()),
+        tty.stderr,
+    ));
+    output::set_quiet(cli.quiet);
+    output::set_json_mode(cli.json);
+
+    let result = dispatch(cli, tty);
+    if let Err(e) = &result {
+        eprintln!("{RED}Error:{RESET} {e:#}");
+    }
+    std::process::ExitCode::from(exit_code(&result))
+}
+
+fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
     let config_dir = cli
         .config
         .as_deref()
@@ -110,23 +179,26 @@ fn main() -> Result<()> {
     let config_path = config_dir.join("config.toml");
 
     match &cli.command {
-        Commands::Warnings => return commands::misc::cmd_warnings(),
-        Commands::Update { pre } => return commands::update::cmd_update(*pre),
-        Commands::Init => return commands::setup::cmd_init(&config_dir),
+        Commands::Warnings => {
+            return commands::misc::cmd_warnings(&account_id_hint(&config_dir), cli.json)
+        }
+        Commands::Update { pre } => return commands::update::cmd_update(*pre).map(succeeded),
+        Commands::Init => return commands::setup::cmd_init(&config_dir).map(succeeded),
         // Routed before the config-file check below so it can give its own
         // pointer to `init` rather than the generic one.
-        Commands::Config => return commands::config::cmd_config(&config_dir),
-        Commands::Reauth => return commands::setup::cmd_reauth(&config_dir),
-        Commands::Uninstall => return commands::setup::cmd_uninstall(&config_dir),
+        Commands::Config => return commands::config::cmd_config(&config_dir).map(succeeded),
+        Commands::Reauth => return commands::setup::cmd_reauth(&config_dir).map(succeeded),
+        Commands::Uninstall => return commands::setup::cmd_uninstall(&config_dir).map(succeeded),
         Commands::Completions { shell } => return commands::misc::cmd_completions(*shell),
         _ => {}
     }
 
     if !config_path.exists() {
-        bail!(
+        return Err(ExitError::usage(format!(
             "No config file found at {}. Run `unsubscribe init` to set up your config.",
             config_path.display()
-        );
+        ))
+        .into());
     }
 
     let (account, credential) = load_account(&config_dir)?;
@@ -147,7 +219,7 @@ fn main() -> Result<()> {
     let history_store = match SqliteHistoryStore::open_default() {
         Ok(store) => Some(store),
         Err(e) => {
-            eprintln!("Warning: unsubscribe history unavailable: {e}");
+            note!("Warning: unsubscribe history unavailable: {e}");
             None
         }
     };
@@ -161,17 +233,40 @@ fn main() -> Result<()> {
             min_emails,
             cached,
             rescan,
-        } => commands::run::cmd_run(
-            &account,
-            &credential,
-            &store,
-            &cache_store,
-            history,
-            &with_min_emails(preferences, min_emails),
-            dry_run,
-            cached,
-            rescan,
-        ),
+            resumed,
+            all_active,
+            stale,
+            senders,
+            senders_file,
+            yes,
+            max_senders,
+        } => {
+            let request = RunRequest {
+                dry_run,
+                cached,
+                rescan,
+                yes,
+                json: cli.json,
+                policy: selection_policy(
+                    resumed,
+                    all_active,
+                    stale,
+                    senders,
+                    senders_file.as_deref(),
+                    max_senders,
+                )?,
+                tty,
+            };
+            commands::run::cmd_run(
+                &account,
+                &credential,
+                &store,
+                &cache_store,
+                history,
+                &with_min_emails(preferences, min_emails),
+                &request,
+            )
+        }
         Commands::Scan { min_emails } => commands::scan::cmd_scan(
             &account,
             &credential,
@@ -179,6 +274,8 @@ fn main() -> Result<()> {
             &cache_store,
             history,
             &with_min_emails(preferences, min_emails),
+            cli.json,
+            tty,
         ),
         Commands::Export {
             output,
@@ -194,8 +291,9 @@ fn main() -> Result<()> {
             &output,
             cached,
             rescan,
+            tty,
         ),
-        Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential),
+        Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential, cli.json),
         Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
@@ -204,6 +302,56 @@ fn main() -> Result<()> {
         | Commands::Uninstall
         | Commands::Completions { .. } => unreachable!(),
     }
+}
+
+/// A command that reports nothing but "it worked".
+const fn succeeded(_: ()) -> Exit {
+    Exit::Success
+}
+
+/// Assemble the selection policy from the flags that describe it.
+///
+/// The file and the repeated flag are one list: a caller keeping a long list on
+/// disk should still be able to add one address on the command line. Reading
+/// the file is the only I/O here; the rule for turning the result into a
+/// selection lives in core.
+fn selection_policy(
+    resumed: bool,
+    all_active: bool,
+    stale: bool,
+    mut senders: Vec<String>,
+    senders_file: Option<&Path>,
+    max_senders: u32,
+) -> Result<SelectionPolicy> {
+    if let Some(path) = senders_file {
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            ExitError::usage(format!(
+                "Failed to read senders file {}: {e}",
+                path.display()
+            ))
+        })?;
+        senders.extend(unsubscribe_core::parse_senders_file(&contents));
+    }
+    Ok(SelectionPolicy {
+        resumed,
+        all_active,
+        stale,
+        senders,
+        max_senders,
+    })
+}
+
+/// The account id, for commands that report before the config is loaded.
+///
+/// Best effort: `warnings` works without a config, and an empty account is a
+/// truthful answer when there is nothing configured yet.
+fn account_id_hint(config_dir: &Path) -> String {
+    TomlConfigStore::new(config_dir)
+        .read_config("")
+        .ok()
+        .flatten()
+        .map(|account| account.account_id)
+        .unwrap_or_default()
 }
 
 /// Apply a `--min-emails` flag on top of the configured preferences.
@@ -448,6 +596,7 @@ mod cli_tests {
                 rescan,
                 dry_run,
                 min_emails,
+                ..
             } => {
                 assert!(!cached);
                 assert!(!rescan);

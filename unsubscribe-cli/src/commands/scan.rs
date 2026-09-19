@@ -1,7 +1,8 @@
 //! Scan command and the scan pipeline shared with `run` and `export`:
 //! scanning the mailbox (or loading a cached scan) and printing results.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
@@ -12,8 +13,12 @@ use unsubscribe_core::{
 };
 
 use crate::commands::load_history;
+use crate::exit::{Exit, ExitError};
+use crate::json as json_out;
+use crate::note;
+use crate::output;
 use crate::progress::CliWarningsOnly;
-use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
+use crate::terminal::{Ansi, Tty, BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{
     age_secs_since, format_relative_age, is_stale, now_iso8601, now_unix_secs, utc_to_local_date,
     scan_max_age_secs,
@@ -30,8 +35,9 @@ pub fn do_scan(
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
     preferences: &Preferences,
+    tty: Tty,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
-    let obtained = run_scan(account, credential, store, cache_store, preferences)?;
+    let obtained = run_scan(account, credential, store, cache_store, preferences, tty)?;
     Ok((obtained.senders, obtained.warnings))
 }
 
@@ -42,11 +48,12 @@ fn run_scan(
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
     preferences: &Preferences,
+    tty: Tty,
 ) -> Result<ObtainedSenders> {
-    eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
+    note!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(account, credential)?;
     let folders: Vec<Folder> = account.scan_folders.iter().map(|f| Folder::new(f)).collect();
-    let scan_progress = progress::CliScanProgress::new();
+    let scan_progress = progress::CliScanProgress::new(tty.stderr);
 
     scan_senders(
         &account.account_id,
@@ -65,6 +72,7 @@ fn run_scan(
 ///
 /// The decision itself is [`decide_scan_action`] in core; this only gathers the
 /// inputs, asks the question when core says to, and carries out the answer.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_scan(
     account: &AccountConfig,
     credential: &Credential,
@@ -73,6 +81,8 @@ pub fn resolve_scan(
     cached: bool,
     rescan: bool,
     preferences: &Preferences,
+    prompts_allowed: bool,
+    tty: Tty,
 ) -> Result<ObtainedSenders> {
     let usable = load_cached_senders(
         cache_store,
@@ -89,7 +99,7 @@ pub fn resolve_scan(
         summary,
         cached,
         rescan,
-        std::io::stdin().is_terminal(),
+        prompts_allowed,
         scan_max_age_secs(preferences.cache_max_age_days),
     );
 
@@ -97,7 +107,10 @@ pub fn resolve_scan(
         ScanAction::UseCache => true,
         ScanAction::Rescan => false,
         ScanAction::CacheUnavailable => {
-            bail!("No cached scan results found. Run `unsubscribe scan` first.")
+            return Err(ExitError::usage(
+                "No cached scan results found. Run `unsubscribe scan` first.",
+            )
+            .into())
         }
         ScanAction::Ask { default_cached } => {
             let cache = usable.as_ref().expect("Ask implies a usable cache");
@@ -109,7 +122,7 @@ pub fn resolve_scan(
         return Ok(usable.expect("cache was checked before use"));
     }
 
-    run_scan(account, credential, store, cache_store, preferences)
+    run_scan(account, credential, store, cache_store, preferences, tty)
 }
 
 /// Ask whether to reuse the cached scan. Returns true for "use cached".
@@ -117,6 +130,11 @@ pub fn resolve_scan(
 /// Anything unrecognised -- including a bare Enter or a closed stdin -- takes
 /// the default, which is reuse for a fresh scan and a rescan for a stale one.
 fn prompt_use_cached(scanned_at: &str, sender_count: usize, default_cached: bool) -> Result<bool> {
+    // Belt and braces: `decide_scan_action` only asks when prompting is
+    // allowed, but nothing in this file may ever block on an unattended stdin.
+    if !std::io::stdin().is_terminal() {
+        return Ok(default_cached);
+    }
     let when = utc_to_local_date(scanned_at).unwrap_or_else(|| scanned_at.to_string());
     let age = age_secs_since(scanned_at)
         .map(format_relative_age)
@@ -156,13 +174,14 @@ pub fn print_warnings_summary(warnings: &[String]) {
     if warnings.is_empty() {
         return;
     }
-    eprintln!(
+    note!(
         "\n{YELLOW}{} email(s) had unparseable or missing List-Unsubscribe headers.{RESET}",
         warnings.len()
     );
-    eprintln!("{DIM}Run `unsubscribe warnings` to see details.{RESET}\n");
+    note!("{DIM}Run `unsubscribe warnings` to see details.{RESET}\n");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_scan(
     account: &AccountConfig,
     credential: &Credential,
@@ -170,8 +189,10 @@ pub fn cmd_scan(
     cache_store: &dyn ScanCacheStore,
     history: Option<&dyn HistoryStore>,
     preferences: &Preferences,
-) -> Result<()> {
-    let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
+    as_json: bool,
+    tty: Tty,
+) -> Result<Exit> {
+    let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences, tty)?;
 
     // Same judgement the run makes, so the two commands never disagree about
     // which sender ignored its unsubscribe -- and recording it here means a
@@ -209,10 +230,25 @@ pub fn cmd_scan(
         })
         .collect();
 
+    if as_json {
+        output::emit_json(&scan_document(
+            account,
+            &senders,
+            &verdicts,
+            preferences,
+            &warnings,
+        ))?;
+        return Ok(if senders.is_empty() {
+            Exit::NothingToDo
+        } else {
+            Exit::Success
+        });
+    }
+
     if senders.is_empty() {
-        println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
+        note!("{YELLOW}No senders with unsubscribe links found.{RESET}");
         print_warnings_summary(&warnings);
-        return Ok(());
+        return Ok(Exit::NothingToDo);
     }
 
     println!(
@@ -289,19 +325,80 @@ pub fn cmd_scan(
 
     print_warnings_summary(&warnings);
 
-    Ok(())
+    Ok(Exit::Success)
 }
 
+/// Everything `scan` found, sender by sender.
+fn scan_document(
+    account: &AccountConfig,
+    senders: &[SenderInfo],
+    verdicts: &[Option<SenderVerdict>],
+    preferences: &Preferences,
+    warnings: &[String],
+) -> Value {
+    let rows: Vec<Value> = senders
+        .iter()
+        .zip(verdicts)
+        .map(|(sender, verdict)| {
+            let mut row = json_out::identity(sender);
+            json_out::merge(
+                &mut row,
+                json!({
+                    "email_count": sender.email_count,
+                    "messages": sender.messages.len(),
+                    "last_seen": sender.last_seen,
+                    "method": json_out::offered_method(sender),
+                    "one_click": sender.one_click,
+                    "stale": is_stale(sender, preferences.stale_after_months),
+                    "history": verdict.as_ref().map(|v| json!({
+                        "previously_unsubscribed": true,
+                        "attempt_id": v.attempt_id,
+                        "unsubscribed_at": v.unsubscribed_at,
+                        "outcome": json_out::outcome(v.outcome),
+                        "violation_count": v.violation_count,
+                        "next_step": json_out::next_step(&v.next_step),
+                    })),
+                }),
+            );
+            row
+        })
+        .collect();
+
+    let mut doc = json_out::document("scan", &account.account_id);
+    doc.insert("senders".to_string(), json!(rows));
+    doc.insert(
+        "totals".to_string(),
+        json!({
+            "senders": senders.len(),
+            "emails": senders.iter().map(|s| s.email_count).sum::<u32>(),
+            "stale": senders
+                .iter()
+                .filter(|s| is_stale(s, preferences.stale_after_months))
+                .count(),
+            "previously_unsubscribed": verdicts.iter().flatten().count(),
+            "resumed": verdicts
+                .iter()
+                .flatten()
+                .filter(|v| v.outcome.is_resumed())
+                .count(),
+        }),
+    );
+    doc.insert("warnings".to_string(), json!(warnings));
+    Value::Object(doc)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_export(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
     preferences: &Preferences,
-    output: &Path,
+    output_path: &Path,
     cached: bool,
     rescan: bool,
-) -> Result<()> {
+    tty: Tty,
+) -> Result<Exit> {
     let resolved = resolve_scan(
         account,
         credential,
@@ -310,14 +407,16 @@ pub fn cmd_export(
         cached,
         rescan,
         preferences,
+        tty.stdin,
+        tty,
     )?;
     if resolved.from_cache {
-        eprintln!("{DIM}Using cached scan from {}{RESET}", resolved.scanned_at);
+        note!("{DIM}Using cached scan from {}{RESET}", resolved.scanned_at);
     }
     let senders = resolved.senders;
 
     let mut wtr =
-        csv::Writer::from_path(output).context("Failed to create CSV")?;
+        csv::Writer::from_path(output_path).context("Failed to create CSV")?;
 
     wtr.write_record([
         "name", "email", "domain", "list_id", "method", "emails", "url", "stale",
@@ -350,8 +449,11 @@ pub fn cmd_export(
     }
 
     wtr.flush()?;
-    println!("{GREEN}Exported {} senders{RESET} to {output:?}", senders.len());
-    Ok(())
+    note!(
+        "{GREEN}Exported {} senders{RESET} to {output_path:?}",
+        senders.len()
+    );
+    Ok(Exit::Success)
 }
 
 /// The policy a listing command judges senders under.
@@ -397,7 +499,7 @@ fn outcome_marker(verdict: &SenderVerdict) -> String {
     }
 }
 
-fn outcome_color(verdict: &SenderVerdict) -> &'static str {
+fn outcome_color(verdict: &SenderVerdict) -> Ansi {
     match verdict.outcome {
         UnsubscribeOutcome::Resumed { .. } => RED,
         UnsubscribeOutcome::WithinGrace { .. } => YELLOW,
@@ -584,6 +686,8 @@ mod tests {
             true,
             false,
             &Preferences::default(),
+            false,
+            Tty::detached(),
         );
         let Err(err) = result else {
             panic!("--cached with no cache must fail");
@@ -606,6 +710,8 @@ mod tests {
             true,
             false,
             &Preferences::default(),
+            false,
+            Tty::detached(),
         )
         .is_err());
     }
@@ -625,6 +731,8 @@ mod tests {
             true,
             false,
             &Preferences::default(),
+            false,
+            Tty::detached(),
         )
         .expect("the cache should satisfy --cached");
 
@@ -659,6 +767,8 @@ mod tests {
             true,
             false,
             &preferences,
+            false,
+            Tty::detached(),
         )
         .is_err());
     }

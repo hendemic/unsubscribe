@@ -2,14 +2,13 @@
 //! (re-authenticate an existing account), and `uninstall`.
 
 use anyhow::{bail, Context, Result};
-use std::io::Write;
 use std::path::Path;
 use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, Credential, CredentialStore, ProviderType};
 use unsubscribe_persistence::{
     FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
 };
 
-use crate::terminal::{prompt, prompt_password, BOLD, DIM, GREEN, RESET, YELLOW};
+use crate::terminal::{confirm, prompt, prompt_password, BOLD, DIM, GREEN, RESET, YELLOW};
 use crate::{make_credential_store, oauth};
 
 // ---------------------------------------------------------------------------
@@ -24,11 +23,7 @@ pub fn cmd_init(config_dir: &Path) -> Result<()> {
             "{YELLOW}Config already exists at {}{RESET}",
             config_path.display()
         );
-        eprint!("Overwrite? [y/N] ");
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
+        if !confirm("Overwrite?")? {
             eprintln!("Aborted.");
             return Ok(());
         }
@@ -280,11 +275,7 @@ pub fn cmd_uninstall(config_dir: &Path) -> Result<()> {
         std::env::current_exe().unwrap_or_default().display()
     );
 
-    eprint!("\n{BOLD}Are you sure?{RESET} [y/N] ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if !answer.trim().eq_ignore_ascii_case("y") {
+    if !confirm(&format!("\n{BOLD}Are you sure?{RESET}"))? {
         eprintln!("Aborted.");
         return Ok(());
     }

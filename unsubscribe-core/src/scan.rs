@@ -44,9 +44,11 @@ pub enum ScanAction {
 ///
 /// `cache` is `None` whenever the cache is unusable, and an unusable cache
 /// simply scans -- silently, because there is nothing to ask about. Explicit
-/// flags always win over the prompt, and a non-interactive caller is never
-/// asked: it takes the cache if there is one. Otherwise the user chooses, with
-/// a fresh cache defaulting to reuse and a stale one defaulting to a rescan.
+/// flags always win over the prompt. A non-interactive caller is never asked
+/// and gets what pressing Enter would have given it: a fresh cache is reused, a
+/// stale one is rescanned. That matters most for the case it exists for -- a
+/// timer whose whole job is to notice new mail must not keep reading a scan
+/// from last month.
 #[must_use]
 pub fn decide_scan_action(
     cache: Option<CachedScanSummary>,
@@ -66,7 +68,13 @@ pub fn decide_scan_action(
     }
     match cache {
         None => ScanAction::Rescan,
-        Some(_) if !interactive => ScanAction::UseCache,
+        Some(summary) if !interactive => {
+            if summary.is_stale(max_age_secs) {
+                ScanAction::Rescan
+            } else {
+                ScanAction::UseCache
+            }
+        }
         Some(summary) => ScanAction::Ask {
             default_cached: !summary.is_stale(max_age_secs),
         },
@@ -198,11 +206,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn without_a_tty_any_cache_is_used_rather_than_prompted_for() {
-        for state in [cache(0), cache(WEEK * 10), undated_cache()] {
+    fn without_a_tty_a_fresh_cache_is_used_rather_than_prompted_for() {
+        assert_eq!(
+            decide_scan_action(cache(0), false, false, false, WEEK),
+            ScanAction::UseCache
+        );
+    }
+
+    #[test]
+    fn without_a_tty_a_stale_cache_is_rescanned_rather_than_prompted_for() {
+        // What Enter would have chosen, for a caller that cannot press it.
+        for state in [cache(WEEK * 10), undated_cache()] {
             assert_eq!(
                 decide_scan_action(state, false, false, false, WEEK),
-                ScanAction::UseCache
+                ScanAction::Rescan
             );
         }
     }
