@@ -34,10 +34,72 @@ Interactive prompts will ask for your IMAP host, port, email address, app passwo
 
 ## Usage
 
-Run `unsubscribe` with no arguments and the full-screen app opens: scan the
-mailbox, review the senders it found, unsubscribe, browse the history, and
-change settings without leaving it. `?` on any screen lists that screen's keys,
-`Esc` goes back, and `q` on the home screen quits.
+Run `unsubscribe` with no arguments and the full-screen app opens: a narrow nav
+on the left, and a working area on the right that shows whatever is
+highlighted.
+
+```
+┌ Unsubscribe · you@example.com ─────────────────────────┐
+│ > Run              │ Last scan: 2h ago · 214 senders   │
+│   Unsubscribe List │ 3 resumed · 12 unsubscribed       │
+│   Warnings (2)     │                                   │
+│   Logs             │ > Scan and unsubscribe            │
+│   Settings         │   Unsubscribe from last scan      │
+│                    │                                   │
+│   Quit             │                                   │
+├────────────────────┴───────────────────────────────────┤
+│ ↑↓ move  Enter open  ? help  q quit                    │
+└────────────────────────────────────────────────────────┘
+```
+
+- **Run** — what the last scan found, and the two ways to act on it: scan the
+  mailbox afresh, or work from the last scan. The scan, the sender selection,
+  the confirmation, the run and its results all happen inside this panel.
+- **Unsubscribe List** — every sender that has been asked, what it did after,
+  and its full timeline.
+- **Warnings** — `List-Unsubscribe` headers the last scan could not parse.
+- **Logs** — every recorded event, newest first: each attempt and each sender
+  that started mailing again.
+- **Settings** — account, folders and preferences, including re-authentication.
+
+#### Keys
+
+`Enter` moves in, `Esc` moves out — exactly one level per press. `Esc` never
+quits: the app is left with `q` from the nav, or `Ctrl-C` from anywhere. These
+keys mean the same thing in every panel, sub-view and dialog.
+
+| Key | Does |
+|-----|------|
+| `↑` `↓` / `k` `j` | Move |
+| `Ctrl+↑` `Ctrl+↓` | Move five rows |
+| `PgUp` `PgDn` | Move a page |
+| `Home` `End` / `g` `G` | First / last row |
+| `Enter` | Open, confirm, or act on the highlighted row |
+| `→` | Move focus from the nav into the working area |
+| `Esc` / `←` | Back one level; from a panel's top level, back to the nav |
+| `q` | Quit — only when the nav has focus; never "back" |
+| `Ctrl-C` | Quit from anywhere |
+| `?` | Show the keys for whatever has focus |
+| `/` | Search, wherever a list is searchable |
+| `Space` | Tick or untick the row under the cursor |
+
+Panel actions are single letters. A letter means one thing throughout the app:
+
+| Key | Does | Where |
+|-----|------|-------|
+| `a` | Select all | Sender selection |
+| `n` | Select none; also "no" at a confirmation | Sender selection, dialogs |
+| `y` | Confirm (same as `Enter`) | Dialogs |
+| `s` | Cycle the sort order | Unsubscribe List |
+| `r` | Show only senders that resumed | Unsubscribe List |
+| `f` | Cycle the event filter (all / failures / resumptions) | Logs |
+| `u` | Unsubscribe from this sender again | Sender timeline |
+| `d` | Toggle dry run | Run confirmation |
+| `w` | Write the settings to disk | Settings |
+| `x` | Discard unsaved changes | Settings |
+
+While a text field has focus, printable keys type; only `Esc`, `Enter` and
+`Backspace` keep their meaning.
 
 ```
 unsubscribe                     # the app
