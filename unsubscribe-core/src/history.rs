@@ -209,7 +209,7 @@ fn latest_successful_by(
 }
 
 /// A `List-Id` trimmed and lowercased, or `None` when there is nothing usable.
-fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
+pub(crate) fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
     list_id
         .map(str::trim)
         .filter(|id| !id.is_empty())

@@ -8,20 +8,26 @@ use unsubscribe_core::{
 };
 
 use crate::action_log::append_log_entry;
+use crate::note;
 use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
 /// CLI scan progress using indicatif multi-progress bars.
 ///
 /// Displays one progress bar per folder, matching the legacy UX:
 /// folder name as prefix, position/length display, cyan bar styling.
+///
+/// A bar redrawn in place is noise in a log file, so with no terminal on
+/// stderr the same events are reported as one line each instead.
 pub struct CliScanProgress {
     mp: MultiProgress,
     style: ProgressStyle,
     bars: Mutex<HashMap<String, ProgressBar>>,
+    /// Whether to draw bars at all.
+    bars_enabled: bool,
 }
 
 impl CliScanProgress {
-    pub fn new() -> Self {
+    pub fn new(bars_enabled: bool) -> Self {
         let style = ProgressStyle::default_bar()
             .template(" \x1b[1m{prefix:<12}\x1b[0m [{bar:30.cyan/dim}] \x1b[36m{pos}\x1b[0m/{len}")
             .expect("valid progress bar template")
@@ -31,12 +37,17 @@ impl CliScanProgress {
             mp: MultiProgress::new(),
             style,
             bars: Mutex::new(HashMap::new()),
+            bars_enabled,
         }
     }
 }
 
 impl ScanProgress for CliScanProgress {
     fn on_folder_start(&self, folder: &Folder, total_messages: u32) {
+        if !self.bars_enabled {
+            note!("Scanning {} ({total_messages} messages)", folder.as_str());
+            return;
+        }
         let pb = self.mp.add(ProgressBar::new(total_messages as u64));
         pb.set_style(self.style.clone());
         pb.set_prefix(folder.as_str().to_string());
@@ -53,6 +64,10 @@ impl ScanProgress for CliScanProgress {
     }
 
     fn on_folder_done(&self, folder: &Folder) {
+        if !self.bars_enabled {
+            note!("Finished {}", folder.as_str());
+            return;
+        }
         let bars = self.bars.lock().expect("progress bar lock poisoned");
         if let Some(pb) = bars.get(folder.as_str()) {
             pb.finish();
@@ -79,15 +94,23 @@ pub struct CliRunObserver {
     /// failure still leaves a record of what was unsubscribed.
     log_path: PathBuf,
     bar: Mutex<Option<ProgressBar>>,
+    /// Whether to draw a bar; a log gets a line per sender instead.
+    bars_enabled: bool,
 }
 
 impl CliRunObserver {
-    pub fn new(dry_run: bool, archive_folder: &str, log_path: PathBuf) -> Self {
+    pub fn new(
+        dry_run: bool,
+        archive_folder: &str,
+        log_path: PathBuf,
+        bars_enabled: bool,
+    ) -> Self {
         Self {
             dry_run,
             archive_folder: archive_folder.to_string(),
             log_path,
             bar: Mutex::new(None),
+            bars_enabled,
         }
     }
 
@@ -102,8 +125,8 @@ impl RunObserver for CliRunObserver {
         if sender_count == 0 {
             return;
         }
-        eprintln!("{BOLD}Unsubscribing...{RESET}\n");
-        if self.dry_run {
+        note!("{BOLD}Unsubscribing...{RESET}\n");
+        if self.dry_run || !self.bars_enabled {
             return;
         }
         let pb = ProgressBar::new(u64::from(sender_count));
@@ -117,8 +140,15 @@ impl RunObserver for CliRunObserver {
     }
 
     fn on_sender_result(&self, _planned: &PlannedSender, result: &UnsubscribeResult) {
-        if let Some(pb) = self.bar.lock().expect("progress bar lock poisoned").as_ref() {
-            pb.inc(1);
+        match self.bar.lock().expect("progress bar lock poisoned").as_ref() {
+            Some(pb) => pb.inc(1),
+            // No bar to advance, so say what happened as it happens: an
+            // unattended run's log is the only place this is visible.
+            None if !self.dry_run => {
+                let tag = if result.success { "ok" } else { "FAILED" };
+                note!("  [{tag}] {} \u{2014} {}", result.email, result.detail);
+            }
+            None => {}
         }
         // A dry run did nothing worth logging.
         if self.dry_run {
@@ -127,7 +157,7 @@ impl RunObserver for CliRunObserver {
         // Best-effort incremental write -- a write failure is warned about but
         // does not abort the run.
         if let Err(e) = append_log_entry(result, &self.log_path) {
-            eprintln!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
+            note!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
         }
     }
 
@@ -139,7 +169,7 @@ impl RunObserver for CliRunObserver {
             return;
         }
 
-        eprintln!(
+        note!(
             "\n{BOLD}Results:{RESET} {GREEN}{} succeeded{RESET}, {RED}{} failed{RESET}\n",
             results.iter().filter(|r| r.success).count(),
             results.iter().filter(|r| !r.success).count(),
@@ -150,7 +180,7 @@ impl RunObserver for CliRunObserver {
             } else {
                 format!("{RED}[FAIL]{RESET}")
             };
-            eprintln!(
+            note!(
                 "  {tag} {:<40} {DIM}{}{}{RESET}",
                 r.email,
                 r.detail,
@@ -158,14 +188,14 @@ impl RunObserver for CliRunObserver {
             );
         }
         if !self.dry_run {
-            eprintln!("{DIM}Action log written to {}{RESET}", self.log_path.display());
+            note!("{DIM}Action log written to {}{RESET}", self.log_path.display());
         }
     }
 
     fn on_archive_start(&self, _message_count: u32, email_count: u32) {
-        eprintln!("\n{BOLD}Archiving emails...{RESET}\n");
+        note!("\n{BOLD}Archiving emails...{RESET}\n");
         if self.dry_run {
-            eprintln!(
+            note!(
                 "Dry run: would archive {email_count} emails to '{}'",
                 self.archive_folder
             );
@@ -173,7 +203,7 @@ impl RunObserver for CliRunObserver {
     }
 
     fn on_archive_done(&self, archived: u32) {
-        eprintln!(
+        note!(
             "{GREEN}Archived {archived} emails{RESET} to '{}'.",
             self.archive_folder
         );
@@ -221,20 +251,20 @@ fn escalation_note(planned: &PlannedSender) -> String {
 fn print_run_warning(warning: &RunWarning) {
     match warning {
         RunWarning::CacheUnreadable(e) => {
-            eprintln!("{YELLOW}Warning: could not read the scan cache: {e}{RESET}");
+            note!("{YELLOW}Warning: could not read the scan cache: {e}{RESET}");
         }
         RunWarning::CacheNotWritten(e) => {
-            eprintln!("{YELLOW}Warning: could not write scan cache: {e}{RESET}");
+            note!("{YELLOW}Warning: could not write scan cache: {e}{RESET}");
         }
         RunWarning::CacheNotPruned(e) => {
-            eprintln!("{YELLOW}Warning: could not prune the scan cache: {e}{RESET}");
-            eprintln!("{DIM}Run `unsubscribe scan` to rebuild it.{RESET}");
+            note!("{YELLOW}Warning: could not prune the scan cache: {e}{RESET}");
+            note!("{DIM}Run `unsubscribe scan` to rebuild it.{RESET}");
         }
         RunWarning::AttemptNotRecorded(e) => {
-            eprintln!("{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}");
+            note!("{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}");
         }
         RunWarning::ResumptionNotRecorded(e) => {
-            eprintln!("{YELLOW}Warning: could not record a resumed sender: {e}{RESET}");
+            note!("{YELLOW}Warning: could not record a resumed sender: {e}{RESET}");
         }
     }
 }

@@ -1,6 +1,7 @@
 //! CLI subcommand implementations, grouped by coherent area.
 
 pub mod config;
+pub mod history;
 pub mod misc;
 pub mod run;
 pub mod scan;
@@ -9,6 +10,7 @@ pub mod update;
 
 use unsubscribe_core::{HistoryStore, Resumption, UnsubscribeAttempt};
 
+use crate::note;
 use crate::terminal::{RESET, YELLOW};
 
 /// Everything an account's history says, as the annotation stage wants it.
@@ -35,7 +37,7 @@ pub fn load_history(history: Option<&dyn HistoryStore>, account: &str) -> Histor
 /// Half a history is better than none: a failed read warns and yields nothing.
 fn read_or_warn<T>(read: anyhow::Result<Vec<T>>, what: &str) -> Vec<T> {
     read.unwrap_or_else(|e| {
-        eprintln!("{YELLOW}Warning: could not read {what}: {e}{RESET}");
+        note!("{YELLOW}Warning: could not read {what}: {e}{RESET}");
         Vec::new()
     })
 }

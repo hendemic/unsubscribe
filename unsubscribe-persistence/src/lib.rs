@@ -3,6 +3,8 @@ mod config;
 mod credential;
 mod data;
 mod history;
+mod lock;
+pub mod settings;
 mod sqlite;
 
 pub use cache::{SqliteCacheStore, CACHE_DB_FILE};
@@ -10,6 +12,8 @@ pub use config::TomlConfigStore;
 pub use credential::KeyringCredentialStore;
 pub use data::FileDataStore;
 pub use history::{SqliteHistoryStore, HISTORY_DB_FILE};
+pub use lock::{LockInfo, LockOutcome, RunLock};
+pub use settings::{split_folders, SettingKey, SettingKind, Settings};
 
 /// Keyring service name used across all credential and config operations.
 ///

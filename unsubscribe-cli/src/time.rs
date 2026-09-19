@@ -118,6 +118,30 @@ pub fn format_relative_age(age_secs: u64) -> String {
     }
 }
 
+/// Format a Unix timestamp as "Mon DD, YYYY" in UTC.
+///
+/// UTC rather than local time: the history stores UTC, and a record that reads
+/// differently depending on where it is opened is a poor piece of evidence.
+pub fn format_unix_date(ts: i64) -> String {
+    let (year, month, day) = days_to_civil(ts.div_euclid(86400) + 719468);
+    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {day}, {year}")
+}
+
+/// Parse a date a user typed into Unix seconds (UTC).
+///
+/// Accepts `YYYY-MM-DD`, which is what anyone writes on a command line, and a
+/// full `YYYY-MM-DDThh:mm:ssZ` for anything generated.
+pub fn parse_date(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let normalized = if text.len() == 10 {
+        format!("{text}T00:00:00Z")
+    } else {
+        text.to_string()
+    };
+    parse_iso8601_age_secs(&normalized).map(|secs| secs as i64)
+}
+
 /// Convert a UTC ISO 8601 timestamp to local time as "Mon DD, YYYY hh:mm".
 pub fn utc_to_local_display(utc_ts: &str) -> Option<String> {
     let tm = local_time(utc_ts)?;

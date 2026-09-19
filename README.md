@@ -43,13 +43,16 @@ unsubscribe <command> [options]
 | `run` | Scan mailbox, select senders in a TUI, unsubscribe, and archive emails. `--dry-run` to preview without changes. `-m <n>` to set minimum email count (default: 3). |
 | `scan` | List senders that have unsubscribe links. `-m <n>` for minimum email count. Always performs a full scan. |
 | `export` | Export scan results to CSV. `-o <file>` for output path (default: `unsubscribe_senders.csv`). |
+| `history` | Show what has been asked of each sender and what it did. `--sender`, `--resumed`, `--since <date>`, `--timeline`. Reads records only; never contacts the mailbox. |
 | `warnings` | Show unparseable List-Unsubscribe headers from the last scan. |
 | `update` | Self-update to the latest GitHub release. |
 | `reauth` | Update IMAP credentials (server, username, password). |
 | `init` | Create config file with interactive setup. |
-| `config` | Edit settings in a terminal UI. |
+| `config` | Edit settings in a terminal UI, or read and change them one key at a time: `config list`, `get`, `set`, `unset`, `path`. |
 
-Global option: `-c <path>` to specify a config file.
+Global options: `-c <path>` to specify a config file, `--json` for machine-readable
+output, `--quiet` to suppress progress and status messages, `--no-color` to drop ANSI
+colours.
 
 Its recommended that you start with a dry run to see what would happen without making any changes:
 
@@ -92,6 +95,108 @@ In `~/.local/share/email-unsubscribe` (or `$XDG_DATA_HOME`):
 
 `unsubscribe uninstall` removes all of it, along with the config and the binary.
 
+## Headless operation
+
+Every command works with no terminal attached: nothing prompts, progress becomes one
+line per event instead of a redrawn bar, and colours switch off automatically. `run`
+normally opens the selection screen, so a scheduled run has to say what it wants
+instead:
+
+| Flag | Selects |
+|------|---------|
+| `--resumed` | Senders that ignored a previous unsubscribe |
+| `--all-active` | Every non-stale sender not previously unsubscribed from |
+| `--stale` | Stale senders, archived without an unsubscribe attempt |
+| `--sender <email>` | One named sender; repeat for more |
+| `--senders-file <path>` | One address per line, `#` comments |
+
+The flags combine as a union. Any of them makes the run non-interactive. Add `--yes` to
+act without a confirmation, and `--max-senders <n>` to change the safety cap (default
+50; `0` lifts it). Addresses that are not in the current scan are reported and skipped.
+
+A second `run` for the same account exits with code 5 rather than racing the first on
+the archive; a lock left behind by a crashed run is cleared automatically.
+
+```
+unsubscribe run --resumed --yes --json --quiet
+```
+
+### cron
+
+```cron
+# Re-unsubscribe from anyone who started mailing again, every night at 03:20.
+20 3 * * * /usr/local/bin/unsubscribe run --resumed --yes --quiet --json >> /var/log/unsubscribe.json 2>> /var/log/unsubscribe.err
+```
+
+### systemd timer
+
+`~/.config/systemd/user/unsubscribe.service`:
+
+```ini
+[Unit]
+Description=Re-unsubscribe from senders that resumed mailing
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/unsubscribe run --resumed --yes --quiet
+# 3 means some unsubscribes failed and 6 means there was nothing to do; neither
+# is a reason to mark the unit failed.
+SuccessExitStatus=0 3 6
+```
+
+`~/.config/systemd/user/unsubscribe.timer`:
+
+```ini
+[Unit]
+Description=Nightly unsubscribe sweep
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Then `systemctl --user enable --now unsubscribe.timer`.
+
+### Credentials without a desktop keyring
+
+A headless server usually has no keyring daemon. Point the config at a command that
+prints the password instead — it is run at startup and nothing is stored on disk:
+
+```toml
+[account]
+password_command = "pass show email/imap"
+```
+
+Anything that writes the password to stdout works: `pass`, `gopass`, `op read`,
+`systemd-creds cat`, or `cat /run/secrets/imap-password` on a machine where that file
+is locked down. Gmail accounts use OAuth and need `unsubscribe reauth` run once from a
+machine with a browser; the refresh token then lives in the keyring.
+
+### JSON output
+
+`--json` writes the command's result to **stdout** as a single document, with every
+human-readable line, progress report and warning on **stderr** — so redirecting stdout
+gives a file that parses whether or not anything went wrong. Supported on `run`,
+`scan`, `history`, `warnings` and `list-folders`.
+
+Documents carry a `schema_version` and use core's stable identifiers — method ids like
+`one_click_post`, outcome names like `resumed` — never display strings.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Unexpected error |
+| `2` | Usage error (bad flags, unknown config key, no selection flags with no terminal) |
+| `3` | Completed, but some unsubscribes failed |
+| `4` | Authentication failure |
+| `5` | Another run holds the lock for this account |
+| `6` | Nothing to do — no senders matched |
+
 ## Config
 
 Config file location: `~/.config/email-unsubscribe/config.toml`
@@ -103,6 +208,23 @@ edits it in place, so your comments and any keys the screen does not show are le
 ```
 unsubscribe config
 ```
+
+On a server, where there is no screen to open, the same settings are available one key at a
+time. Keys are the dotted paths of the TOML layout, and every write goes through the same
+validation and the same comment-preserving editor as the screen:
+
+```
+unsubscribe config list                            # every setting, and whether it is a default
+unsubscribe config get scan.folders
+unsubscribe config set scan.folders INBOX,Promotions
+unsubscribe config set preferences.grace_period_days 21
+unsubscribe config unset account.smtp_host         # restore the default
+unsubscribe config path                            # where the config and data live
+```
+
+List settings accept a comma-separated value or several arguments. `config` with no subcommand
+and no terminal behaves as `config list`. An unknown key exits with code `2`. Credentials are
+never readable or writable here — `config list` says only where they are stored.
 
 | Key | Action |
 |-----|--------|

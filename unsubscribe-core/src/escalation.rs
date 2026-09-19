@@ -39,6 +39,19 @@ impl RungMethod {
         }
     }
 
+    /// Stable identifier for machine-readable output.
+    ///
+    /// Separate from [`Self::label`] on purpose: the label is wording and may
+    /// be reworded, while this is what a script matches on.
+    #[must_use]
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Self::OneClickPost => "one_click_post",
+            Self::HttpFlow => "http_flow",
+            Self::Mailto => "mailto",
+        }
+    }
+
     /// Which rung a recorded attempt was climbing.
     ///
     /// `None` for the methods that describe an absence rather than a request:
