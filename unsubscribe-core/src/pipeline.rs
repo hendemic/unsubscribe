@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 
+use crate::escalation::{next_step, Escalation, NextStep};
 use crate::history::{
     split_previously_unsubscribed, PreviouslyUnsubscribed, Resumption, UnsubscribeAttempt,
 };
@@ -24,7 +25,7 @@ use crate::ports::{
     ScanCacheStore, ScanProgress,
 };
 use crate::types::{Folder, FolderMessage, SenderInfo, UnsubscribeMethod, UnsubscribeResult};
-use crate::unsubscribe::unsubscribe_sender;
+use crate::unsubscribe::{unsubscribe_sender, unsubscribe_via};
 
 /// Seconds in a month, taken as a twelfth of a 365-day year so that a threshold
 /// of 12 months is exactly one year.
@@ -108,10 +109,11 @@ pub trait RunObserver {
 
     /// One sender's attempt finished. Fires in dry runs as well, where the
     /// result describes what would have been tried.
-    fn on_sender_result(&self, sender: &SenderInfo, result: &UnsubscribeResult);
+    fn on_sender_result(&self, planned: &PlannedSender, result: &UnsubscribeResult);
 
-    /// Every attempt is done, with all of the results in plan order.
-    fn on_unsubscribe_done(&self, results: &[UnsubscribeResult]);
+    /// Every attempt is done. `planned` and `results` are in the same order,
+    /// so a consumer can show what each sender escalated from and to.
+    fn on_unsubscribe_done(&self, planned: &[PlannedSender], results: &[UnsubscribeResult]);
 
     /// About to archive `message_count` messages carrying `email_count` emails
     /// between them.
@@ -129,8 +131,8 @@ pub struct NoopRunObserver;
 
 impl RunObserver for NoopRunObserver {
     fn on_unsubscribe_start(&self, _sender_count: u32) {}
-    fn on_sender_result(&self, _sender: &SenderInfo, _result: &UnsubscribeResult) {}
-    fn on_unsubscribe_done(&self, _results: &[UnsubscribeResult]) {}
+    fn on_sender_result(&self, _planned: &PlannedSender, _result: &UnsubscribeResult) {}
+    fn on_unsubscribe_done(&self, _planned: &[PlannedSender], _results: &[UnsubscribeResult]) {}
     fn on_archive_start(&self, _message_count: u32, _email_count: u32) {}
     fn on_archive_done(&self, _archived: u32) {}
     fn on_warning(&self, _warning: &RunWarning) {}
@@ -341,46 +343,82 @@ pub fn record_resumptions(
 // Stage 3: plan
 // ---------------------------------------------------------------------------
 
+/// One sender the run will attempt an unsubscribe for, and how.
+#[derive(Debug, Clone)]
+pub struct PlannedSender {
+    pub sender: SenderInfo,
+    /// The full flow, or the one rung the history says to climb to next.
+    pub step: NextStep,
+}
+
+impl PlannedSender {
+    /// The escalation this attempt is, when it is one.
+    #[must_use]
+    pub fn escalation(&self) -> Option<&Escalation> {
+        match &self.step {
+            NextStep::Escalate(escalation) => Some(escalation),
+            NextStep::FirstAttempt | NextStep::Exhausted => None,
+        }
+    }
+}
+
 /// What a run will do to the senders the user selected.
 ///
 /// Stale senders are archived without an unsubscribe attempt: mail that stopped
-/// arriving a year ago is not worth poking a tracking URL for.
+/// arriving a year ago is not worth poking a tracking URL for. So are exhausted
+/// ones, for the opposite reason -- everything has been asked already.
 #[derive(Debug, Clone, Default)]
 pub struct RunPlan {
     /// Senders that get an unsubscribe attempt and then an archive.
-    pub to_unsubscribe: Vec<SenderInfo>,
-    /// Senders that are archived only.
+    pub to_unsubscribe: Vec<PlannedSender>,
+    /// Stale senders, archived only.
     pub archive_only: Vec<SenderInfo>,
+    /// Senders whose every rung is spent or broken: archived, and the
+    /// candidates for a server-side filter or a report once those exist.
+    pub exhausted: Vec<SenderInfo>,
 }
 
 impl RunPlan {
     /// Emails belonging to senders that will be unsubscribed from.
     #[must_use]
     pub fn unsubscribe_emails(&self) -> u32 {
-        self.to_unsubscribe.iter().map(|s| s.email_count).sum()
+        self.to_unsubscribe
+            .iter()
+            .map(|planned| planned.sender.email_count)
+            .sum()
     }
 
-    /// Emails belonging to senders that will only be archived.
+    /// Emails belonging to stale senders that will only be archived.
     #[must_use]
     pub fn archive_only_emails(&self) -> u32 {
         self.archive_only.iter().map(|s| s.email_count).sum()
     }
 
+    /// Emails belonging to senders with nothing left to try.
+    #[must_use]
+    pub fn exhausted_emails(&self) -> u32 {
+        self.exhausted.iter().map(|s| s.email_count).sum()
+    }
+
     /// Emails the run touches in total.
     #[must_use]
     pub fn total_emails(&self) -> u32 {
-        self.unsubscribe_emails() + self.archive_only_emails()
+        self.unsubscribe_emails() + self.archive_only_emails() + self.exhausted_emails()
     }
 
     /// Whether the plan would do nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.to_unsubscribe.is_empty() && self.archive_only.is_empty()
+        self.to_unsubscribe.is_empty() && self.archive_only.is_empty() && self.exhausted.is_empty()
     }
 
-    /// Every sender the run archives: those unsubscribed from and those not.
+    /// Every sender the run archives, whether or not it was asked to stop.
     pub fn archived_senders(&self) -> impl Iterator<Item = &SenderInfo> {
-        self.to_unsubscribe.iter().chain(self.archive_only.iter())
+        self.to_unsubscribe
+            .iter()
+            .map(|planned| &planned.sender)
+            .chain(self.archive_only.iter())
+            .chain(self.exhausted.iter())
     }
 
     /// Every message the run moves, across all archived senders.
@@ -398,18 +436,35 @@ impl RunPlan {
     }
 }
 
-/// Split the selected senders into "unsubscribe then archive" and
-/// "archive only", preserving the order they were selected in.
+/// Work out what the run will do to each selected sender.
+///
+/// Three destinations: stale senders are archived, senders whose ladder is used
+/// up are archived and noted, and everything else gets the one attempt its
+/// history says is worth making. Order within each group is the order the
+/// senders were selected in.
 #[must_use]
-pub fn plan_run(selected: Vec<SenderInfo>, policy: &RunPolicy, now: i64) -> RunPlan {
-    let (archive_only, to_unsubscribe): (Vec<_>, Vec<_>) = selected
+pub fn plan_run(
+    selected: Vec<SenderInfo>,
+    attempts: &[UnsubscribeAttempt],
+    resumptions: &[Resumption],
+    policy: &RunPolicy,
+    now: i64,
+) -> RunPlan {
+    selected
         .into_iter()
-        .partition(|s| is_stale(s, policy.stale_after_months, now));
-
-    RunPlan {
-        to_unsubscribe,
-        archive_only,
-    }
+        .fold(RunPlan::default(), |mut plan, sender| {
+            if is_stale(&sender, policy.stale_after_months, now) {
+                plan.archive_only.push(sender);
+                return plan;
+            }
+            let step = next_step(&sender, attempts, resumptions);
+            if step.is_exhausted() {
+                plan.exhausted.push(sender);
+            } else {
+                plan.to_unsubscribe.push(PlannedSender { sender, step });
+            }
+            plan
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +525,8 @@ pub fn execute_run(
     policy: &RunPolicy,
 ) -> Result<RunOutcome> {
     let results = attempt_unsubscribes(plan, ctx, policy);
-    ctx.observer.on_unsubscribe_done(&results);
+    ctx.observer
+        .on_unsubscribe_done(&plan.to_unsubscribe, &results);
 
     let messages = plan.archive_messages();
     ctx.observer
@@ -512,11 +568,25 @@ fn attempt_unsubscribes(
 
     plan.to_unsubscribe
         .iter()
-        .map(|sender| {
+        .map(|planned| {
+            let sender = &planned.sender;
             let result = if policy.dry_run {
-                dry_run_result(sender)
+                dry_run_result(planned)
             } else {
-                unsubscribe_sender(sender, ctx.http, ctx.email_sender)
+                match &planned.step {
+                    // Nothing has been ignored yet, so the sender gets the full
+                    // flow with its within-attempt fallbacks.
+                    NextStep::FirstAttempt => {
+                        unsubscribe_sender(sender, ctx.http, ctx.email_sender)
+                    }
+                    // Escalating means trying the thing that has not been tried,
+                    // so this rung and no other.
+                    NextStep::Escalate(escalation) => {
+                        unsubscribe_via(sender, &escalation.rung, ctx.http, ctx.email_sender)
+                    }
+                    // Never planned into this list; nothing sensible to attempt.
+                    NextStep::Exhausted => no_rung_left(sender),
+                }
             };
 
             // An attempt's timestamp is "now" and cannot be backfilled, so it
@@ -524,28 +594,56 @@ fn attempt_unsubscribes(
             // not a prerequisite: an unavailable one costs the record, not the
             // unsubscribe. A dry run records nothing, having done nothing.
             if let Some(history) = ctx.history.filter(|_| !policy.dry_run) {
-                let attempt =
-                    UnsubscribeAttempt::from_result(ctx.account, sender, &result, now_unix_secs());
+                let attempt = UnsubscribeAttempt::from_result(
+                    ctx.account,
+                    sender,
+                    &result,
+                    now_unix_secs(),
+                    planned
+                        .escalation()
+                        .and_then(|e| e.follows_attempt_id.clone()),
+                );
                 if let Err(e) = history.record_attempt(&attempt) {
                     ctx.observer
                         .on_warning(&RunWarning::AttemptNotRecorded(e.to_string()));
                 }
             }
 
-            ctx.observer.on_sender_result(sender, &result);
+            ctx.observer.on_sender_result(planned, &result);
             result
         })
         .collect()
 }
 
 /// What a dry run reports in place of an attempt.
-fn dry_run_result(sender: &SenderInfo) -> UnsubscribeResult {
+fn dry_run_result(planned: &PlannedSender) -> UnsubscribeResult {
+    let url = match planned.escalation() {
+        Some(escalation) => escalation.rung.target.clone(),
+        None => planned
+            .sender
+            .best_unsubscribe_url()
+            .unwrap_or_default()
+            .to_string(),
+    };
     UnsubscribeResult {
-        email: sender.email.clone(),
+        email: planned.sender.email.clone(),
         method: UnsubscribeMethod::DryRun,
         success: true,
         detail: "Would unsubscribe".to_string(),
-        url: sender.best_unsubscribe_url().unwrap_or_default().to_string(),
+        url,
+        http_status: None,
+        final_url: None,
+    }
+}
+
+/// Defensive: an exhausted sender should have been planned as archive-only.
+fn no_rung_left(sender: &SenderInfo) -> UnsubscribeResult {
+    UnsubscribeResult {
+        email: sender.email.clone(),
+        method: UnsubscribeMethod::None,
+        success: false,
+        detail: "No unsubscribe method left to try".to_string(),
+        url: String::new(),
         http_status: None,
         final_url: None,
     }

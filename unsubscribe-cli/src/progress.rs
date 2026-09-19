@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use unsubscribe_core::{
-    Folder, RunObserver, RunWarning, ScanProgress, SenderInfo, UnsubscribeResult,
+    Folder, PlannedSender, RunObserver, RunWarning, ScanProgress, UnsubscribeResult,
 };
 
 use crate::action_log::append_log_entry;
@@ -116,7 +116,7 @@ impl RunObserver for CliRunObserver {
         *self.bar.lock().expect("progress bar lock poisoned") = Some(pb);
     }
 
-    fn on_sender_result(&self, _sender: &SenderInfo, result: &UnsubscribeResult) {
+    fn on_sender_result(&self, _planned: &PlannedSender, result: &UnsubscribeResult) {
         if let Some(pb) = self.bar.lock().expect("progress bar lock poisoned").as_ref() {
             pb.inc(1);
         }
@@ -131,7 +131,7 @@ impl RunObserver for CliRunObserver {
         }
     }
 
-    fn on_unsubscribe_done(&self, results: &[UnsubscribeResult]) {
+    fn on_unsubscribe_done(&self, planned: &[PlannedSender], results: &[UnsubscribeResult]) {
         if let Some(pb) = self.bar.lock().expect("progress bar lock poisoned").take() {
             pb.finish();
         }
@@ -144,13 +144,18 @@ impl RunObserver for CliRunObserver {
             results.iter().filter(|r| r.success).count(),
             results.iter().filter(|r| !r.success).count(),
         );
-        for r in results {
+        for (planned, r) in planned.iter().zip(results) {
             let tag = if r.success {
                 format!("{GREEN}[OK]{RESET}  ")
             } else {
                 format!("{RED}[FAIL]{RESET}")
             };
-            eprintln!("  {tag} {:<40} {DIM}{}{RESET}", r.email, r.detail);
+            eprintln!(
+                "  {tag} {:<40} {DIM}{}{}{RESET}",
+                r.email,
+                r.detail,
+                escalation_note(planned)
+            );
         }
         if !self.dry_run {
             eprintln!("{DIM}Action log written to {}{RESET}", self.log_path.display());
@@ -185,12 +190,30 @@ pub struct CliWarningsOnly;
 
 impl RunObserver for CliWarningsOnly {
     fn on_unsubscribe_start(&self, _sender_count: u32) {}
-    fn on_sender_result(&self, _sender: &SenderInfo, _result: &UnsubscribeResult) {}
-    fn on_unsubscribe_done(&self, _results: &[UnsubscribeResult]) {}
+    fn on_sender_result(&self, _planned: &PlannedSender, _result: &UnsubscribeResult) {}
+    fn on_unsubscribe_done(&self, _planned: &[PlannedSender], _results: &[UnsubscribeResult]) {}
     fn on_archive_start(&self, _message_count: u32, _email_count: u32) {}
     fn on_archive_done(&self, _archived: u32) {}
     fn on_warning(&self, warning: &RunWarning) {
         print_run_warning(warning);
+    }
+}
+
+/// What a row says about climbing the ladder, when it climbed one.
+///
+/// A plain retry says nothing; an escalation names what was ignored and what
+/// was tried instead, which is the whole point of the ladder.
+fn escalation_note(planned: &PlannedSender) -> String {
+    let Some(escalation) = planned.escalation() else {
+        return String::new();
+    };
+    match escalation.from {
+        Some(from) => format!(
+            "  (escalated: {} \u{2192} {})",
+            from.label(),
+            escalation.rung.label()
+        ),
+        None => format!("  (escalated to {})", escalation.rung.label()),
     }
 }
 

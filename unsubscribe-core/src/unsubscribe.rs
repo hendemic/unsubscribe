@@ -1,6 +1,7 @@
 use scraper::{Html, Selector};
 use url::{Url, form_urlencoded};
 
+use crate::escalation::{Rung, RungMethod};
 use crate::parsing::parse_mailto;
 use crate::ports::{EmailSender, HttpClient};
 use crate::types::{SenderInfo, UnsubscribeMethod, UnsubscribeResult};
@@ -55,156 +56,211 @@ struct ConfirmOutcome {
 
 /// Run the unsubscribe flow for a single sender.
 ///
-/// Public because the run pipeline drives senders one at a time, reporting and
-/// recording each result before moving on.
-#[must_use]
+/// The full flow, with its within-attempt fallbacks: one-click POST, then the
+/// GET/form flow, then `mailto:`. This is what a sender gets the first time --
+/// and every time, until its history says which rungs are spent or broken, at
+/// which point [`unsubscribe_via`] takes over with one specific rung.
 pub fn unsubscribe_sender(
     sender: &SenderInfo,
     http: &dyn HttpClient,
     email_sender: Option<&dyn EmailSender>,
 ) -> UnsubscribeResult {
-    let fallback_url = sender
-        .best_unsubscribe_url()
-        .unwrap_or_default()
-        .to_string();
-
-    // Strategy 1: RFC 8058 one-click POST
-    if sender.one_click {
-        if let Some(url) = sender.unsubscribe_urls.first() {
-            match http.post_body(
-                url,
-                "application/x-www-form-urlencoded",
-                "List-Unsubscribe=One-Click",
-            ) {
-                Ok(resp) => {
-                    return UnsubscribeResult {
-                        email: sender.email.clone(),
-                        method: UnsubscribeMethod::OneClickPost,
-                        success: (200..300).contains(&resp.status),
-                        detail: format!("HTTP {}", resp.status),
-                        url: fallback_url,
-                        http_status: Some(resp.status),
-                        final_url: resp.final_url,
-                    };
-                }
-                Err(_) => {
-                    // Fall through to GET
-                }
-            }
-        }
+    // Strategy 1: RFC 8058 one-click POST. A transport error here falls
+    // through to the GET rather than ending the attempt.
+    let one_click_url = sender
+        .one_click
+        .then(|| sender.unsubscribe_urls.first())
+        .flatten();
+    if let Some(result) = one_click_url.and_then(|url| try_one_click_post(sender, url, http)) {
+        return result;
     }
 
-    // Strategy 2: GET the unsubscribe URL, then follow through on any confirmation page
+    // Strategy 2: GET the unsubscribe URL, then follow through on any
+    // confirmation page.
     if let Some(url) = sender.unsubscribe_urls.first() {
-        match http.get(url) {
-            Ok(resp) => {
-                let status = resp.status;
-                if (200..300).contains(&status) {
-                    // Check if the page is a confirmation form we need to submit
-                    if let Some(outcome) = try_confirm_page(http, url, &resp.body) {
-                        return UnsubscribeResult {
-                            email: sender.email.clone(),
-                            method: outcome.method,
-                            success: outcome.success,
-                            detail: outcome.detail,
-                            url: fallback_url,
-                            http_status: outcome.http_status,
-                            final_url: outcome.final_url,
-                        };
-                    }
-                    // No confirmation needed -- the GET itself was the unsubscribe
-                    return UnsubscribeResult {
-                        email: sender.email.clone(),
-                        method: UnsubscribeMethod::Get,
-                        success: true,
-                        detail: format!("HTTP {status}"),
-                        url: fallback_url,
-                        http_status: Some(status),
-                        final_url: resp.final_url,
-                    };
-                } else {
-                    return UnsubscribeResult {
-                        email: sender.email.clone(),
-                        method: UnsubscribeMethod::Get,
-                        success: (300..400).contains(&status),
-                        detail: format!("HTTP {status}"),
-                        url: fallback_url,
-                        http_status: Some(status),
-                        final_url: resp.final_url,
-                    };
-                }
-            }
-            Err(e) => {
-                return UnsubscribeResult {
-                    email: sender.email.clone(),
-                    method: UnsubscribeMethod::Get,
-                    success: false,
-                    detail: format!("Error: {e}"),
-                    url: fallback_url,
-                    http_status: None,
-                    final_url: None,
-                };
-            }
-        }
+        return http_flow(sender, url, http);
     }
 
-    // Strategy 3: mailto via EmailSender (if available)
+    // Strategy 3: mailto via EmailSender, when there is one.
     if let Some(mailto_uri) = sender.unsubscribe_mailto.first() {
-        if let Some(sender_impl) = email_sender {
-            if let Some(parsed) = parse_mailto(mailto_uri) {
-                let subject = if parsed.subject.is_empty() {
-                    "Unsubscribe".to_string()
-                } else {
-                    parsed.subject
-                };
-                let body = if parsed.body.is_empty() {
-                    "Please unsubscribe this email address.".to_string()
-                } else {
-                    parsed.body
-                };
+        return mailto_flow(sender, mailto_uri, email_sender);
+    }
 
-                return match sender_impl.send_email(&parsed.to, &subject, &body) {
-                    Ok(()) => UnsubscribeResult {
-                        email: sender.email.clone(),
-                        method: UnsubscribeMethod::MailtoSent,
-                        success: true,
-                        detail: format!("Email sent to {}", parsed.to),
-                        url: fallback_url,
-                        http_status: None,
-                        final_url: None,
-                    },
-                    Err(e) => UnsubscribeResult {
-                        email: sender.email.clone(),
-                        method: UnsubscribeMethod::MailtoFailed,
-                        success: false,
-                        detail: format!("Send failed: {e}"),
-                        url: fallback_url,
-                        http_status: None,
-                        final_url: None,
-                    },
-                };
-            }
+    no_mechanism(sender)
+}
+
+/// Attempt exactly one rung of a sender's ladder.
+///
+/// No fallbacks: the point of escalating is to try the thing that has *not*
+/// been tried, so falling back into a spent rung would undo the decision. A
+/// one-click POST that cannot even reach the server is reported as the failure
+/// it is rather than quietly becoming a GET.
+pub fn unsubscribe_via(
+    sender: &SenderInfo,
+    rung: &Rung,
+    http: &dyn HttpClient,
+    email_sender: Option<&dyn EmailSender>,
+) -> UnsubscribeResult {
+    match rung.method {
+        RungMethod::OneClickPost => try_one_click_post(sender, &rung.target, http)
+            .unwrap_or_else(|| UnsubscribeResult {
+                email: sender.email.clone(),
+                method: UnsubscribeMethod::OneClickPost,
+                success: false,
+                detail: "One-click POST failed".to_string(),
+                url: rung.target.clone(),
+                http_status: None,
+                final_url: None,
+            }),
+        RungMethod::HttpFlow => http_flow(sender, &rung.target, http),
+        RungMethod::Mailto => mailto_flow(sender, &rung.target, email_sender),
+    }
+}
+
+/// RFC 8058 one-click POST. `None` when the request never reached the server.
+fn try_one_click_post(
+    sender: &SenderInfo,
+    url: &str,
+    http: &dyn HttpClient,
+) -> Option<UnsubscribeResult> {
+    let resp = http
+        .post_body(
+            url,
+            "application/x-www-form-urlencoded",
+            "List-Unsubscribe=One-Click",
+        )
+        .ok()?;
+
+    Some(UnsubscribeResult {
+        email: sender.email.clone(),
+        method: UnsubscribeMethod::OneClickPost,
+        success: (200..300).contains(&resp.status),
+        detail: format!("HTTP {}", resp.status),
+        url: url.to_string(),
+        http_status: Some(resp.status),
+        final_url: resp.final_url,
+    })
+}
+
+/// GET the unsubscribe URL and follow through any confirmation page it serves.
+fn http_flow(sender: &SenderInfo, url: &str, http: &dyn HttpClient) -> UnsubscribeResult {
+    let resp = match http.get(url) {
+        Ok(resp) => resp,
+        Err(e) => {
+            return UnsubscribeResult {
+                email: sender.email.clone(),
+                method: UnsubscribeMethod::Get,
+                success: false,
+                detail: format!("Error: {e}"),
+                url: url.to_string(),
+                http_status: None,
+                final_url: None,
+            };
         }
+    };
 
-        // No EmailSender provided or mailto URI unparseable
+    let status = resp.status;
+    if !(200..300).contains(&status) {
+        return UnsubscribeResult {
+            email: sender.email.clone(),
+            method: UnsubscribeMethod::Get,
+            success: (300..400).contains(&status),
+            detail: format!("HTTP {status}"),
+            url: url.to_string(),
+            http_status: Some(status),
+            final_url: resp.final_url,
+        };
+    }
+
+    // The page may be a confirmation form or link we still have to follow.
+    match try_confirm_page(http, url, &resp.body) {
+        Some(outcome) => UnsubscribeResult {
+            email: sender.email.clone(),
+            method: outcome.method,
+            success: outcome.success,
+            detail: outcome.detail,
+            url: url.to_string(),
+            http_status: outcome.http_status,
+            final_url: outcome.final_url,
+        },
+        // No confirmation needed -- the GET itself was the unsubscribe.
+        None => UnsubscribeResult {
+            email: sender.email.clone(),
+            method: UnsubscribeMethod::Get,
+            success: true,
+            detail: format!("HTTP {status}"),
+            url: url.to_string(),
+            http_status: Some(status),
+            final_url: resp.final_url,
+        },
+    }
+}
+
+/// Send the unsubscribe email a `mailto:` target asks for.
+///
+/// Sent automatically, without a separate confirmation: the address came from
+/// the sender's own header. With no `EmailSender` configured -- or a URI that
+/// will not parse -- the sender is reported as skipped, never as a failed run.
+fn mailto_flow(
+    sender: &SenderInfo,
+    mailto_uri: &str,
+    email_sender: Option<&dyn EmailSender>,
+) -> UnsubscribeResult {
+    let parsed = email_sender.and_then(|impl_| parse_mailto(mailto_uri).map(|p| (impl_, p)));
+
+    let Some((email_sender, parsed)) = parsed else {
         return UnsubscribeResult {
             email: sender.email.clone(),
             method: UnsubscribeMethod::MailtoSkipped,
             success: false,
             detail: "Only mailto unsubscribe available \u{2014} requires sending email".to_string(),
-            url: fallback_url,
+            url: mailto_uri.to_string(),
             http_status: None,
             final_url: None,
         };
-    }
+    };
 
-    // No unsubscribe mechanism at all
+    let subject = if parsed.subject.is_empty() {
+        "Unsubscribe".to_string()
+    } else {
+        parsed.subject
+    };
+    let body = if parsed.body.is_empty() {
+        "Please unsubscribe this email address.".to_string()
+    } else {
+        parsed.body
+    };
+
+    match email_sender.send_email(&parsed.to, &subject, &body) {
+        Ok(()) => UnsubscribeResult {
+            email: sender.email.clone(),
+            method: UnsubscribeMethod::MailtoSent,
+            success: true,
+            detail: format!("Email sent to {}", parsed.to),
+            url: mailto_uri.to_string(),
+            http_status: None,
+            final_url: None,
+        },
+        Err(e) => UnsubscribeResult {
+            email: sender.email.clone(),
+            method: UnsubscribeMethod::MailtoFailed,
+            success: false,
+            detail: format!("Send failed: {e}"),
+            url: mailto_uri.to_string(),
+            http_status: None,
+            final_url: None,
+        },
+    }
+}
+
+/// The sender offered nothing to try.
+fn no_mechanism(sender: &SenderInfo) -> UnsubscribeResult {
     UnsubscribeResult {
         email: sender.email.clone(),
         method: UnsubscribeMethod::None,
         success: false,
         detail: "No unsubscribe URL found".to_string(),
-        url: fallback_url,
+        url: String::new(),
         http_status: None,
         final_url: None,
     }

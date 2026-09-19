@@ -108,7 +108,13 @@ pub fn cmd_run(
 
     // Phase 3: plan. Active senders get an unsubscribe attempt and an archive;
     // stale ones (no message within `stale_after_months`) are archived only.
-    let plan = plan_run(selected, &policy, now_unix_secs());
+    let plan = plan_run(
+        selected,
+        &history_view.attempts,
+        &history_view.resumptions,
+        &policy,
+        now_unix_secs(),
+    );
     announce_plan(&plan);
 
     // Phase 4: execute. The action log starts fresh each run: it is a
@@ -166,6 +172,8 @@ pub fn cmd_run(
         return Err(e);
     }
 
+    report_exhausted(&plan);
+
     if !from_cache {
         print_warnings_summary(&warnings);
     }
@@ -189,5 +197,31 @@ fn announce_plan(plan: &RunPlan) {
             plan.archive_only_emails()
         );
     }
+    if !plan.exhausted.is_empty() {
+        eprintln!(
+            "Will archive {BOLD}{}{RESET} senders with no unsubscribe method left ({} emails).",
+            plan.exhausted.len(),
+            plan.exhausted_emails()
+        );
+    }
     eprintln!("Total: {} emails.\n", plan.total_emails());
+}
+
+/// Name the senders that have run out of ways to be asked.
+///
+/// They are the input to the rungs that do not exist yet -- a server-side
+/// filter, and a report to the company or its ESP -- so the run ends by
+/// listing them rather than letting them disappear into the archive.
+fn report_exhausted(plan: &RunPlan) {
+    if plan.exhausted.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\n{YELLOW}{} sender(s) have no unsubscribe method left:{RESET}",
+        plan.exhausted.len()
+    );
+    for sender in &plan.exhausted {
+        eprintln!("  {:<40} {DIM}archived only{RESET}", sender.email);
+    }
+    eprintln!("{DIM}Every method these senders offer has been tried and ignored.{RESET}");
 }

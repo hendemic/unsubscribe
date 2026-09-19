@@ -6,7 +6,7 @@ use ratatui::widgets::*;
 use std::io;
 
 use unsubscribe_core::{
-    AnnotatedSenders, Preferences, SenderInfo, SenderVerdict, UnsubscribeOutcome,
+    AnnotatedSenders, NextStep, Preferences, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
 use crate::time::{is_scan_stale, utc_to_local_display, MONTH_NAMES};
@@ -714,6 +714,7 @@ mod tests {
             url: "https://test.com/unsub".to_string(),
             final_url: None,
             list_unsubscribe_raw: None,
+            follows_attempt_id: None,
             detail: "HTTP 200".to_string(),
         }
     }
@@ -1530,11 +1531,12 @@ fn previous_sender_row(
     is_cursor: bool,
 ) -> Line<'static> {
     let text = format!(
-        "{}  unsubscribed {}  {}{}",
+        "{}  unsubscribed {}  {}{}{}",
         sender_row_text(sender, selected),
         format_date(verdict.unsubscribed_at),
         outcome_label(verdict.outcome),
         violations_label(verdict.violation_count),
+        next_step_label(verdict),
     );
     let style = if is_cursor {
         Style::default().bg(Color::DarkGray).fg(Color::White)
@@ -1561,6 +1563,20 @@ fn outcome_label(outcome: UnsubscribeOutcome) -> String {
         UnsubscribeOutcome::Resumed { days_after } => {
             format!("resumed {days_after}d after unsubscribe")
         }
+    }
+}
+
+/// What a retry of a sender that ignored its unsubscribe would do.
+///
+/// Only shown for senders that actually resumed: for the rest, what would be
+/// tried next is not yet a question anyone is asking.
+fn next_step_label(verdict: &SenderVerdict) -> String {
+    if !verdict.outcome.is_resumed() {
+        return String::new();
+    }
+    match &verdict.next_step {
+        NextStep::Exhausted => "  exhausted \u{2014} no methods left".to_string(),
+        step => format!("  {}", step.label()),
     }
 }
 

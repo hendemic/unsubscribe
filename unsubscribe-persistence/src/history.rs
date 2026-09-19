@@ -42,6 +42,8 @@ const MIGRATIONS: &[&str] = &["
     );
     CREATE INDEX idx_resumptions_account_sender
         ON resumptions (account, sender_email);
+", "
+    ALTER TABLE unsubscribe_attempts ADD COLUMN follows_attempt_id TEXT;
 "];
 
 /// The file name used inside the data directory.
@@ -85,8 +87,9 @@ impl HistoryStore for SqliteHistoryStore {
         conn.execute(
             "INSERT INTO unsubscribe_attempts (
                  id, account, sender_email, sender_domain, list_id, attempted_at,
-                 method, success, http_status, url, final_url, list_unsubscribe_raw, detail
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 method, success, http_status, url, final_url, list_unsubscribe_raw,
+                 follows_attempt_id, detail
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 attempt.id,
                 attempt.account,
@@ -100,6 +103,7 @@ impl HistoryStore for SqliteHistoryStore {
                 attempt.url,
                 attempt.final_url,
                 attempt.list_unsubscribe_raw,
+                attempt.follows_attempt_id,
                 attempt.detail,
             ],
         )
@@ -112,7 +116,8 @@ impl HistoryStore for SqliteHistoryStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account, sender_email, sender_domain, list_id, attempted_at,
-                        method, success, http_status, url, final_url, list_unsubscribe_raw, detail
+                        method, success, http_status, url, final_url, list_unsubscribe_raw,
+                        follows_attempt_id, detail
                  FROM unsubscribe_attempts
                  WHERE account = ?1
                  ORDER BY attempted_at ASC, id ASC",
@@ -199,7 +204,8 @@ fn row_to_attempt(row: &Row<'_>) -> rusqlite::Result<UnsubscribeAttempt> {
         url: row.get(9)?,
         final_url: row.get(10)?,
         list_unsubscribe_raw: row.get(11)?,
-        detail: row.get(12)?,
+        follows_attempt_id: row.get(12)?,
+        detail: row.get(13)?,
     })
 }
 
@@ -242,6 +248,7 @@ mod tests {
             list_unsubscribe_raw: Some(
                 "<https://acme.example.com/unsub?id=1>, <mailto:u@acme.example.com>".to_string(),
             ),
+            follows_attempt_id: None,
             detail: "HTTP 202".to_string(),
         }
     }
@@ -293,6 +300,7 @@ mod tests {
             url: String::new(),
             final_url: None,
             list_unsubscribe_raw: None,
+            follows_attempt_id: None,
             detail: String::new(),
         };
 

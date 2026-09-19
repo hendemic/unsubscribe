@@ -1,3 +1,4 @@
+pub mod escalation;
 pub mod history;
 pub mod parsing;
 pub mod pipeline;
@@ -6,6 +7,7 @@ pub mod scan;
 pub mod types;
 pub mod unsubscribe;
 
+pub use escalation::*;
 pub use history::*;
 pub use parsing::*;
 pub use pipeline::*;

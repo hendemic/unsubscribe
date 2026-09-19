@@ -186,6 +186,7 @@ pub fn cmd_scan(
             judge_sender(
                 sender,
                 &latest,
+                &history_view.attempts,
                 &history_view.resumptions,
                 now,
                 policy.grace_period_days,
