@@ -209,14 +209,87 @@ pub fn describe(action: Action) -> Option<Hint> {
     Some(Hint { keys, what })
 }
 
-/// The footer line for a focus that answers `actions`.
+/// What separates two hints in the footer.
+const SEPARATOR: &str = "  |  ";
+
+/// What the footer says instead of the hints it had to drop. `?` opens the
+/// overlay that lists every key, so the one thing the footer must never lose
+/// is the way to see the rest.
+const MORE: &str = "?: more";
+
+/// The footer for a focus that answers `actions` on one line, however long
+/// it comes out.
+///
+/// Nothing on screen uses this any more -- every footer wraps -- but the
+/// tests that assert "this key is advertised" want the whole list in one
+/// string, without a width deciding what they can see.
+#[cfg(test)]
 #[must_use]
 pub fn hints(actions: &[Action]) -> String {
-    let rendered: Vec<String> = rows(actions)
+    let mut lines = hint_lines(actions, u16::MAX);
+    lines.swap_remove(0)
+}
+
+/// The footer for a focus that answers `actions`, wrapped to `width`.
+///
+/// Pure, and terminal-free, because this is where the footer either tells the
+/// truth or silently loses keys: panels now offer more actions than a single
+/// line holds, and a clipped hint is indistinguishable from a key that does
+/// not exist. Breaks only between whole `key: what` items -- half a hint is
+/// worse than no hint -- and gives up at two lines, at which point the tail
+/// becomes [`MORE`] rather than growing the footer over the working area.
+#[must_use]
+pub fn hint_lines(actions: &[Action], width: u16) -> Vec<String> {
+    let items: Vec<String> = rows(actions)
         .into_iter()
         .map(|hint| format!("{}: {}", hint.keys, hint.what))
         .collect();
-    format!(" {}", rendered.join("  |  "))
+    if items.is_empty() {
+        return vec![String::new()];
+    }
+
+    let width = width as usize;
+    if fits(&items, width) {
+        return vec![line(&items)];
+    }
+
+    // At least one item on the first line, however narrow the terminal: a
+    // line with nothing on it would push the whole footer onto the second.
+    let first = taken(&items, width, 0).max(1);
+    let rest = &items[first..];
+    if rest.is_empty() {
+        return vec![line(&items)];
+    }
+    if fits(rest, width) {
+        return vec![line(&items[..first]), line(rest)];
+    }
+
+    // Everything past two lines is dropped, so the second line ends with the
+    // way to see what was dropped.
+    let second = taken(rest, width, SEPARATOR.chars().count() + MORE.chars().count());
+    let mut tail: Vec<String> = rest[..second].to_vec();
+    tail.push(MORE.to_string());
+    vec![line(&items[..first]), line(&tail)]
+}
+
+/// One footer line: the leading space every footer has, then the items.
+fn line(items: &[String]) -> String {
+    format!(" {}", items.join(SEPARATOR))
+}
+
+/// Whether `items` fit on one line of `width`.
+fn fits(items: &[String], width: usize) -> bool {
+    line(items).chars().count() <= width
+}
+
+/// How many of `items` fit on one line of `width`, leaving `reserved`
+/// columns at the end free.
+fn taken(items: &[String], width: usize, reserved: usize) -> usize {
+    let budget = width.saturating_sub(reserved);
+    (1..=items.len())
+        .take_while(|&count| fits(&items[..count], budget))
+        .last()
+        .unwrap_or(0)
 }
 
 /// The rows the `?` overlay lists for a focus that answers `actions`.
@@ -451,6 +524,81 @@ mod tests {
             assert!(footer.contains(keys), "{keys} missing from {footer}");
             assert!(footer.contains(what), "{what} missing from {footer}");
         }
+    }
+
+    // -- wrapping ------------------------------------------------------------
+
+    /// A focus with more actions than a narrow footer can hold.
+    fn crowded() -> Vec<Action> {
+        list_actions(&[
+            Action::Toggle,
+            Action::Mnemonic('a'),
+            Action::Mnemonic('n'),
+            Action::Mnemonic('c'),
+            Action::Activate,
+        ])
+    }
+
+    fn widths(lines: &[String]) -> Vec<usize> {
+        lines.iter().map(|line| line.chars().count()).collect()
+    }
+
+    #[test]
+    fn a_footer_that_fits_stays_on_one_line() {
+        let lines = hint_lines(&crowded(), 500);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], hints(&crowded()));
+    }
+
+    #[test]
+    fn a_footer_that_does_not_fit_wraps_onto_a_second_line() {
+        let one = hints(&crowded());
+        let width = one.chars().count() as u16 / 2 + 10;
+        let lines = hint_lines(&crowded(), width);
+
+        assert_eq!(lines.len(), 2);
+        for w in widths(&lines) {
+            assert!(w <= width as usize, "{lines:?} overflows {width}");
+        }
+        // Nothing is lost when two lines are enough, and nothing is cut in
+        // the middle of a hint.
+        for (keys, what) in help_rows(&crowded()) {
+            let item = format!("{keys}: {what}");
+            assert!(
+                lines.iter().any(|line| line.contains(&item)),
+                "{item} missing from {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_footer_too_long_for_two_lines_ends_by_pointing_at_the_overlay() {
+        let lines = hint_lines(&crowded(), 30);
+
+        assert_eq!(lines.len(), 2);
+        for w in widths(&lines) {
+            assert!(w <= 30, "{lines:?} overflows 30");
+        }
+        assert!(lines[1].ends_with(MORE), "{lines:?}");
+    }
+
+    #[test]
+    fn the_way_to_see_every_key_is_never_the_hint_that_gets_dropped() {
+        // Whatever else a narrow footer loses, `?` has to survive: it is the
+        // only way back to the keys that were dropped.
+        for width in [10, 20, 30, 45, 60, 120] {
+            let lines = hint_lines(&crowded(), width);
+            assert!(
+                lines.iter().any(|line| line.contains('?')),
+                "width {width} lost `?`: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_focus_with_no_advertised_keys_has_an_empty_footer() {
+        assert_eq!(hint_lines(&[], 80), vec![String::new()]);
     }
 
     #[test]

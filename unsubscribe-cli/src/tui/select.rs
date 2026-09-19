@@ -1491,12 +1491,15 @@ mod tests {
 
 /// Draw the whole screen, standalone: title, body, and its own help line.
 fn draw(f: &mut Frame, app: &mut App) {
+    // Measured first: the footer wraps rather than clipping a key, so how
+    // many lines it needs decides the layout.
+    let footer = keys::hint_lines(&app.actions(), f.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Min(5),    // body
-            Constraint::Length(2), // help
+            Constraint::Length(3),                        // title
+            Constraint::Min(5),                           // body
+            Constraint::Length(footer.len() as u16 + 1),  // help
         ])
         .split(f.area());
 
@@ -1509,7 +1512,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     render(f, chunks[1], app);
 
     f.render_widget(
-        Paragraph::new(keys::hints(&app.actions())).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer.join("\n")).style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
 }

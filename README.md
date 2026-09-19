@@ -88,6 +88,21 @@ Quitting
 while a scan or a run is going asks too, then stops the worker cleanly — an
 attempt in flight is always finished first.
 
+Dialogs follow the same rule: every question draws its answers as buttons you
+can move onto and press — `[ Keep scanning ]  [ Stop scanning ]`,
+`[ Cancel ]  [ Run ]` — and the button says what it will do rather than
+"Confirm". `←` `→` move along the row, `Enter` or `Space` presses the
+focused button, and the confirm button starts focused so `Enter` answers a
+question as it always has. `y` still confirms and `n` or `Esc` still cancels
+from anywhere. The run confirmation adds a `[ ] Dry run` checkbox above the
+buttons: `↑` moves onto it, `Space` or `Enter` ticks it, `d` ticks it from
+anywhere in the dialog, and ticking it renames the confirm button to
+`[ Dry run ]` so the mode cannot be on without the button saying so.
+
+The footer lists the keys whatever has focus answers. When they do not fit on
+one line it wraps onto a second; when even that is not enough it ends with
+`?: more`, and `?` opens the overlay listing every key.
+
 | Key | Does |
 |-----|------|
 | `↑` `↓` / `k` `j` | Move |
@@ -110,12 +125,12 @@ Panel actions are single letters. A letter means one thing throughout the app:
 | `a` | Select all | Sender selection |
 | `n` | Select none; also "no" at a confirmation | Sender selection, dialogs |
 | `c` | Cancel what is in front of you: stop a scan or a run, discard a selection, close the results — the same as pressing the screen's `[ … ]` row | Scan, sender selection, run, results |
-| `y` | Confirm (same as `Enter`) | Dialogs |
+| `y` | Confirm, whatever the dialog has focused | Dialogs |
 | `s` | Cycle the sort order | Unsubscribe List |
 | `r` | Show only senders that resumed | Unsubscribe List |
 | `f` | Cycle the event filter (all / failures / resumptions) | Logs |
 | `u` | Unsubscribe from this sender again | Sender timeline |
-| `d` | Toggle dry run | Run confirmation |
+| `d` | Tick the dry-run checkbox, from any focus | Run confirmation |
 | `w` | Write the settings to disk | Settings |
 | `x` | Discard unsaved changes | Settings |
 

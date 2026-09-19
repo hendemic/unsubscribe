@@ -927,7 +927,10 @@ impl Shell {
                  attempt in flight is always finished first."
                     .to_string(),
             ],
-        ));
+        )
+        .with_confirm_label("Quit")
+        .with_cancel_label("Stay"),
+        );
     }
 
     /// Ask every worker to stop, and leave once they have.
@@ -992,7 +995,10 @@ impl Shell {
                         String::new(),
                         "The last complete scan stays in the cache, untouched.".to_string(),
                     ],
-                ));
+                )
+                .with_confirm_label("Stop scanning")
+                .with_cancel_label("Keep scanning"),
+                );
             }
             Effect::ConfirmCancelRun => {
                 self.pending = Some(Pending::CancelRun);
@@ -1005,7 +1011,10 @@ impl Shell {
                          already handled are still archived."
                             .to_string(),
                     ],
-                ));
+                )
+                .with_confirm_label("Stop the run")
+                .with_cancel_label("Keep going"),
+                );
             }
             Effect::CancelSelection => self.cancel_selection(),
             Effect::ConfirmCancelSelection => {
@@ -1019,7 +1028,10 @@ impl Shell {
                          senders can be selected again."
                             .to_string(),
                     ],
-                ));
+                )
+                .with_confirm_label("Discard")
+                .with_cancel_label("Keep the ticks"),
+                );
             }
             Effect::RunFromHistory => self.run_from_history(),
             Effect::SettingsSave => self.settings_save(),
@@ -1182,7 +1194,9 @@ impl Shell {
         let plan = worker::plan(selected, history, &self.ctx.policy(false), now_unix_secs());
         let counts = PlanCounts::of(&plan);
         self.dialog = Some(
-            Dialog::confirm("Confirm run", plan_summary(&plan)).with_toggle("Dry run", false),
+            Dialog::confirm("Confirm run", plan_summary(&plan))
+                .with_confirm_label("Run")
+                .with_toggle("Dry run", false),
         );
         self.pending = Some(Pending::Run {
             plan: Box::new(plan),
@@ -1257,7 +1271,9 @@ impl Shell {
         );
         let counts = PlanCounts::of(&plan);
         self.dialog = Some(
-            Dialog::confirm("Confirm run", plan_summary(&plan)).with_toggle("Dry run", false),
+            Dialog::confirm("Confirm run", plan_summary(&plan))
+                .with_confirm_label("Run")
+                .with_toggle("Dry run", false),
         );
         self.pending = Some(Pending::Run {
             plan: Box::new(plan),
@@ -1344,13 +1360,23 @@ impl Shell {
 
     fn render(&mut self, f: &mut Frame) {
         let has_status = self.status.is_some();
+        // The footer is measured before the layout is split: several panels
+        // offer more keys than one line holds, and a footer given a fixed
+        // line would clip them rather than wrap.
+        let actions = self.focus_actions();
+        let footer = match (&self.dialog, self.nav.help) {
+            (Some(dialog), _) => vec![dialog.hints().to_string()],
+            (None, true) => vec![" any key: close help".to_string()],
+            (None, false) => keys::hint_lines(&actions, f.area().width),
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),                     // header
                 Constraint::Min(5),                        // nav + working area
                 Constraint::Length(u16::from(has_status)), // status
-                Constraint::Length(1),                     // footer
+                Constraint::Length(footer.len() as u16),   // footer
             ])
             .split(f.area());
 
@@ -1361,14 +1387,8 @@ impl Shell {
             render_status(f, chunks[2], status);
         }
 
-        let actions = self.focus_actions();
-        let footer = match (&self.dialog, self.nav.help) {
-            (Some(dialog), _) => dialog.hints().to_string(),
-            (None, true) => " any key: close help".to_string(),
-            (None, false) => keys::hints(&actions),
-        };
         f.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(footer.join("\n")).style(Style::default().fg(Color::DarkGray)),
             chunks[3],
         );
 
@@ -3327,7 +3347,7 @@ mod tests {
     // `dispatch_action` the `Action` directly.
 
     mod real_keys {
-        use super::state_machine::{open, shell};
+        use super::state_machine::{open, shell, unsubscribing};
         use super::*;
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -3352,6 +3372,61 @@ mod tests {
                 shell.panels.settings.as_ref().unwrap().0.is_dirty(),
                 "the fixture did not dirty the screen"
             );
+        }
+
+        /// The question the Run workflow asks, with its dry-run switch.
+        fn asking_to_run(shell: &mut Shell) {
+            shell.dialog = Some(
+                Dialog::confirm("Confirm run", ["3 senders.".to_string()])
+                    .with_confirm_label("Run")
+                    .with_toggle("Dry run", false),
+            );
+            shell.pending = Some(Pending::CancelRun);
+        }
+
+        #[test]
+        fn a_question_is_answered_by_its_buttons_through_the_real_key_path() {
+            // The shell hands the keys to whatever the dialog has focused, so
+            // the button the user is looking at is the one Enter presses.
+            let mut shell = unsubscribing();
+            asking_to_run(&mut shell);
+
+            shell.handle_key(key(KeyCode::Left));
+            shell.handle_key(key(KeyCode::Enter));
+
+            assert!(shell.dialog.is_none(), "the question was answered");
+            assert!(shell.pending.is_none());
+            assert!(shell.work_in_flight(), "Cancel means the run was left alone");
+        }
+
+        #[test]
+        fn enter_on_the_confirm_button_resolves_what_was_pending() {
+            let mut shell = unsubscribing();
+            asking_to_run(&mut shell);
+
+            shell.handle_key(key(KeyCode::Enter));
+
+            assert!(shell.dialog.is_none());
+            assert!(shell.pending.is_none(), "the pending question was carried out");
+        }
+
+        #[test]
+        fn the_switch_the_shell_reads_is_the_one_the_user_ticked() {
+            // Both ways of ticking it -- the hotkey, and Space on the focused
+            // checkbox -- have to leave the same value for `resolve` to read.
+            for tick in [KeyCode::Char('d'), KeyCode::Char(' ')] {
+                let mut shell = unsubscribing();
+                asking_to_run(&mut shell);
+                if tick == KeyCode::Char(' ') {
+                    shell.handle_key(key(KeyCode::Up));
+                }
+
+                shell.handle_key(key(tick));
+
+                let dialog = shell.dialog.as_ref().expect("still asking");
+                assert!(dialog.toggled(), "{tick:?} should tick the box");
+                assert_eq!(dialog.confirm_button_label(), "Dry run", "{tick:?}");
+            }
         }
 
         #[test]

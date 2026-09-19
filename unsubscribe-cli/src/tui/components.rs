@@ -58,12 +58,23 @@ impl Button {
 /// highlighting something that will not answer `Enter` is a lie.
 #[must_use]
 pub fn button_line(button: Button, focused: bool) -> Line<'static> {
-    let style = match (button.enabled, focused) {
+    Line::from(vec![
+        Span::raw("   "),
+        button_span(button.label, button.enabled, focused),
+    ])
+}
+
+/// One `[ Label ]` as a span, so a row can hold more than one of them.
+///
+/// The single place the button style is written: a dialog's buttons and a
+/// screen's action row have to be recognisable as the same control.
+fn button_span(label: &str, enabled: bool, focused: bool) -> Span<'static> {
+    let style = match (enabled, focused) {
         (false, _) => Style::default().fg(Color::DarkGray),
         (true, true) => Style::default().bg(Color::DarkGray).fg(Color::White),
         (true, false) => Style::default().fg(Color::Cyan),
     };
-    Line::styled(format!("   [ {} ]", button.label), style)
+    Span::styled(format!("[ {label} ]"), style)
 }
 
 /// The same row as its own widget, for a screen that gives it a line of the
@@ -74,14 +85,48 @@ pub fn button(button: Button, focused: bool) -> Paragraph<'static> {
 }
 
 /// A modal question or notice, drawn over whatever screen is beneath it.
+///
+/// Every question carries its buttons as state rather than as decoration:
+/// the keys act on whatever has focus, so the control the user is looking at
+/// and the control that answers `Enter` can never come apart. Hotkeys stay
+/// accelerators on top of that -- `y`, `n` and `Esc` answer from any focus --
+/// because nothing here should be reachable only by knowing a letter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dialog {
     pub kind: DialogKind,
     pub title: String,
     pub body: Vec<String>,
-    /// An extra yes/no the dialog carries, shown as a checkbox and toggled
-    /// with `d`. Used for the run confirmation's dry-run switch.
+    /// An extra yes/no the dialog carries, shown as a checkbox above the
+    /// buttons. Used for the run confirmation's dry-run switch.
     pub toggle: Option<DialogToggle>,
+    /// The verb on the button that says yes, so a question names what it is
+    /// about to do rather than saying "Confirm".
+    pub confirm_label: String,
+    pub cancel_label: String,
+    /// Which control the keys act on.
+    pub focus: DialogFocus,
+    /// Which button the row is on, remembered while focus is on the
+    /// checkbox so that coming back lands where the user left.
+    pub button: DialogButton,
+}
+
+/// Which of a dialog's controls the keys act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogFocus {
+    /// The checkbox, when the dialog has one.
+    Toggle,
+    #[default]
+    Button,
+}
+
+/// The two buttons every question offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogButton {
+    Cancel,
+    /// The default: `Enter` answers a question the way it always has,
+    /// without the user first having to walk to a button.
+    #[default]
+    Confirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +163,10 @@ impl Dialog {
             title: title.into(),
             body: body.into_iter().collect(),
             toggle: None,
+            confirm_label: "Confirm".to_string(),
+            cancel_label: "Cancel".to_string(),
+            focus: DialogFocus::default(),
+            button: DialogButton::default(),
         }
     }
 
@@ -129,7 +178,27 @@ impl Dialog {
             title: title.into(),
             body: wrapped_lines(&message.into()),
             toggle: None,
+            confirm_label: "OK".to_string(),
+            cancel_label: "OK".to_string(),
+            focus: DialogFocus::default(),
+            button: DialogButton::default(),
         }
+    }
+
+    /// Name what saying yes will do. A question whose button says "Confirm"
+    /// makes the user re-read the body to find out what they agreed to.
+    #[must_use]
+    pub fn with_confirm_label(mut self, label: impl Into<String>) -> Self {
+        self.confirm_label = label.into();
+        self
+    }
+
+    /// Name what backing out leaves behind, where "Cancel" would be
+    /// ambiguous -- "Cancel" on a question about cancelling a scan is a trap.
+    #[must_use]
+    pub fn with_cancel_label(mut self, label: impl Into<String>) -> Self {
+        self.cancel_label = label.into();
+        self
     }
 
     /// Add a switch the user can flip before confirming.
@@ -158,15 +227,66 @@ impl Dialog {
             return DialogOutcome::Confirmed;
         }
         match keys::action(key, false) {
+            // The accelerators answer from any focus: they are how the
+            // question was always answered, and giving it focusable buttons
+            // must not have taken that away.
+            Some(Action::Mnemonic('y')) => DialogOutcome::Confirmed,
+            Some(Action::Back | Action::Mnemonic('n')) => DialogOutcome::Dismissed,
             Some(Action::Mnemonic('d')) if self.toggle.is_some() => {
-                if let Some(toggle) = self.toggle.as_mut() {
-                    toggle.on = !toggle.on;
-                }
+                self.flip();
                 DialogOutcome::Open
             }
-            Some(Action::Activate | Action::Mnemonic('y')) => DialogOutcome::Confirmed,
-            Some(Action::Back | Action::Mnemonic('n')) => DialogOutcome::Dismissed,
+            Some(Action::MoveUp) if self.toggle.is_some() => {
+                self.focus = DialogFocus::Toggle;
+                DialogOutcome::Open
+            }
+            Some(Action::MoveDown) if self.toggle.is_some() => {
+                self.focus = DialogFocus::Button;
+                DialogOutcome::Open
+            }
+            Some(Action::FocusOut) => {
+                self.move_button(DialogButton::Cancel);
+                DialogOutcome::Open
+            }
+            Some(Action::FocusIn) => {
+                self.move_button(DialogButton::Confirm);
+                DialogOutcome::Open
+            }
+            // Enter and Space act on whatever has focus, which is what makes
+            // the buttons controls rather than a picture of controls.
+            Some(Action::Activate | Action::Toggle) => match (self.focus, self.button) {
+                (DialogFocus::Toggle, _) => {
+                    self.flip();
+                    DialogOutcome::Open
+                }
+                (DialogFocus::Button, DialogButton::Cancel) => DialogOutcome::Dismissed,
+                (DialogFocus::Button, DialogButton::Confirm) => DialogOutcome::Confirmed,
+            },
             _ => DialogOutcome::Open,
+        }
+    }
+
+    /// Flip the switch, wherever focus happens to be.
+    fn flip(&mut self) {
+        if let Some(toggle) = self.toggle.as_mut() {
+            toggle.on = !toggle.on;
+        }
+    }
+
+    /// Move along the button row, which also brings focus down off the
+    /// checkbox: a sideways key is only ever about the buttons.
+    fn move_button(&mut self, button: DialogButton) {
+        self.focus = DialogFocus::Button;
+        self.button = button;
+    }
+
+    /// What the confirm button says. A switch that is on renames the button
+    /// after itself, so the mode cannot be on without the button saying so.
+    #[must_use]
+    pub fn confirm_button_label(&self) -> &str {
+        match &self.toggle {
+            Some(toggle) if toggle.on => &toggle.label,
+            _ => &self.confirm_label,
         }
     }
 
@@ -174,9 +294,13 @@ impl Dialog {
     pub fn hints(&self) -> &str {
         match self.kind {
             DialogKind::Confirm if self.toggle.is_some() => {
-                " Enter/y: confirm | d: toggle dry run | Esc/n: cancel"
+                " \u{2191}\u{2193}\u{2190}\u{2192}: move  |  Space/Enter: activate  |  \
+                 d: toggle dry run  |  y: confirm  |  n/Esc: cancel"
             }
-            DialogKind::Confirm => " Enter/y: confirm | Esc/n: cancel",
+            DialogKind::Confirm => {
+                " \u{2190}\u{2192}: move  |  Space/Enter: activate  |  y: confirm  |  \
+                 n/Esc: cancel"
+            }
             DialogKind::Error => " any key: dismiss",
         }
     }
@@ -232,18 +356,18 @@ impl StatusMessage {
 
 /// Draw a dialog centred over the whole frame, clearing what is under it.
 pub fn render_dialog(f: &mut Frame, dialog: &Dialog) {
-    let lines: Vec<Line> = dialog
+    let mut lines: Vec<Line> = dialog
         .body
         .iter()
         .map(|line| Line::raw(format!(" {line}")))
-        .chain(dialog.toggle.iter().map(|toggle| {
-            let checkbox = if toggle.on { "[x]" } else { "[ ]" };
-            Line::styled(
-                format!(" {checkbox} {}", toggle.label),
-                Style::default().fg(Color::Yellow),
-            )
-        }))
         .collect();
+
+    if let Some(toggle) = &dialog.toggle {
+        lines.push(Line::raw(""));
+        lines.push(checkbox_line(toggle, dialog.focus == DialogFocus::Toggle));
+    }
+    lines.push(Line::raw(""));
+    lines.push(button_row(dialog));
 
     let height = (lines.len() as u16 + 4).min(f.area().height);
     let width = lines
@@ -269,6 +393,43 @@ pub fn render_dialog(f: &mut Frame, dialog: &Dialog) {
         ),
         area,
     );
+}
+
+/// The checkbox row, drawn the way a tickable row is drawn everywhere else
+/// so that a control which answers Space looks like one.
+fn checkbox_line(toggle: &DialogToggle, focused: bool) -> Line<'static> {
+    let checkbox = if toggle.on { "[x]" } else { "[ ]" };
+    let style = if focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White).bold()
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Line::styled(format!(" {checkbox} {}", toggle.label), style)
+}
+
+/// A question's buttons; a notice has only the one that dismisses it.
+fn button_row(dialog: &Dialog) -> Line<'static> {
+    if dialog.kind == DialogKind::Error {
+        return Line::from(vec![
+            Span::raw("   "),
+            button_span(&dialog.confirm_label, true, true),
+        ]);
+    }
+    let on_row = dialog.focus == DialogFocus::Button;
+    Line::from(vec![
+        Span::raw("   "),
+        button_span(
+            &dialog.cancel_label,
+            true,
+            on_row && dialog.button == DialogButton::Cancel,
+        ),
+        Span::raw("  "),
+        button_span(
+            dialog.confirm_button_label(),
+            true,
+            on_row && dialog.button == DialogButton::Confirm,
+        ),
+    ])
 }
 
 /// Draw the help overlay: the keys the current screen answers to.
@@ -368,13 +529,19 @@ mod tests {
         );
     }
 
+    /// A button row carries its style on the button itself, so a row can
+    /// hold more than one of them.
+    fn button_style(line: &Line<'_>) -> Style {
+        line.spans.last().expect("a button").style
+    }
+
     #[test]
     fn a_button_with_the_cursor_is_highlighted_and_one_without_is_not() {
         let focused = button_line(Button::new("Close"), true);
         let idle = button_line(Button::new("Close"), false);
 
-        assert_ne!(focused.style, idle.style);
-        assert_eq!(focused.style.bg, Some(Color::DarkGray));
+        assert_ne!(button_style(&focused), button_style(&idle));
+        assert_eq!(button_style(&focused).bg, Some(Color::DarkGray));
     }
 
     #[test]
@@ -384,10 +551,10 @@ mod tests {
         let button = Button::inert("Stopping\u{2026}");
 
         assert_eq!(
-            button_line(button, true).style,
-            button_line(button, false).style
+            button_style(&button_line(button, true)),
+            button_style(&button_line(button, false))
         );
-        assert_eq!(button_line(button, true).style.bg, None);
+        assert_eq!(button_style(&button_line(button, true)).bg, None);
         assert!(!button.enabled);
     }
 
@@ -491,6 +658,187 @@ mod tests {
         assert!(!confirm().hints().contains("dry run"));
     }
 
+    #[test]
+    fn every_question_advertises_its_buttons_rather_than_only_its_hotkeys() {
+        for dialog in [confirm(), toggling()] {
+            let hints = dialog.hints();
+            assert!(hints.contains("move"), "{hints}");
+            assert!(hints.contains("activate"), "{hints}");
+            assert!(hints.contains("y: confirm"), "{hints}");
+            assert!(hints.contains("n/Esc: cancel"), "{hints}");
+        }
+        assert_eq!(Dialog::error("x", "y").hints(), " any key: dismiss");
+    }
+
+    // -- the buttons every question carries ---------------------------------
+
+    fn toggling() -> Dialog {
+        Dialog::confirm("Confirm run", ["3 senders.".to_string()])
+            .with_confirm_label("Run")
+            .with_toggle("Dry run", false)
+    }
+
+    /// The text of the row the renderer draws, buttons and all.
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_question_starts_on_its_confirm_button_so_enter_still_answers_it() {
+        // Muscle memory: Enter has always meant yes, and giving the dialog
+        // focusable controls must not add a keypress to the common answer.
+        for dialog in [confirm(), toggling()] {
+            assert_eq!(dialog.focus, DialogFocus::Button);
+            assert_eq!(dialog.button, DialogButton::Confirm);
+        }
+    }
+
+    #[test]
+    fn left_and_right_walk_the_button_row() {
+        let mut dialog = confirm();
+
+        assert_eq!(dialog.on_key(key(KeyCode::Left)), DialogOutcome::Open);
+        assert_eq!(dialog.button, DialogButton::Cancel);
+        assert_eq!(dialog.on_key(key(KeyCode::Right)), DialogOutcome::Open);
+        assert_eq!(dialog.button, DialogButton::Confirm);
+    }
+
+    #[test]
+    fn enter_and_space_answer_whichever_button_has_focus() {
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut dialog = confirm();
+            dialog.on_key(key(KeyCode::Left));
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Dismissed, "{code:?}");
+
+            let mut dialog = confirm();
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Confirmed, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn the_checkbox_is_a_focus_stop_above_the_buttons() {
+        let mut dialog = toggling();
+
+        for code in [KeyCode::Up, KeyCode::Char('k')] {
+            dialog.focus = DialogFocus::Button;
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Open);
+            assert_eq!(dialog.focus, DialogFocus::Toggle, "{code:?}");
+        }
+        for code in [KeyCode::Down, KeyCode::Char('j')] {
+            dialog.focus = DialogFocus::Toggle;
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Open);
+            assert_eq!(dialog.focus, DialogFocus::Button, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_question_with_no_checkbox_has_no_stop_to_move_up_to() {
+        let mut dialog = confirm();
+
+        assert_eq!(dialog.on_key(key(KeyCode::Up)), DialogOutcome::Open);
+        assert_eq!(dialog.focus, DialogFocus::Button, "there is nowhere to go");
+    }
+
+    #[test]
+    fn space_and_enter_on_the_checkbox_tick_it_rather_than_answering() {
+        for code in [KeyCode::Char(' '), KeyCode::Enter] {
+            let mut dialog = toggling();
+            dialog.on_key(key(KeyCode::Up));
+
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Open, "{code:?}");
+            assert!(dialog.toggled(), "{code:?} should tick the box");
+            assert_eq!(dialog.on_key(key(code)), DialogOutcome::Open);
+            assert!(!dialog.toggled(), "and untick it");
+        }
+    }
+
+    #[test]
+    fn a_sideways_key_from_the_checkbox_lands_on_the_button_it_names() {
+        let mut dialog = toggling();
+        dialog.on_key(key(KeyCode::Up));
+
+        dialog.on_key(key(KeyCode::Left));
+
+        assert_eq!(dialog.focus, DialogFocus::Button);
+        assert_eq!(dialog.button, DialogButton::Cancel);
+    }
+
+    #[test]
+    fn the_hotkeys_still_answer_from_any_focus() {
+        for focus in [DialogFocus::Toggle, DialogFocus::Button] {
+            for button in [DialogButton::Cancel, DialogButton::Confirm] {
+                let mut dialog = toggling();
+                (dialog.focus, dialog.button) = (focus, button);
+                assert_eq!(dialog.on_key(key(KeyCode::Char('y'))), DialogOutcome::Confirmed);
+
+                let mut dialog = toggling();
+                (dialog.focus, dialog.button) = (focus, button);
+                assert_eq!(dialog.on_key(key(KeyCode::Char('n'))), DialogOutcome::Dismissed);
+
+                let mut dialog = toggling();
+                (dialog.focus, dialog.button) = (focus, button);
+                assert_eq!(dialog.on_key(key(KeyCode::Esc)), DialogOutcome::Dismissed);
+
+                let mut dialog = toggling();
+                (dialog.focus, dialog.button) = (focus, button);
+                assert_eq!(dialog.on_key(key(KeyCode::Char('d'))), DialogOutcome::Open);
+                assert!(dialog.toggled(), "d ticks the box wherever focus is");
+            }
+        }
+    }
+
+    // -- what the buttons say ------------------------------------------------
+
+    #[test]
+    fn a_question_names_what_saying_yes_will_do() {
+        let dialog = Dialog::confirm("Cancel the scan", [])
+            .with_confirm_label("Stop scanning")
+            .with_cancel_label("Keep scanning");
+
+        assert_eq!(row_text(&button_row(&dialog)), "   [ Keep scanning ]  [ Stop scanning ]");
+    }
+
+    #[test]
+    fn a_question_that_was_given_no_labels_still_reads_as_a_question() {
+        assert_eq!(row_text(&button_row(&confirm())), "   [ Cancel ]  [ Confirm ]");
+    }
+
+    #[test]
+    fn a_ticked_switch_renames_the_button_after_itself() {
+        // The mode cannot be on without the button the user presses saying so.
+        let mut dialog = toggling();
+        assert_eq!(dialog.confirm_button_label(), "Run");
+
+        dialog.on_key(key(KeyCode::Char('d')));
+
+        assert_eq!(dialog.confirm_button_label(), "Dry run");
+        assert!(row_text(&button_row(&dialog)).contains("[ Dry run ]"));
+    }
+
+    #[test]
+    fn a_notice_offers_only_the_button_that_dismisses_it() {
+        let dialog = Dialog::error("Run failed", "connection refused");
+
+        assert_eq!(row_text(&button_row(&dialog)), "   [ OK ]");
+    }
+
+    #[test]
+    fn the_focused_control_is_highlighted_the_way_a_focused_row_is() {
+        let ticked = checkbox_line(&DialogToggle { label: "Dry run".to_string(), on: true }, true);
+        let idle = checkbox_line(&DialogToggle { label: "Dry run".to_string(), on: true }, false);
+
+        assert_eq!(ticked.style.bg, Some(Color::DarkGray));
+        assert_eq!(idle.style.bg, None);
+        assert_eq!(
+            button_span("Run", true, true).style.bg,
+            Some(Color::DarkGray),
+            "a button and a row agree on what focus looks like"
+        );
+    }
+
     // -- transient status ----------------------------------------------------
 
     #[test]
@@ -505,3 +853,4 @@ mod tests {
         assert_eq!(StatusMessage::warning("careful").kind, StatusKind::Warning);
     }
 }
+
