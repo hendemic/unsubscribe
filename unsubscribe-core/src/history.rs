@@ -1000,3 +1000,649 @@ mod from_result_tests {
         assert_eq!(attempt.attempted_at, -42);
     }
 }
+
+/// Outcome detection: whether a sender honoured an unsubscribe, which sender a
+/// recorded attempt belongs to, and what gets written down when it did not.
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::escalation::NextStep;
+    use crate::types::UnsubscribeMethod;
+
+    const DAY: i64 = 24 * 60 * 60;
+    /// When the successful unsubscribe happened, for every test below.
+    const UNSUB: i64 = 1_700_000_000;
+    /// The default grace period, in days.
+    const GRACE: u32 = 14;
+    const ACCOUNT: &str = "user@example.com";
+
+    fn attempt(id: &str, sender_email: &str, at: i64, success: bool) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: id.to_string(),
+            account: ACCOUNT.to_string(),
+            sender_email: sender_email.to_string(),
+            sender_domain: "acme.example.com".to_string(),
+            list_id: None,
+            attempted_at: at,
+            method: UnsubscribeMethod::OneClickPost.as_id().to_string(),
+            success,
+            http_status: Some(200),
+            url: "https://acme.example.com/unsub".to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            follows_attempt_id: None,
+            detail: String::new(),
+        }
+    }
+
+    fn success(id: &str, sender_email: &str, at: i64) -> UnsubscribeAttempt {
+        attempt(id, sender_email, at, true)
+    }
+
+    fn failure(id: &str, sender_email: &str, at: i64) -> UnsubscribeAttempt {
+        attempt(id, sender_email, at, false)
+    }
+
+    /// A scanned sender whose newest message is dated `last_seen`.
+    fn sender(email: &str, last_seen: Option<i64>) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+            unsubscribe_mailto: vec!["mailto:unsub@acme.example.com".to_string()],
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: 5,
+            messages: Vec::new(),
+            last_seen,
+        }
+    }
+
+    fn with_list_id(mut sender: SenderInfo, list_id: &str) -> SenderInfo {
+        sender.list_id = Some(list_id.to_string());
+        sender
+    }
+
+    /// An observation already on record against `attempt_id`.
+    fn recorded(attempt_id: &str) -> Resumption {
+        Resumption {
+            id: format!("res-{attempt_id}"),
+            account: ACCOUNT.to_string(),
+            sender_email: "news@acme.example.com".to_string(),
+            list_id: None,
+            attempt_id: attempt_id.to_string(),
+            observed_at: UNSUB + 20 * DAY,
+            last_seen: UNSUB + 19 * DAY,
+            email_count: 3,
+        }
+    }
+
+    /// The single verdict `split_previously_unsubscribed` produced, or a panic.
+    fn verdict_for(
+        sender: SenderInfo,
+        attempts: &[UnsubscribeAttempt],
+        resumptions: &[Resumption],
+        now: i64,
+    ) -> SenderVerdict {
+        let sections =
+            split_previously_unsubscribed(vec![sender], attempts, resumptions, now, GRACE);
+        assert!(
+            sections.remaining.is_empty(),
+            "the sender should have matched the history"
+        );
+        sections
+            .previously_unsubscribed
+            .into_iter()
+            .next()
+            .expect("one verdict")
+            .verdict
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_outcome: what counts as new mail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mail_dated_before_the_unsubscribe_is_not_new_mail() {
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB - 1), UNSUB + DAY, GRACE),
+            UnsubscribeOutcome::NoNewMail
+        );
+    }
+
+    #[test]
+    fn mail_dated_at_the_very_second_of_the_unsubscribe_is_not_new_mail() {
+        // The mail being archived was received before the request went out.
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB), UNSUB + DAY, GRACE),
+            UnsubscribeOutcome::NoNewMail
+        );
+    }
+
+    #[test]
+    fn a_sender_the_scan_could_not_date_is_never_a_violation() {
+        assert_eq!(
+            classify_outcome(UNSUB, None, UNSUB + 900 * DAY, GRACE),
+            UnsubscribeOutcome::NoNewMail
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_outcome: the grace boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mail_one_second_before_the_grace_period_ends_is_within_grace() {
+        // 14 days of grace, 4 days elapsed: 10 whole days left.
+        assert_eq!(
+            classify_outcome(
+                UNSUB,
+                Some(UNSUB + 14 * DAY - 1),
+                UNSUB + 4 * DAY,
+                GRACE,
+            ),
+            UnsubscribeOutcome::WithinGrace { days_left: 10 }
+        );
+    }
+
+    #[test]
+    fn mail_at_the_last_second_of_the_grace_period_is_still_within_grace() {
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB + 14 * DAY), UNSUB + 14 * DAY, GRACE),
+            UnsubscribeOutcome::WithinGrace { days_left: 0 }
+        );
+    }
+
+    #[test]
+    fn mail_one_second_after_the_grace_period_ends_is_a_resumption() {
+        assert_eq!(
+            classify_outcome(
+                UNSUB,
+                Some(UNSUB + 14 * DAY + 1),
+                UNSUB + 15 * DAY,
+                GRACE,
+            ),
+            UnsubscribeOutcome::Resumed { days_after: 14 }
+        );
+    }
+
+    #[test]
+    fn a_grace_period_of_zero_makes_the_next_message_a_resumption() {
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB + 1), UNSUB + 1, 0),
+            UnsubscribeOutcome::Resumed { days_after: 0 }
+        );
+    }
+
+    #[test]
+    fn a_grace_period_of_zero_still_ignores_mail_from_before_the_unsubscribe() {
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB), UNSUB + DAY, 0),
+            UnsubscribeOutcome::NoNewMail
+        );
+    }
+
+    #[test]
+    fn the_longest_allowed_grace_period_keeps_old_mail_inside_it() {
+        // 3650 days is the top of the configurable range.
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB + 3_000 * DAY), UNSUB, 3_650),
+            UnsubscribeOutcome::WithinGrace { days_left: 3_650 }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_outcome: the numbers the rows display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn days_left_never_goes_negative_once_the_window_has_closed() {
+        // The sender mailed once, inside its window, and has been quiet since.
+        // Re-judging it as resumed later would accuse it of something it did
+        // not do, so it stays `WithinGrace` with nothing left on the clock.
+        assert_eq!(
+            classify_outcome(UNSUB, Some(UNSUB + DAY), UNSUB + 40 * DAY, GRACE),
+            UnsubscribeOutcome::WithinGrace { days_left: 0 }
+        );
+    }
+
+    #[test]
+    fn days_after_counts_whole_days_and_drops_the_remainder() {
+        assert_eq!(
+            classify_outcome(
+                UNSUB,
+                Some(UNSUB + 23 * DAY + 3 * 3_600),
+                UNSUB + 24 * DAY,
+                GRACE,
+            ),
+            UnsubscribeOutcome::Resumed { days_after: 23 }
+        );
+    }
+
+    #[test]
+    fn only_a_resumption_reports_itself_as_one() {
+        assert!(UnsubscribeOutcome::Resumed { days_after: 1 }.is_resumed());
+        assert!(!UnsubscribeOutcome::WithinGrace { days_left: 1 }.is_resumed());
+        assert!(!UnsubscribeOutcome::NoNewMail.is_resumed());
+    }
+
+    // -----------------------------------------------------------------------
+    // Which successful attempt anchors the judgement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_later_failed_attempt_does_not_reset_the_clock() {
+        // If the failure anchored the judgement, mail from day 20 would predate
+        // it and the sender would look innocent.
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            failure("f1", "news@acme.example.com", UNSUB + 30 * DAY),
+        ];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 20 * DAY)),
+            &attempts,
+            &[],
+            UNSUB + 40 * DAY,
+        );
+
+        assert_eq!(verdict.unsubscribed_at, UNSUB);
+        assert_eq!(
+            verdict.outcome,
+            UnsubscribeOutcome::Resumed { days_after: 20 }
+        );
+    }
+
+    #[test]
+    fn a_later_successful_attempt_does_reset_the_clock() {
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            success("s2", "news@acme.example.com", UNSUB + 30 * DAY),
+        ];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 20 * DAY)),
+            &attempts,
+            &[],
+            UNSUB + 40 * DAY,
+        );
+
+        assert_eq!(verdict.unsubscribed_at, UNSUB + 30 * DAY);
+        assert_eq!(verdict.outcome, UnsubscribeOutcome::NoNewMail);
+    }
+
+    // -----------------------------------------------------------------------
+    // Matching a recorded attempt to a scanned sender
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_id_decides_when_both_sides_carry_one() {
+        // The From address rotated; the list did not.
+        let mut recorded_attempt = success("s1", "bounce-1@esp.example.net", UNSUB);
+        recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
+        let scanned = with_list_id(
+            sender("bounce-2@esp.example.net", None),
+            "weekly.acme.example.com",
+        );
+
+        assert!(recorded_attempt.is_about(&scanned));
+    }
+
+    #[test]
+    fn a_different_list_id_on_the_same_address_is_a_different_list() {
+        let mut recorded_attempt = success("s1", "news@acme.example.com", UNSUB);
+        recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
+        let scanned = with_list_id(
+            sender("news@acme.example.com", None),
+            "daily.acme.example.com",
+        );
+
+        assert!(!recorded_attempt.is_about(&scanned));
+    }
+
+    #[test]
+    fn matching_falls_back_to_the_address_when_the_sender_has_no_list_id() {
+        let mut recorded_attempt = success("s1", "news@acme.example.com", UNSUB);
+        recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
+
+        assert!(recorded_attempt.is_about(&sender("news@acme.example.com", None)));
+        assert!(!recorded_attempt.is_about(&sender("deals@acme.example.com", None)));
+    }
+
+    #[test]
+    fn address_matching_ignores_case() {
+        let recorded_attempt = success("s1", "News@Acme.Example.COM", UNSUB);
+
+        assert!(recorded_attempt.is_about(&sender("news@acme.example.com", None)));
+    }
+
+    #[test]
+    fn list_id_matching_ignores_case_and_surrounding_space() {
+        let mut recorded_attempt = success("s1", "bounce@esp.example.net", UNSUB);
+        recorded_attempt.list_id = Some("  Weekly.Acme.Example.COM  ".to_string());
+        let scanned = with_list_id(
+            sender("someone-else@esp.example.net", None),
+            "weekly.acme.example.com",
+        );
+
+        assert!(recorded_attempt.is_about(&scanned));
+    }
+
+    #[test]
+    fn a_blank_list_id_is_treated_as_no_list_id() {
+        // A header that parsed to nothing must not make every blank-id attempt
+        // match every blank-id sender.
+        let mut recorded_attempt = success("s1", "news@acme.example.com", UNSUB);
+        recorded_attempt.list_id = Some("   ".to_string());
+        let scanned = with_list_id(sender("deals@acme.example.com", None), "  ");
+
+        assert!(!recorded_attempt.is_about(&scanned));
+    }
+
+    #[test]
+    fn a_resumption_is_matched_to_a_sender_the_same_way_an_attempt_is() {
+        let mut observation = recorded("s1");
+        observation.sender_email = "bounce-1@esp.example.net".to_string();
+        observation.list_id = Some("weekly.acme.example.com".to_string());
+
+        let same_list = with_list_id(
+            sender("bounce-2@esp.example.net", None),
+            "weekly.acme.example.com",
+        );
+        let other_list = with_list_id(
+            sender("bounce-1@esp.example.net", None),
+            "daily.acme.example.com",
+        );
+
+        assert!(observation.is_about(&same_list));
+        assert!(!observation.is_about(&other_list));
+    }
+
+    #[test]
+    fn the_indexed_history_finds_a_sender_by_its_list_id_after_the_address_rotates() {
+        let mut recorded_attempt = success("s1", "bounce-1@esp.example.net", UNSUB);
+        recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
+        let latest = LatestAttempts::from_history(&[recorded_attempt]);
+
+        let found = latest.for_sender(&with_list_id(
+            sender("bounce-2@esp.example.net", None),
+            "weekly.acme.example.com",
+        ));
+
+        assert_eq!(found.map(|a| a.id.as_str()), Some("s1"));
+    }
+
+    #[test]
+    fn an_indexed_history_with_no_successes_is_empty() {
+        let latest =
+            LatestAttempts::from_history(&[failure("f1", "news@acme.example.com", UNSUB)]);
+
+        assert!(latest.is_empty());
+        assert!(latest.for_sender(&sender("news@acme.example.com", None)).is_none());
+    }
+
+    #[test]
+    #[ignore = "bug: LatestAttempts::for_sender falls back to the address even when both sides carry a different list id (issue #99)"]
+    fn a_different_list_id_on_the_same_address_is_not_previously_unsubscribed() {
+        // `UnsubscribeAttempt::is_about` says these are two different lists, so
+        // the sections must agree. They do not: `for_sender` only consults the
+        // list index when the *scanned* list id is a key in it, and otherwise
+        // falls through to the address, matching an attempt recorded against a
+        // different list. The sender is then judged against an attempt that
+        // `next_step` does not consider its own, so the row reads "resumed"
+        // while the next step reads "full flow" -- and a resumption is recorded
+        // blaming an unsubscribe for another list.
+        let mut recorded_attempt = success("s1", "news@acme.example.com", UNSUB);
+        recorded_attempt.list_id = Some("weekly.acme.example.com".to_string());
+        let scanned = with_list_id(
+            sender("news@acme.example.com", Some(UNSUB + 40 * DAY)),
+            "daily.acme.example.com",
+        );
+        assert!(
+            !recorded_attempt.is_about(&scanned),
+            "guard: the two carry different list ids"
+        );
+
+        let sections = split_previously_unsubscribed(
+            vec![scanned],
+            &[recorded_attempt],
+            &[],
+            UNSUB + 50 * DAY,
+            GRACE,
+        );
+
+        assert!(sections.previously_unsubscribed.is_empty());
+        assert_eq!(sections.remaining.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // observed_resumptions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn catching_a_sender_records_one_observation_with_the_scans_evidence() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let mut scanned = sender("news@acme.example.com", Some(UNSUB + 30 * DAY));
+        scanned.list_id = Some("weekly.acme.example.com".to_string());
+        scanned.email_count = 9;
+        let now = UNSUB + 31 * DAY;
+
+        let observed =
+            observed_resumptions(ACCOUNT, &[scanned], &attempts, &[], now, GRACE);
+
+        assert_eq!(observed.len(), 1);
+        let observation = &observed[0];
+        assert_eq!(observation.account, ACCOUNT);
+        assert_eq!(observation.sender_email, "news@acme.example.com");
+        assert_eq!(
+            observation.list_id.as_deref(),
+            Some("weekly.acme.example.com")
+        );
+        assert_eq!(observation.attempt_id, "s1");
+        assert_eq!(observation.observed_at, now);
+        assert_eq!(observation.last_seen, UNSUB + 30 * DAY);
+        assert_eq!(observation.email_count, 9);
+    }
+
+    #[test]
+    fn seeing_the_same_ignored_attempt_again_records_nothing() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let scanned = sender("news@acme.example.com", Some(UNSUB + 60 * DAY));
+
+        let observed = observed_resumptions(
+            ACCOUNT,
+            &[scanned],
+            &attempts,
+            &[recorded("s1")],
+            UNSUB + 61 * DAY,
+            GRACE,
+        );
+
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn a_new_successful_attempt_can_be_ignored_in_its_own_right() {
+        // The first unsubscribe was ignored and recorded; a second one was made
+        // and ignored too, so there is a second observation to write.
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            success("s2", "news@acme.example.com", UNSUB + 40 * DAY),
+        ];
+        let scanned = sender("news@acme.example.com", Some(UNSUB + 80 * DAY));
+
+        let observed = observed_resumptions(
+            ACCOUNT,
+            &[scanned],
+            &attempts,
+            &[recorded("s1")],
+            UNSUB + 81 * DAY,
+            GRACE,
+        );
+
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].attempt_id, "s2");
+    }
+
+    #[test]
+    fn a_sender_still_inside_its_grace_period_is_not_observed() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let scanned = sender("news@acme.example.com", Some(UNSUB + 3 * DAY));
+
+        assert!(observed_resumptions(
+            ACCOUNT,
+            &[scanned],
+            &attempts,
+            &[],
+            UNSUB + 4 * DAY,
+            GRACE
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_sender_that_was_never_successfully_unsubscribed_is_not_observed() {
+        let attempts = vec![failure("f1", "news@acme.example.com", UNSUB)];
+        let scanned = sender("news@acme.example.com", Some(UNSUB + 60 * DAY));
+
+        assert!(observed_resumptions(
+            ACCOUNT,
+            &[scanned],
+            &attempts,
+            &[],
+            UNSUB + 61 * DAY,
+            GRACE
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_undated_sender_is_not_observed() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let scanned = sender("news@acme.example.com", None);
+
+        assert!(observed_resumptions(
+            ACCOUNT,
+            &[scanned],
+            &attempts,
+            &[],
+            UNSUB + 900 * DAY,
+            GRACE
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn two_resumed_senders_are_observed_separately() {
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            success("s2", "deals@other.example.com", UNSUB),
+        ];
+        let senders = vec![
+            sender("news@acme.example.com", Some(UNSUB + 60 * DAY)),
+            sender("deals@other.example.com", Some(UNSUB + 70 * DAY)),
+        ];
+
+        let observed =
+            observed_resumptions(ACCOUNT, &senders, &attempts, &[], UNSUB + 80 * DAY, GRACE);
+
+        let mut ids: Vec<&str> = observed.iter().map(|r| r.attempt_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["s1", "s2"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Violation counts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_run_that_first_catches_a_sender_already_counts_the_violation() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 60 * DAY)),
+            &attempts,
+            &[],
+            UNSUB + 61 * DAY,
+        );
+
+        assert_eq!(verdict.violation_count, 1);
+    }
+
+    #[test]
+    fn an_observation_already_on_record_is_not_counted_twice() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 60 * DAY)),
+            &attempts,
+            &[recorded("s1")],
+            UNSUB + 61 * DAY,
+        );
+
+        assert_eq!(verdict.violation_count, 1);
+    }
+
+    #[test]
+    fn a_second_ignored_unsubscribe_makes_the_count_two() {
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            success("s2", "news@acme.example.com", UNSUB + 40 * DAY),
+        ];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 80 * DAY)),
+            &attempts,
+            &[recorded("s1")],
+            UNSUB + 81 * DAY,
+        );
+
+        assert_eq!(verdict.violation_count, 2);
+        assert_eq!(verdict.attempt_id, "s2");
+    }
+
+    #[test]
+    fn a_quiet_sender_keeps_the_violations_it_already_earned() {
+        // It resumed once, was unsubscribed again, and has been quiet since.
+        // The history of what it did does not disappear.
+        let attempts = vec![
+            success("s1", "news@acme.example.com", UNSUB),
+            success("s2", "news@acme.example.com", UNSUB + 40 * DAY),
+        ];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 30 * DAY)),
+            &attempts,
+            &[recorded("s1")],
+            UNSUB + 90 * DAY,
+        );
+
+        assert_eq!(verdict.outcome, UnsubscribeOutcome::NoNewMail);
+        assert_eq!(verdict.violation_count, 1);
+    }
+
+    #[test]
+    fn a_sender_with_no_successful_attempt_gets_no_verdict() {
+        let attempts = vec![failure("f1", "news@acme.example.com", UNSUB)];
+        let latest = LatestAttempts::from_history(&attempts);
+
+        assert!(judge_sender(
+            &sender("news@acme.example.com", Some(UNSUB + 60 * DAY)),
+            &latest,
+            &attempts,
+            &[],
+            UNSUB + 61 * DAY,
+            GRACE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_verdict_on_a_quiet_sender_does_not_narrow_the_next_attempt() {
+        let attempts = vec![success("s1", "news@acme.example.com", UNSUB)];
+        let verdict = verdict_for(
+            sender("news@acme.example.com", Some(UNSUB + 3 * DAY)),
+            &attempts,
+            &[],
+            UNSUB + 4 * DAY,
+        );
+
+        assert_eq!(verdict.next_step, NextStep::FirstAttempt);
+    }
+}

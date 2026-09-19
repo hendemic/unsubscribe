@@ -513,3 +513,390 @@ mod tests {
         );
     }
 }
+
+/// Resumptions, escalation links, and upgrading a database written by an
+/// earlier build.
+#[cfg(test)]
+mod resumption_and_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+    use unsubscribe_core::UnsubscribeMethod;
+
+    /// The schema as the first released build created it: no `resumptions`
+    /// table and no `follows_attempt_id` column.
+    ///
+    /// Typed out rather than read from `MIGRATIONS`, so that editing a released
+    /// migration cannot quietly redefine what "the previous version" was.
+    const SCHEMA_V1: &str = "
+        CREATE TABLE unsubscribe_attempts (
+            id                   TEXT PRIMARY KEY,
+            account              TEXT NOT NULL,
+            sender_email         TEXT NOT NULL,
+            sender_domain        TEXT NOT NULL,
+            list_id              TEXT,
+            attempted_at         INTEGER NOT NULL,
+            method               TEXT NOT NULL,
+            success              INTEGER NOT NULL,
+            http_status          INTEGER,
+            url                  TEXT NOT NULL,
+            final_url            TEXT,
+            list_unsubscribe_raw TEXT,
+            detail               TEXT NOT NULL
+        );
+        CREATE INDEX idx_attempts_account_sender
+            ON unsubscribe_attempts (account, sender_email);
+    ";
+
+    /// What migration 2 added, before `follows_attempt_id` existed.
+    const SCHEMA_V2_ADDITION: &str = "
+        CREATE TABLE resumptions (
+            id           TEXT PRIMARY KEY,
+            account      TEXT NOT NULL,
+            sender_email TEXT NOT NULL,
+            list_id      TEXT,
+            attempt_id   TEXT NOT NULL UNIQUE,
+            observed_at  INTEGER NOT NULL,
+            last_seen    INTEGER NOT NULL,
+            email_count  INTEGER NOT NULL
+        );
+        CREATE INDEX idx_resumptions_account_sender
+            ON resumptions (account, sender_email);
+    ";
+
+    /// An attempt row as an older build would have written it.
+    const SEED_ATTEMPT: &str = "
+        INSERT INTO unsubscribe_attempts (
+            id, account, sender_email, sender_domain, list_id, attempted_at,
+            method, success, http_status, url, final_url, list_unsubscribe_raw, detail
+        ) VALUES (
+            'legacy-1', 'user@example.com', 'news@acme.example.com', 'acme.example.com',
+            'weekly.acme.example.com', 1700000000, 'one_click_post', 1, 202,
+            'https://acme.example.com/unsub?id=1', 'https://acme.example.com/done',
+            '<https://acme.example.com/unsub?id=1>', 'HTTP 202'
+        );
+    ";
+
+    fn temp_store() -> (TempDir, SqliteHistoryStore) {
+        let dir = TempDir::new().expect("temp dir");
+        let store = SqliteHistoryStore::open(dir.path().join(HISTORY_DB_FILE)).expect("open");
+        (dir, store)
+    }
+
+    fn resumption(id: &str, account: &str, attempt_id: &str) -> Resumption {
+        Resumption {
+            id: id.to_string(),
+            account: account.to_string(),
+            sender_email: "news@acme.example.com".to_string(),
+            list_id: Some("weekly.acme.example.com".to_string()),
+            attempt_id: attempt_id.to_string(),
+            observed_at: 1_700_500_000,
+            last_seen: 1_700_400_000,
+            email_count: 12,
+        }
+    }
+
+    fn attempt(id: &str, account: &str) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: id.to_string(),
+            account: account.to_string(),
+            sender_email: "news@acme.example.com".to_string(),
+            sender_domain: "acme.example.com".to_string(),
+            list_id: Some("weekly.acme.example.com".to_string()),
+            attempted_at: 1_700_000_000,
+            method: UnsubscribeMethod::Get.as_id().to_string(),
+            success: true,
+            http_status: Some(200),
+            url: "https://acme.example.com/unsub?id=1".to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            follows_attempt_id: None,
+            detail: "HTTP 200".to_string(),
+        }
+    }
+
+    fn user_version(path: &std::path::Path) -> i64 {
+        Connection::open(path)
+            .expect("reopen")
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version")
+    }
+
+    // -----------------------------------------------------------------------
+    // Resumptions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_recorded_resumption_reads_back_with_every_field_intact() {
+        let (_dir, store) = temp_store();
+        let observation = resumption("res-1", "user@example.com", "attempt-1");
+
+        store.record_resumption(&observation).expect("record");
+
+        assert_eq!(
+            store
+                .resumptions_for_account("user@example.com")
+                .expect("read"),
+            vec![observation]
+        );
+    }
+
+    #[test]
+    fn a_resumption_without_a_list_id_round_trips_as_absent_not_empty() {
+        let (_dir, store) = temp_store();
+        let mut observation = resumption("res-1", "user@example.com", "attempt-1");
+        observation.list_id = None;
+
+        store.record_resumption(&observation).expect("record");
+
+        assert_eq!(
+            store.resumptions_for_account("user@example.com").expect("read")[0].list_id,
+            None
+        );
+    }
+
+    #[test]
+    fn at_most_one_resumption_can_be_recorded_per_ignored_attempt() {
+        // The durable half of "seeing the same ignored attempt again records
+        // nothing": core declines to offer a duplicate, and the schema refuses
+        // one anyway.
+        let (_dir, store) = temp_store();
+        store
+            .record_resumption(&resumption("res-1", "user@example.com", "attempt-1"))
+            .expect("first record");
+
+        let duplicate = resumption("res-2", "user@example.com", "attempt-1");
+        assert!(store.record_resumption(&duplicate).is_err());
+        assert_eq!(
+            store
+                .resumptions_for_account("user@example.com")
+                .expect("read")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn resumptions_come_back_oldest_first() {
+        let (_dir, store) = temp_store();
+        for (id, observed_at) in [("c", 300), ("a", 100), ("b", 200)] {
+            let mut observation = resumption(id, "user@example.com", &format!("attempt-{id}"));
+            observation.observed_at = observed_at;
+            store.record_resumption(&observation).expect("record");
+        }
+
+        let read = store
+            .resumptions_for_account("user@example.com")
+            .expect("read");
+        assert_eq!(
+            read.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn resumptions_for_account_returns_only_that_accounts_rows() {
+        let (_dir, store) = temp_store();
+        store
+            .record_resumption(&resumption("res-1", "alice@example.com", "attempt-1"))
+            .expect("record");
+        store
+            .record_resumption(&resumption("res-2", "bob@example.com", "attempt-2"))
+            .expect("record");
+
+        let alice = store
+            .resumptions_for_account("alice@example.com")
+            .expect("read");
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].id, "res-1");
+        assert!(store
+            .resumptions_for_account("nobody@example.com")
+            .expect("read")
+            .is_empty());
+    }
+
+    #[test]
+    fn resumptions_and_attempts_are_stored_independently() {
+        // Deleting neither is possible, but a store that mixed the two tables
+        // up would show it here.
+        let (_dir, store) = temp_store();
+        store
+            .record_attempt(&attempt("attempt-1", "user@example.com"))
+            .expect("record attempt");
+        store
+            .record_resumption(&resumption("res-1", "user@example.com", "attempt-1"))
+            .expect("record resumption");
+
+        assert_eq!(
+            store.attempts_for_account("user@example.com").expect("read").len(),
+            1
+        );
+        assert_eq!(
+            store
+                .resumptions_for_account("user@example.com")
+                .expect("read")
+                .len(),
+            1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The escalation link
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_escalated_attempt_round_trips_with_the_attempt_it_answers() {
+        let (_dir, store) = temp_store();
+        let mut escalated = attempt("attempt-2", "user@example.com");
+        escalated.follows_attempt_id = Some("attempt-1".to_string());
+
+        store
+            .record_attempt(&attempt("attempt-1", "user@example.com"))
+            .expect("record first");
+        store.record_attempt(&escalated).expect("record second");
+
+        let read = store.attempts_for_account("user@example.com").expect("read");
+        assert_eq!(read[0].follows_attempt_id, None);
+        assert_eq!(read[1].follows_attempt_id.as_deref(), Some("attempt-1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Migrations
+    // -----------------------------------------------------------------------
+
+    /// Seed a database at `version` with one attempt row already in it.
+    fn seed(path: &std::path::Path, version: i64) {
+        let conn = Connection::open(path).expect("seed open");
+        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
+        conn.execute_batch(SEED_ATTEMPT).expect("seed attempt");
+        if version >= 2 {
+            conn.execute_batch(SCHEMA_V2_ADDITION).expect("v2 schema");
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
+            .expect("set version");
+    }
+
+    #[test]
+    fn a_database_at_the_first_schema_upgrades_in_place_with_its_attempt_intact() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(HISTORY_DB_FILE);
+        seed(&path, 1);
+
+        let store = SqliteHistoryStore::open(&path).expect("open and migrate");
+        let read = store.attempts_for_account("user@example.com").expect("read");
+
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        assert_eq!(read.len(), 1);
+        let migrated = &read[0];
+        assert_eq!(migrated.id, "legacy-1");
+        assert_eq!(migrated.sender_email, "news@acme.example.com");
+        assert_eq!(migrated.sender_domain, "acme.example.com");
+        assert_eq!(migrated.list_id.as_deref(), Some("weekly.acme.example.com"));
+        assert_eq!(migrated.attempted_at, 1_700_000_000);
+        assert_eq!(migrated.method, "one_click_post");
+        assert!(migrated.success);
+        assert_eq!(migrated.http_status, Some(202));
+        assert_eq!(migrated.url, "https://acme.example.com/unsub?id=1");
+        assert_eq!(
+            migrated.final_url.as_deref(),
+            Some("https://acme.example.com/done")
+        );
+        assert_eq!(
+            migrated.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.example.com/unsub?id=1>")
+        );
+        assert_eq!(migrated.detail, "HTTP 202");
+        // The column the upgrade added has no value to backfill.
+        assert_eq!(migrated.follows_attempt_id, None);
+    }
+
+    #[test]
+    fn a_database_at_the_first_schema_can_record_resumptions_after_upgrading() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(HISTORY_DB_FILE);
+        seed(&path, 1);
+
+        let store = SqliteHistoryStore::open(&path).expect("open and migrate");
+        store
+            .record_resumption(&resumption("res-1", "user@example.com", "legacy-1"))
+            .expect("record against the migrated attempt");
+
+        assert_eq!(
+            store
+                .resumptions_for_account("user@example.com")
+                .expect("read")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_database_at_the_second_schema_gains_the_escalation_column_without_losing_rows() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(HISTORY_DB_FILE);
+        seed(&path, 2);
+        // A resumption written by the build that only knew schema 2.
+        Connection::open(&path)
+            .expect("seed open")
+            .execute_batch(
+                "INSERT INTO resumptions (
+                     id, account, sender_email, list_id, attempt_id,
+                     observed_at, last_seen, email_count
+                 ) VALUES (
+                     'legacy-res-1', 'user@example.com', 'news@acme.example.com',
+                     'weekly.acme.example.com', 'legacy-1', 1700500000, 1700400000, 12
+                 );",
+            )
+            .expect("seed resumption");
+
+        let store = SqliteHistoryStore::open(&path).expect("open and migrate");
+
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        assert_eq!(
+            store.attempts_for_account("user@example.com").expect("read")[0].follows_attempt_id,
+            None
+        );
+        assert_eq!(
+            store
+                .resumptions_for_account("user@example.com")
+                .expect("read"),
+            vec![resumption("legacy-res-1", "user@example.com", "legacy-1")]
+        );
+    }
+
+    #[test]
+    fn an_upgraded_database_accepts_the_escalation_link_the_upgrade_made_room_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(HISTORY_DB_FILE);
+        seed(&path, 2);
+
+        let store = SqliteHistoryStore::open(&path).expect("open and migrate");
+        let mut escalated = attempt("attempt-2", "user@example.com");
+        escalated.follows_attempt_id = Some("legacy-1".to_string());
+        store.record_attempt(&escalated).expect("record");
+
+        let read = store.attempts_for_account("user@example.com").expect("read");
+        assert_eq!(
+            read.iter()
+                .find(|a| a.id == "attempt-2")
+                .and_then(|a| a.follows_attempt_id.as_deref()),
+            Some("legacy-1")
+        );
+    }
+
+    #[test]
+    fn upgrading_twice_changes_nothing_the_second_time() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(HISTORY_DB_FILE);
+        seed(&path, 1);
+
+        SqliteHistoryStore::open(&path).expect("first open");
+        let store = SqliteHistoryStore::open(&path).expect("second open");
+
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        assert_eq!(
+            store.attempts_for_account("user@example.com").expect("read").len(),
+            1
+        );
+    }
+}
