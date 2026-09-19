@@ -8,19 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use unsubscribe_core::SenderInfo;
 
-/// A sender is considered stale if their last message is older than 12 months.
-const STALE_THRESHOLD_SECS: i64 = 365 * 24 * 60 * 60;
-
-fn is_stale(sender: &SenderInfo) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    match sender.last_seen {
-        Some(ts) => now - ts > STALE_THRESHOLD_SECS,
-        None => false,
-    }
-}
+use crate::time::{is_stale, parse_iso8601_age_secs};
 
 /// Guard that restores the terminal on drop, even if we panic or return early
 struct TerminalGuard;
@@ -772,29 +760,6 @@ fn truncate_str(s: &str, max: usize) -> String {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
         None => s.to_string(),
     }
-}
-
-/// Parse an ISO 8601 timestamp (e.g., "2026-03-18T19:30:00Z") into Unix seconds.
-fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
-    // Minimal parser for the format produced by now_iso8601(): YYYY-MM-DDThh:mm:ssZ
-    let b = ts.as_bytes();
-    if b.len() < 19 { return None; }
-    let year: i64 = ts.get(0..4)?.parse().ok()?;
-    let month: u32 = ts.get(5..7)?.parse().ok()?;
-    let day: u32 = ts.get(8..10)?.parse().ok()?;
-    let hour: u64 = ts.get(11..13)?.parse().ok()?;
-    let min: u64 = ts.get(14..16)?.parse().ok()?;
-    let sec: u64 = ts.get(17..19)?.parse().ok()?;
-
-    // Convert civil date to days since epoch (inverse of days_to_civil)
-    let (y, m) = if month <= 2 { (year - 1, month + 9) } else { (year, month - 3) };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let day_count = era * 146097 + doe as i64 - 719468;
-
-    Some(day_count as u64 * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 /// Convert a UTC ISO 8601 timestamp to a local-time display string.
