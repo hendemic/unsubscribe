@@ -3382,6 +3382,10 @@ mod tests {
             shell.apply(nav);
 
             assert!(shell.nav.nav_has_focus(), "y should have left settings");
+            assert!(
+                !shell.panels.settings.as_ref().unwrap().0.is_dirty(),
+                "y should have discarded the edit, not just moved focus"
+            );
         }
 
         #[test]

@@ -569,7 +569,14 @@ impl SettingsApp {
     fn on_action_confirm_quit(&mut self, action: Key) -> Action {
         // The same answer keys as every other confirmation in the app.
         match action {
-            Key::Mnemonic('y') | Key::Activate => Action::Quit,
+            Key::Mnemonic('y') | Key::Activate => {
+                // Inside the shell the panel outlives the answer, so the
+                // discard has to actually happen: otherwise the prompt and the
+                // edits are still there and `y` looks like it did nothing.
+                self.revert();
+                self.mode = Mode::Browse;
+                Action::Quit
+            }
             _ => {
                 self.mode = Mode::Browse;
                 Action::None
@@ -885,7 +892,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
     let (style, text) = match &app.mode {
         Mode::ConfirmQuit => (
             Style::default().fg(Color::Yellow),
-            " Discard unsaved changes and quit? [y/N]".to_string(),
+            " Discard unsaved changes and leave? [y/N]".to_string(),
         ),
         _ => match app.status() {
             Some((kind, message)) => {
@@ -1616,6 +1623,8 @@ mod tests {
                 Action::Quit,
                 "{confirm:?} should confirm"
             );
+            assert!(is_browsing(&app), "the prompt should be gone");
+            assert!(!app.is_dirty(), "{confirm:?} should discard the edit");
         }
     }
 
