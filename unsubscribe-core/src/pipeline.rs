@@ -78,6 +78,29 @@ pub struct RunPolicy {
     pub dry_run: bool,
 }
 
+/// A stage stopped because the consumer asked it to, through
+/// [`ScanProgress::should_cancel`] or [`RunObserver::should_cancel`].
+///
+/// Carried as an error so it travels the same path a failure does, but it is
+/// not one: consumers test for it with [`is_cancelled`] and say "cancelled"
+/// rather than showing a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Whether an error is really a cancellation.
+#[must_use]
+pub fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Cancelled>().is_some()
+}
+
 /// Something non-fatal that went wrong mid-run.
 ///
 /// An enum rather than a message so the consumer writes the wording: core
@@ -125,6 +148,17 @@ pub trait RunObserver {
 
     /// Something went wrong that did not stop the run.
     fn on_warning(&self, warning: &RunWarning);
+
+    /// Whether the consumer has asked the run to stop.
+    ///
+    /// Polled between senders and never inside one: an attempt that has been
+    /// made is evidence, and abandoning it half-way would lose the record of
+    /// a request the sender has already received. Senders already handled are
+    /// still archived and pruned. The default is never, so a consumer that
+    /// has no way to cancel needs no code at all.
+    fn should_cancel(&self) -> bool {
+        false
+    }
 }
 
 /// Observer for consumers that do not report progress (tests, batch jobs).
@@ -207,7 +241,16 @@ pub fn scan_senders(
     progress: &dyn ScanProgress,
     observer: &dyn RunObserver,
 ) -> Result<ObtainedSenders> {
-    let scan = provider.scan(folders, progress)?;
+    let scan = provider.scan(folders, progress);
+
+    // Checked before the result is even unwrapped: an adapter that aborted
+    // mid-scan may report the abort as an error, and that is a cancellation,
+    // not a failure. Nothing has been written at this point, so the cache and
+    // the warnings from the last complete scan are untouched.
+    if progress.should_cancel() {
+        return Err(Cancelled.into());
+    }
+    let scan = scan?;
 
     warnings_store.write_warnings(&scan.warnings)?;
 
@@ -504,10 +547,13 @@ pub struct RunContext<'a> {
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct RunOutcome {
-    /// One result per sender in [`RunPlan::to_unsubscribe`], in plan order.
+    /// One result per sender attempted, in plan order. Shorter than
+    /// [`RunPlan::to_unsubscribe`] when the run was cancelled part-way.
     pub results: Vec<UnsubscribeResult>,
     /// Messages moved into the archive folder.
     pub archived: u32,
+    /// Whether the run stopped early because the consumer asked it to.
+    pub cancelled: bool,
 }
 
 impl RunOutcome {
@@ -533,16 +579,34 @@ pub fn execute_run(
     policy: &RunPolicy,
 ) -> Result<RunOutcome> {
     let results = attempt_unsubscribes(plan, ctx, policy);
-    ctx.observer
-        .on_unsubscribe_done(&plan.to_unsubscribe, &results);
+    let cancelled = results.len() < plan.to_unsubscribe.len();
+    let attempted = &plan.to_unsubscribe[..results.len()];
+    ctx.observer.on_unsubscribe_done(attempted, &results);
 
-    let messages = plan.archive_messages();
-    ctx.observer
-        .on_archive_start(messages.len() as u32, plan.total_emails());
+    // A cancelled run archives what it handled and nothing else. The senders
+    // it never reached keep their mail where it is, so the next run finds
+    // them exactly as this one did.
+    let handled: Vec<&SenderInfo> = if cancelled {
+        attempted.iter().map(|planned| &planned.sender).collect()
+    } else {
+        plan.archived_senders().collect()
+    };
+    let messages: Vec<FolderMessage> = handled
+        .iter()
+        .flat_map(|sender| sender.messages.iter().cloned())
+        .collect();
+    let emails: u32 = handled.iter().map(|sender| sender.email_count).sum();
 
-    // A dry run reports what the archive would move and moves nothing.
+    ctx.observer
+        .on_archive_start(messages.len() as u32, emails);
+
+    // A dry run reports what the archive would move and moves nothing. So
+    // does an empty archive: a run cancelled before its first sender should
+    // not open a mailbox connection to move nothing.
     let archived = if policy.dry_run {
-        plan.total_emails()
+        emails
+    } else if messages.is_empty() {
+        0
     } else {
         ctx.provider.archive(&messages, ctx.archive_folder)?
     };
@@ -553,19 +617,25 @@ pub fn execute_run(
     // sender that was just handled from reappearing on the next cached run.
     // Only a real archive prunes: a dry run changed nothing.
     if !policy.dry_run {
-        let pruned = ctx
-            .cache
-            .remove_cached_senders(ctx.account, &plan.archived_sender_emails());
+        let emails: Vec<String> = handled.iter().map(|s| s.email.clone()).collect();
+        let pruned = ctx.cache.remove_cached_senders(ctx.account, &emails);
         if let Err(e) = pruned {
             ctx.observer
                 .on_warning(&RunWarning::CacheNotPruned(e.to_string()));
         }
     }
 
-    Ok(RunOutcome { results, archived })
+    Ok(RunOutcome {
+        results,
+        archived,
+        cancelled,
+    })
 }
 
 /// Attempt every planned unsubscribe, recording each one as it completes.
+///
+/// Stops between senders when the observer asks it to, returning the results
+/// it has. A short list is how the caller learns the run was cancelled.
 fn attempt_unsubscribes(
     plan: &RunPlan,
     ctx: &RunContext<'_>,
@@ -576,6 +646,9 @@ fn attempt_unsubscribes(
 
     plan.to_unsubscribe
         .iter()
+        // Checked before each attempt, never during one: a request already
+        // sent is evidence and has to be recorded.
+        .take_while(|_| !ctx.observer.should_cancel())
         .map(|planned| {
             let sender = &planned.sender;
             let result = if policy.dry_run {

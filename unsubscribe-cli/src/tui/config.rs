@@ -7,17 +7,12 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::io;
 
 use unsubscribe_core::{AccountConfig, Preferences};
 
-use super::{TerminalGuard, Tui};
+use super::{suspended, TerminalGuard};
 
 // ---------------------------------------------------------------------------
 // Side effects
@@ -590,7 +585,7 @@ pub fn run(
     Ok(())
 }
 
-fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
+pub(crate) fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
     match app.to_config() {
         Err((field, message)) => {
             app.focus_invalid(field, format!("{}: {message}", field.label()));
@@ -603,21 +598,6 @@ fn save(app: &mut SettingsApp, io_ops: &dyn SettingsIo) {
             Err(e) => app.set_status(StatusKind::Error, format!("Save failed: {e}")),
         },
     }
-}
-
-/// Leave the alternate screen for the duration of `f`, then take it back.
-///
-/// The outer `Result` covers restoring the terminal; the inner one is `f`'s.
-fn suspended<T>(terminal: &mut Tui, f: impl FnOnce() -> Result<T>) -> Result<Result<T>> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-
-    let result = f();
-
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    terminal.clear()?;
-    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -633,13 +613,13 @@ fn draw_loading(f: &mut Frame, message: &str) {
     f.render_widget(block, f.area());
 }
 
+/// Draw the whole screen, standalone: title, body, and its own help line.
 fn draw(f: &mut Frame, app: &mut SettingsApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // title
-            Constraint::Min(5),    // body
-            Constraint::Length(3), // status
+            Constraint::Min(5),    // body + status
             Constraint::Length(2), // help
         ])
         .split(f.area());
@@ -650,24 +630,50 @@ fn draw(f: &mut Frame, app: &mut SettingsApp) {
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(title, chunks[0]);
 
+    render(f, chunks[1], app);
+
+    f.render_widget(
+        Paragraph::new(hints(app)).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+/// Draw the screen's body into `area`: the fields (or the folder picker) and
+/// the status line under them. Used by the app shell, which supplies its own
+/// header and footer.
+pub(crate) fn render(f: &mut Frame, area: Rect, app: &mut SettingsApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(area);
+
     match &mut app.mode {
-        Mode::Folders(picker) => draw_folder_picker(f, chunks[1], picker),
-        _ => draw_settings(f, chunks[1], app),
+        Mode::Folders(picker) => draw_folder_picker(f, chunks[0], picker),
+        _ => draw_settings(f, chunks[0], app),
     }
 
-    draw_status(f, chunks[2], app);
+    draw_status(f, chunks[1], app);
+}
 
-    let hints = match &app.mode {
+/// Whether the screen is currently taking free text, in which case every
+/// printable key belongs to it and none to the shell's global shortcuts.
+pub(crate) fn is_editing(app: &SettingsApp) -> bool {
+    match &app.mode {
+        Mode::Editing { .. } => true,
+        Mode::Folders(picker) => picker.free_text.is_some(),
+        Mode::Browse | Mode::ConfirmQuit => false,
+    }
+}
+
+/// The key hints for whatever the screen is currently doing.
+pub(crate) fn hints(app: &SettingsApp) -> &'static str {
+    match &app.mode {
         Mode::Browse => " Enter: edit | s: save | r: revert | j/k: move | q: quit",
         Mode::Editing { .. } => " Enter: accept | Esc: cancel",
         Mode::Folders(picker) if picker.free_text.is_some() => " Enter: accept | Esc: cancel",
         Mode::Folders(_) => " Space: toggle | Enter: accept | j/k: move | Esc: cancel",
         Mode::ConfirmQuit => " y: discard changes and quit | any other key: keep editing",
-    };
-    f.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
-        chunks[3],
-    );
+    }
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &mut SettingsApp) {

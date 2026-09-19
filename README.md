@@ -34,12 +34,23 @@ Interactive prompts will ask for your IMAP host, port, email address, app passwo
 
 ## Usage
 
+Run `unsubscribe` with no arguments and the full-screen app opens: scan the
+mailbox, review the senders it found, unsubscribe, browse the history, and
+change settings without leaving it. `?` on any screen lists that screen's keys,
+`Esc` goes back, and `q` on the home screen quits.
+
 ```
-unsubscribe <command> [options]
+unsubscribe                     # the app
+unsubscribe <command> [options] # scriptable, no prompts
 ```
+
+The subcommands are the headless half of the same engine — the app and the
+commands share every decision, so neither can disagree with the other about
+which senders are stale, which resumed, or what to try next.
 
 | Command | Description |
 |---------|-------------|
+| `tui` | Open the full-screen app explicitly. Same as running with no arguments. |
 | `run` | Scan mailbox, select senders in a TUI, unsubscribe, and archive emails. `--dry-run` to preview without changes. `-m <n>` to set minimum email count (default: 3). |
 | `scan` | List senders that have unsubscribe links. `-m <n>` for minimum email count. Always performs a full scan. |
 | `export` | Export scan results to CSV. `-o <file>` for output path (default: `unsubscribe_senders.csv`). |

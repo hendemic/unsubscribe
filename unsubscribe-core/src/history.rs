@@ -209,6 +209,9 @@ fn latest_successful_by(
 }
 
 /// A `List-Id` trimmed and lowercased, or `None` when there is nothing usable.
+///
+/// Crate-visible because every place that compares two identities has to
+/// normalise them the same way -- see [`crate::history_view`].
 pub(crate) fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
     list_id
         .map(str::trim)

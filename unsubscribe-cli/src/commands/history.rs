@@ -93,9 +93,10 @@ fn build_filter(request: &HistoryRequest) -> Result<HistoryFilter> {
         None => None,
     };
     Ok(HistoryFilter {
-        sender: request.sender.clone(),
+        search: request.sender.clone().unwrap_or_default(),
         resumed_only: request.resumed,
         since,
+        ..HistoryFilter::default()
     })
 }
 
@@ -208,7 +209,7 @@ fn history_document(
                 "outcome": view.outcome.map(json_out::outcome),
                 "violation_count": view.violation_count,
                 "next_step": view.next_step.as_ref().map(json_out::next_step),
-                "in_current_scan": view.is_in_current_scan(),
+                "in_current_scan": view.in_current_scan(),
                 "timeline": view.timeline.iter().map(timeline_event).collect::<Vec<_>>(),
             })
         })
@@ -218,7 +219,7 @@ fn history_document(
     doc.insert(
         "filter".to_string(),
         json!({
-            "sender": filter.sender,
+            "sender": Some(&filter.search).filter(|needle| !needle.is_empty()),
             "resumed": filter.resumed_only,
             "since": filter.since,
         }),

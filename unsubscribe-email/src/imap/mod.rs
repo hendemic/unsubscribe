@@ -77,6 +77,11 @@ impl EmailProvider for ImapProvider {
 
         // Process folders in batches to respect server connection limits
         for batch in folders.chunks(MAX_CONCURRENT_CONNECTIONS) {
+            // Between batches is the cheapest place to stop: no connection is
+            // open yet for the folders in this one.
+            if progress.should_cancel() {
+                break;
+            }
             std::thread::scope(|s| {
                 let handles: Vec<_> = batch
                     .iter()
@@ -100,6 +105,9 @@ impl EmailProvider for ImapProvider {
                             all_warnings.push(w);
                         }
                     }
+                    // Senders are deduplicated here and nowhere else, so this
+                    // is the only place a running unique count exists.
+                    progress.on_totals(combined.len() as u32, all_warnings.len() as u32);
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -246,6 +254,12 @@ fn scan_folder(
     let batch_size = 500u32;
     let mut start = 1u32;
     while start <= total {
+        // Between fetches, so a cancelled scan never abandons a request that
+        // is already in flight. What has been parsed so far is returned and
+        // the pipeline discards it.
+        if progress.should_cancel() {
+            break;
+        }
         let end = total.min(start + batch_size - 1);
         let sequence = format!("{start}:{end}");
         let messages = session

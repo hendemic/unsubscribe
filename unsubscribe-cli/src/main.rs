@@ -11,7 +11,7 @@ mod time;
 mod tui;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{
@@ -50,12 +50,15 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
+    /// With no subcommand, the full-screen app opens (same as `tui`).
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open the full-screen app (the default with no subcommand)
+    Tui,
     /// Scan mailbox, select senders, unsubscribe, and archive
     ///
     /// With no selection flag and a terminal, this opens the selection screen.
@@ -201,7 +204,23 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         .unwrap_or_else(TomlConfigStore::default_dir);
     let config_path = config_dir.join("config.toml");
 
-    match &cli.command {
+    // The app is the default front-end, so it is routed before anything else
+    // -- including the config-file check, which it answers with the `init`
+    // wizard rather than an error.
+    let command = match cli.command {
+        None if !tui::app::is_interactive() => {
+            Cli::command().print_help()?;
+            eprintln!();
+            return Err(ExitError::usage(
+                "unsubscribe needs a terminal to open its app. Pick a subcommand above.",
+            )
+            .into());
+        }
+        None | Some(Commands::Tui) => return tui::app::launch(&config_dir).map(succeeded),
+        Some(command) => command,
+    };
+
+    match &command {
         Commands::Warnings => {
             return commands::misc::cmd_warnings(&account_id_hint(&config_dir), cli.json)
         }
@@ -260,7 +279,7 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         resumed,
         since,
         timeline,
-    } = &cli.command
+    } = &command
     {
         let account = config_store.read_config("")?.with_context(|| {
             format!("Failed to read config: {}", config_path.display())
@@ -283,7 +302,7 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
     // Built before credentials are resolved: a `run` with nothing to select by
     // and no terminal to ask at should say so, rather than failing first on a
     // keyring nobody is there to unlock.
-    let run_request = match &cli.command {
+    let run_request = match &command {
         Commands::Run {
             dry_run,
             cached,
@@ -326,7 +345,7 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
     let (account, credential) = load_account(&config_dir)
         .map_err(|e| ExitError::new(Exit::Auth, format!("{e:#}")))?;
 
-    match cli.command {
+    match command {
         Commands::Run { min_emails, .. } => commands::run::cmd_run(
             &account,
             &credential,
@@ -364,6 +383,7 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential, cli.json),
         Commands::History { .. }
+        | Commands::Tui
         | Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
@@ -447,7 +467,7 @@ fn with_min_emails(preferences: Preferences, flag: Option<u32>) -> Preferences {
 /// For OAuth accounts, this exchanges the stored refresh token for a fresh
 /// access token before returning. The token is cached in memory for the
 /// lifetime of the session.
-fn load_account(config_dir: &Path) -> Result<(AccountConfig, Credential)> {
+pub(crate) fn load_account(config_dir: &Path) -> Result<(AccountConfig, Credential)> {
     let config_store = TomlConfigStore::new(config_dir);
 
     let account = config_store
@@ -603,6 +623,12 @@ mod cli_tests {
         Cli::try_parse_from(args).expect("argv should parse")
     }
 
+    /// The subcommand an argv names. Panics for the no-subcommand form, which
+    /// opens the app rather than naming a command.
+    fn command(args: &[&str]) -> Commands {
+        parse(args).command.expect("argv should name a subcommand")
+    }
+
     #[test]
     fn the_command_definition_is_internally_consistent() {
         // clap's own audit: duplicate flags, dangling `conflicts_with`
@@ -624,14 +650,14 @@ mod cli_tests {
 
     #[test]
     fn run_accepts_each_cache_flag_on_its_own() {
-        match parse(["unsubscribe", "run", "--cached"].as_ref()).command {
+        match command(["unsubscribe", "run", "--cached"].as_ref()) {
             Commands::Run { cached, rescan, .. } => {
                 assert!(cached);
                 assert!(!rescan);
             }
             _ => panic!("expected the `run` subcommand"),
         }
-        match parse(["unsubscribe", "run", "--rescan"].as_ref()).command {
+        match command(["unsubscribe", "run", "--rescan"].as_ref()) {
             Commands::Run { cached, rescan, .. } => {
                 assert!(!cached);
                 assert!(rescan);
@@ -642,14 +668,14 @@ mod cli_tests {
 
     #[test]
     fn export_accepts_each_cache_flag_on_its_own() {
-        match parse(["unsubscribe", "export", "--cached"].as_ref()).command {
+        match command(["unsubscribe", "export", "--cached"].as_ref()) {
             Commands::Export { cached, rescan, .. } => {
                 assert!(cached);
                 assert!(!rescan);
             }
             _ => panic!("expected the `export` subcommand"),
         }
-        match parse(["unsubscribe", "export", "--rescan"].as_ref()).command {
+        match command(["unsubscribe", "export", "--rescan"].as_ref()) {
             Commands::Export { cached, rescan, .. } => {
                 assert!(!cached);
                 assert!(rescan);
@@ -660,7 +686,7 @@ mod cli_tests {
 
     #[test]
     fn neither_cache_flag_is_the_default() {
-        match parse(["unsubscribe", "run"].as_ref()).command {
+        match command(["unsubscribe", "run"].as_ref()) {
             Commands::Run {
                 cached,
                 rescan,

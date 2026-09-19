@@ -286,6 +286,10 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
         let mut retry_start: Option<std::time::Instant> = None;
 
         for (i, chunk) in message_ids.chunks(default_batch_size).enumerate() {
+            // Between batches, so no in-flight request is abandoned.
+            if progress.should_cancel() {
+                break;
+            }
             if i > 0 {
                 thread::sleep(delay);
             }
@@ -411,6 +415,7 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
             }
         }
 
+        progress.on_totals(senders.len() as u32, warnings.len() as u32);
         progress.on_folder_done(&inbox);
 
         let mut result: Vec<SenderInfo> = senders.into_values().collect();

@@ -49,6 +49,18 @@ pub fn now_iso8601() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
+/// Format a Unix timestamp (UTC) as "Mon DD, YYYY", e.g. "Mar 14, 2026".
+///
+/// The history stores Unix seconds, so every screen that shows a recorded
+/// date formats it through here rather than reimplementing the calendar. UTC
+/// rather than local time: a record that reads differently depending on where
+/// it is opened is a poor piece of evidence.
+pub fn format_unix_date(ts: i64) -> String {
+    let (year, month, day) = days_to_civil(ts.div_euclid(86400) + 719468);
+    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {day}, {year}")
+}
+
 /// Convert day count to civil date (algorithm from Howard Hinnant).
 fn days_to_civil(day_count: i64) -> (i64, u32, u32) {
     let era = if day_count >= 0 {
@@ -116,16 +128,6 @@ pub fn format_relative_age(age_secs: u64) -> String {
         secs if secs < 2 * DAY => "1 day ago".to_string(),
         secs => format!("{} days ago", secs / DAY),
     }
-}
-
-/// Format a Unix timestamp as "Mon DD, YYYY" in UTC.
-///
-/// UTC rather than local time: the history stores UTC, and a record that reads
-/// differently depending on where it is opened is a poor piece of evidence.
-pub fn format_unix_date(ts: i64) -> String {
-    let (year, month, day) = days_to_civil(ts.div_euclid(86400) + 719468);
-    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
-    format!("{month_name} {day}, {year}")
 }
 
 /// Parse a date a user typed into Unix seconds (UTC).
