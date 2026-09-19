@@ -2679,6 +2679,7 @@ dependencies = [
  "encoding_rs",
  "scraper",
  "serde",
+ "serde_json",
  "url",
  "uuid",
 ]

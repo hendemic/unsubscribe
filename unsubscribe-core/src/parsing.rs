@@ -768,4 +768,130 @@ mod tests {
         assert_eq!(result.subject, "Unsub");
         assert_eq!(result.body, "");
     }
+
+    // -----------------------------------------------------------------------
+    // parse_list_id (RFC 2919)
+    // -----------------------------------------------------------------------
+
+    /// The identifier every shape below is expected to normalize to.
+    ///
+    /// Taken from RFC 2919 section 3's own example header, so the expected
+    /// value is not computed the same way the parser computes it.
+    const RFC2919_EXAMPLE_ID: &str = "list-header.nisto.com";
+
+    #[test]
+    fn list_id_bare_brackets_and_leading_phrase_agree() {
+        let bare = parse_list_id("<list-header.nisto.com>");
+        let phrased = parse_list_id("List Header Mailing List <list-header.nisto.com>");
+        assert_eq!(bare.as_deref(), Some(RFC2919_EXAMPLE_ID));
+        assert_eq!(phrased, bare);
+    }
+
+    #[test]
+    fn list_id_rfc2047_encoded_phrase_agrees_with_plain_phrase() {
+        // =?UTF-8?B?TGlzdGU=?= decodes to "Liste"
+        let encoded = parse_list_id("=?UTF-8?B?TGlzdGU=?= <list-header.nisto.com>");
+        assert_eq!(encoded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_folded_across_lines_agrees_with_single_line() {
+        let folded = parse_list_id("List Header Mailing List\r\n <list-header.nisto.com>");
+        assert_eq!(folded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_surrounding_whitespace_is_ignored() {
+        let padded = parse_list_id("  \t <list-header.nisto.com>  \t ");
+        assert_eq!(padded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_whitespace_inside_brackets_is_trimmed() {
+        let inner = parse_list_id("< list-header.nisto.com >");
+        assert_eq!(inner.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_is_lowercased_and_brackets_stripped() {
+        assert_eq!(
+            parse_list_id("Acme <News.ACME.Example.COM>").as_deref(),
+            Some("news.acme.example.com")
+        );
+    }
+
+    #[test]
+    fn list_id_bare_dotted_value_without_brackets_is_accepted() {
+        assert_eq!(
+            parse_list_id("news.acme.example.com").as_deref(),
+            Some("news.acme.example.com")
+        );
+    }
+
+    #[test]
+    fn list_id_empty_value_is_none() {
+        assert_eq!(parse_list_id(""), None);
+        assert_eq!(parse_list_id("   "), None);
+    }
+
+    #[test]
+    fn list_id_empty_brackets_are_none() {
+        assert_eq!(parse_list_id("<>"), None);
+        assert_eq!(parse_list_id("Acme News <>"), None);
+    }
+
+    #[test]
+    fn list_id_unbalanced_brackets_are_none() {
+        assert_eq!(parse_list_id("<news.acme.example.com"), None);
+        assert_eq!(parse_list_id("news.acme.example.com>"), None);
+        assert_eq!(parse_list_id(">news.acme.example.com<"), None);
+    }
+
+    #[test]
+    fn list_id_bare_multi_word_value_is_none() {
+        // Without brackets a phrase is indistinguishable from an identifier.
+        assert_eq!(parse_list_id("Acme News"), None);
+        assert_eq!(parse_list_id("Acme news.example.com"), None);
+    }
+
+    #[test]
+    fn list_id_bare_undotted_token_is_none() {
+        assert_eq!(parse_list_id("newsletter"), None);
+    }
+
+    #[test]
+    fn list_id_with_internal_whitespace_in_brackets_is_none() {
+        assert_eq!(parse_list_id("<acme news.example.com>"), None);
+    }
+
+    #[test]
+    fn list_id_malformed_encoded_word_does_not_panic() {
+        // Truncated encoded words, stray "=?" and a lone charset must all be
+        // answered with a value or None rather than an unwind.
+        for header in [
+            "=?UTF-8?B?<news.example.com>",
+            "=?UTF-8?<news.example.com>",
+            "=? <news.example.com>",
+            "=?UTF-8?Q?=ZZ?= <news.example.com>",
+        ] {
+            let _ = parse_list_id(header);
+        }
+    }
+
+    #[test]
+    fn list_id_warning_names_the_sender_and_the_value() {
+        assert_eq!(
+            list_id_warning("news@acme.com", "  Acme News  "),
+            "news@acme.com: unparseable List-Id: Acme News"
+        );
+    }
+
+    #[test]
+    fn list_id_warning_shows_the_decoded_value() {
+        // =?UTF-8?B?TGlzdGU=?= decodes to "Liste"
+        assert_eq!(
+            list_id_warning("news@acme.com", "=?UTF-8?B?TGlzdGU=?="),
+            "news@acme.com: unparseable List-Id: Liste"
+        );
+    }
 }

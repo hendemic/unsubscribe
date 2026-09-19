@@ -661,6 +661,423 @@ mod tests {
         app.select_all();
         app.deselect_all();
     }
+
+    // -------------------------------------------------------------------
+    // Three-section model: previously unsubscribed / active / stale
+    // -------------------------------------------------------------------
+
+    /// A successful unsubscribe of `email`, which is what promotes a scanned
+    /// sender into the Previously Unsubscribed section.
+    fn unsubscribed(email: &str) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: format!("attempt-{email}"),
+            account: "user@example.com".to_string(),
+            sender_email: email.to_string(),
+            sender_domain: "test.com".to_string(),
+            list_id: None,
+            attempted_at: 1_700_000_000,
+            method: "one_click_post".to_string(),
+            success: true,
+            http_status: Some(200),
+            url: "https://test.com/unsub".to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            detail: "HTTP 200".to_string(),
+        }
+    }
+
+    /// Two senders per section, interleaved in scan order so that routing is
+    /// visible rather than an artefact of the input order.
+    fn all_three_sections() -> App {
+        let senders = vec![
+            make_sender("p1@test.com", 1),
+            make_sender("a1@test.com", 2),
+            make_stale_sender("s1@test.com", 3),
+            make_sender("p2@test.com", 4),
+            make_sender("a2@test.com", 5),
+            make_stale_sender("s2@test.com", 6),
+        ];
+        let history = vec![unsubscribed("p1@test.com"), unsubscribed("p2@test.com")];
+        App::with_history(senders, &history, Preferences::default())
+    }
+
+    fn emails(senders: &[SenderInfo]) -> Vec<&str> {
+        senders.iter().map(|s| s.email.as_str()).collect()
+    }
+
+    #[test]
+    fn all_three_sections_lay_out_header_select_all_senders_and_spacers() {
+        let app = all_three_sections();
+        assert_eq!(
+            app.rows,
+            vec![
+                RowKind::PreviousHeader,
+                RowKind::SelectAllPrevious,
+                RowKind::Previous(0),
+                RowKind::Previous(1),
+                RowKind::Spacer,
+                RowKind::ActiveHeader,
+                RowKind::SelectAllActive,
+                RowKind::Active(0),
+                RowKind::Active(1),
+                RowKind::Spacer,
+                RowKind::StaleHeader,
+                RowKind::SelectAllStale,
+                RowKind::Stale(0),
+                RowKind::Stale(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn senders_are_routed_to_the_right_section() {
+        let app = all_three_sections();
+        assert_eq!(emails(&app.previous), ["p1@test.com", "p2@test.com"]);
+        assert_eq!(emails(&app.active), ["a1@test.com", "a2@test.com"]);
+        assert_eq!(emails(&app.stale), ["s1@test.com", "s2@test.com"]);
+    }
+
+    #[test]
+    fn previously_unsubscribed_section_is_omitted_when_empty() {
+        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        assert!(!app.rows.contains(&RowKind::PreviousHeader));
+        assert!(!app.rows.contains(&RowKind::SelectAllPrevious));
+        assert_eq!(app.rows[0], RowKind::ActiveHeader);
+    }
+
+    #[test]
+    fn stale_section_is_omitted_when_empty() {
+        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        assert!(!app.rows.contains(&RowKind::StaleHeader));
+        assert!(!app.rows.contains(&RowKind::Spacer));
+    }
+
+    #[test]
+    fn only_previously_unsubscribed_senders_still_shows_the_active_section() {
+        // The active header is the screen's anchor, so it is drawn even with
+        // nothing under it.
+        let app = App::with_history(
+            vec![make_sender("p1@test.com", 1)],
+            &[unsubscribed("p1@test.com")],
+            Preferences::default(),
+        );
+        assert_eq!(
+            app.rows,
+            vec![
+                RowKind::PreviousHeader,
+                RowKind::SelectAllPrevious,
+                RowKind::Previous(0),
+                RowKind::Spacer,
+                RowKind::ActiveHeader,
+                RowKind::SelectAllActive,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_stale_senders_still_shows_the_active_section() {
+        let app = App::with_history(
+            vec![make_stale_sender("s1@test.com", 1)],
+            &[],
+            Preferences::default(),
+        );
+        assert_eq!(
+            app.rows,
+            vec![
+                RowKind::ActiveHeader,
+                RowKind::SelectAllActive,
+                RowKind::Spacer,
+                RowKind::StaleHeader,
+                RowKind::SelectAllStale,
+                RowKind::Stale(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn previously_unsubscribed_and_stale_with_no_active_senders() {
+        let app = App::with_history(
+            vec![
+                make_sender("p1@test.com", 1),
+                make_stale_sender("s1@test.com", 2),
+            ],
+            &[unsubscribed("p1@test.com")],
+            Preferences::default(),
+        );
+        assert_eq!(
+            app.rows,
+            vec![
+                RowKind::PreviousHeader,
+                RowKind::SelectAllPrevious,
+                RowKind::Previous(0),
+                RowKind::Spacer,
+                RowKind::ActiveHeader,
+                RowKind::SelectAllActive,
+                RowKind::Spacer,
+                RowKind::StaleHeader,
+                RowKind::SelectAllStale,
+                RowKind::Stale(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_senders_at_all_leaves_only_the_active_header_and_select_all() {
+        let app = App::with_history(vec![], &[], Preferences::default());
+        assert_eq!(app.rows, vec![RowKind::ActiveHeader, RowKind::SelectAllActive]);
+        assert_eq!(app.total_senders(), 0);
+    }
+
+    #[test]
+    fn a_sender_that_is_both_stale_and_previously_unsubscribed_lands_in_previous() {
+        let app = App::with_history(
+            vec![make_stale_sender("ghost@test.com", 1)],
+            &[unsubscribed("ghost@test.com")],
+            Preferences::default(),
+        );
+        assert_eq!(emails(&app.previous), ["ghost@test.com"]);
+        assert!(app.stale.is_empty());
+    }
+
+    #[test]
+    fn history_matches_the_scanned_sender_case_insensitively() {
+        let app = App::with_history(
+            vec![make_sender("News@Test.com", 1)],
+            &[unsubscribed("NEWS@TEST.COM")],
+            Preferences::default(),
+        );
+        assert_eq!(app.previous.len(), 1);
+        assert!(app.active.is_empty());
+    }
+
+    #[test]
+    fn a_failed_prior_attempt_does_not_promote_a_sender() {
+        let mut attempt = unsubscribed("a1@test.com");
+        attempt.success = false;
+        let app = App::with_history(
+            vec![make_sender("a1@test.com", 1)],
+            &[attempt],
+            Preferences::default(),
+        );
+        assert!(app.previous.is_empty());
+        assert_eq!(app.active.len(), 1);
+    }
+
+    #[test]
+    fn the_date_of_the_last_successful_unsubscribe_is_kept_for_display() {
+        let mut older = unsubscribed("p1@test.com");
+        older.id = "older".to_string();
+        older.attempted_at = 1_600_000_000;
+        let app = App::with_history(
+            vec![make_sender("p1@test.com", 1)],
+            &[older, unsubscribed("p1@test.com")],
+            Preferences::default(),
+        );
+        assert_eq!(app.previous_unsubscribed_at, [1_700_000_000]);
+    }
+
+    // -------------------------------------------------------------------
+    // Selection defaults and per-section select-all
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn previously_unsubscribed_senders_start_deselected() {
+        let app = all_three_sections();
+        assert_eq!(app.previous_selected, [false, false]);
+    }
+
+    #[test]
+    fn active_senders_keep_their_deselected_default() {
+        let app = all_three_sections();
+        assert_eq!(app.active_selected, [false, false]);
+        assert_eq!(app.stale_selected, [false, false]);
+        assert_eq!(app.count_selected(), 0);
+    }
+
+    #[test]
+    fn toggle_select_all_previous_toggles_only_previous() {
+        let mut app = all_three_sections();
+        app.cursor = 1;
+        assert!(matches!(app.row_kind(1), RowKind::SelectAllPrevious));
+        app.toggle();
+
+        assert_eq!(app.previous_selected, [true, true]);
+        assert_eq!(app.active_selected, [false, false]);
+        assert_eq!(app.stale_selected, [false, false]);
+    }
+
+    #[test]
+    fn toggle_select_all_active_leaves_previous_and_stale_alone() {
+        let mut app = all_three_sections();
+        app.cursor = 6;
+        assert!(matches!(app.row_kind(6), RowKind::SelectAllActive));
+        app.toggle();
+
+        assert_eq!(app.previous_selected, [false, false]);
+        assert_eq!(app.active_selected, [true, true]);
+        assert_eq!(app.stale_selected, [false, false]);
+    }
+
+    #[test]
+    fn toggle_select_all_stale_leaves_previous_and_active_alone() {
+        let mut app = all_three_sections();
+        app.cursor = 11;
+        assert!(matches!(app.row_kind(11), RowKind::SelectAllStale));
+        app.toggle();
+
+        assert_eq!(app.previous_selected, [false, false]);
+        assert_eq!(app.active_selected, [false, false]);
+        assert_eq!(app.stale_selected, [true, true]);
+    }
+
+    #[test]
+    fn select_all_previous_twice_returns_to_deselected() {
+        let mut app = all_three_sections();
+        app.cursor = 1;
+        app.toggle();
+        app.toggle();
+        assert_eq!(app.previous_selected, [false, false]);
+    }
+
+    #[test]
+    fn toggling_a_previous_sender_row_touches_only_that_sender() {
+        let mut app = all_three_sections();
+        app.cursor = 3;
+        assert!(matches!(app.row_kind(3), RowKind::Previous(1)));
+        app.toggle();
+
+        assert_eq!(app.previous_selected, [false, true]);
+        assert_eq!(app.count_selected(), 1);
+    }
+
+    #[test]
+    fn toggling_a_header_or_spacer_changes_nothing() {
+        let mut app = all_three_sections();
+        for row in [0, 4, 5, 9, 10] {
+            app.cursor = row;
+            app.toggle();
+        }
+        assert_eq!(app.count_selected(), 0);
+    }
+
+    #[test]
+    fn select_all_and_deselect_all_span_every_section() {
+        let mut app = all_three_sections();
+        app.select_all();
+        assert_eq!(app.count_selected(), 6);
+        assert_eq!(app.total_emails_selected(), 1 + 2 + 3 + 4 + 5 + 6);
+
+        app.deselect_all();
+        assert_eq!(app.count_selected(), 0);
+        assert_eq!(app.total_emails_selected(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Cursor navigation across three sections
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cursor_starts_on_select_all_previous_when_that_section_exists() {
+        let app = all_three_sections();
+        assert_eq!(app.cursor, 1);
+        assert!(matches!(app.row_kind(1), RowKind::SelectAllPrevious));
+    }
+
+    #[test]
+    fn moving_down_visits_every_selectable_row_and_no_other() {
+        let mut app = all_three_sections();
+        let mut visited = vec![app.cursor];
+        for _ in 0..20 {
+            app.move_down();
+            visited.push(app.cursor);
+        }
+        visited.dedup();
+        assert_eq!(visited, vec![1, 2, 3, 6, 7, 8, 11, 12, 13]);
+        assert!(!visited.iter().any(|&row| app.is_non_selectable(row)));
+    }
+
+    #[test]
+    fn moving_up_from_the_bottom_retraces_the_same_selectable_rows() {
+        let mut app = all_three_sections();
+        app.cursor = 13;
+        let mut visited = vec![app.cursor];
+        for _ in 0..20 {
+            app.move_up();
+            visited.push(app.cursor);
+        }
+        visited.dedup();
+        assert_eq!(visited, vec![13, 12, 11, 8, 7, 6, 3, 2, 1]);
+    }
+
+    #[test]
+    fn moving_up_stops_at_select_all_previous() {
+        let mut app = all_three_sections();
+        for _ in 0..10 {
+            app.move_up();
+        }
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn jump_movement_skips_headers_and_spacers_too() {
+        let mut app = all_three_sections();
+        app.move_down_by(JUMP_ROWS);
+        // Five selectable steps from row 1: 2, 3, 6, 7, 8.
+        assert_eq!(app.cursor, 8);
+        assert!(!app.is_non_selectable(app.cursor));
+    }
+
+    #[test]
+    fn first_selectable_is_the_active_select_all_when_there_is_no_previous_section() {
+        let app = App::with_history(
+            vec![make_stale_sender("s1@test.com", 1)],
+            &[],
+            Preferences::default(),
+        );
+        assert_eq!(app.first_selectable(), 1);
+        assert!(matches!(app.row_kind(1), RowKind::SelectAllActive));
+    }
+
+    // -------------------------------------------------------------------
+    // into_results
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn into_results_returns_every_sender_exactly_once_across_three_sections() {
+        let results = all_three_sections().into_results();
+
+        let mut found: Vec<&str> = results.iter().map(|(s, _)| s.email.as_str()).collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "a1@test.com",
+                "a2@test.com",
+                "p1@test.com",
+                "p2@test.com",
+                "s1@test.com",
+                "s2@test.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn into_results_pairs_each_sender_with_its_own_selection() {
+        let mut app = all_three_sections();
+        // One sender selected per section, at a different index each time, so
+        // a mis-zipped section would pair the wrong sender.
+        app.previous_selected[0] = true;
+        app.active_selected[1] = true;
+        app.stale_selected[0] = true;
+
+        let results = app.into_results();
+        let selected: Vec<&str> = results
+            .iter()
+            .filter(|(_, sel)| *sel)
+            .map(|(s, _)| s.email.as_str())
+            .collect();
+        assert_eq!(selected, ["p1@test.com", "a2@test.com", "s1@test.com"]);
+    }
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
