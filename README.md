@@ -48,7 +48,7 @@ unsubscribe <command> [options]
 | `update` | Self-update to the latest GitHub release. |
 | `reauth` | Update IMAP credentials (server, username, password). |
 | `init` | Create config file with interactive setup. |
-| `config` | Edit settings in a terminal UI. |
+| `config` | Edit settings in a terminal UI, or read and change them one key at a time: `config list`, `get`, `set`, `unset`, `path`. |
 
 Global options: `-c <path>` to specify a config file, `--json` for machine-readable
 output, `--quiet` to suppress progress and status messages, `--no-color` to drop ANSI
@@ -208,6 +208,23 @@ edits it in place, so your comments and any keys the screen does not show are le
 ```
 unsubscribe config
 ```
+
+On a server, where there is no screen to open, the same settings are available one key at a
+time. Keys are the dotted paths of the TOML layout, and every write goes through the same
+validation and the same comment-preserving editor as the screen:
+
+```
+unsubscribe config list                            # every setting, and whether it is a default
+unsubscribe config get scan.folders
+unsubscribe config set scan.folders INBOX,Promotions
+unsubscribe config set preferences.grace_period_days 21
+unsubscribe config unset account.smtp_host         # restore the default
+unsubscribe config path                            # where the config and data live
+```
+
+List settings accept a comma-separated value or several arguments. `config` with no subcommand
+and no terminal behaves as `config list`. An unknown key exits with code `2`. Credentials are
+never readable or writable here — `config list` says only where they are stored.
 
 | Key | Action |
 |-----|--------|

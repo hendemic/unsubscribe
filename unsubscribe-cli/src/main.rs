@@ -15,8 +15,8 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{
-    AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, HistoryStore,
-    Preferences, ProviderType, SelectionPolicy,
+    decide_run_mode, AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider,
+    HistoryStore, Preferences, ProviderType, RunMode, SelectionPolicy,
 };
 use unsubscribe_persistence::{
     FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
@@ -153,8 +153,14 @@ enum Commands {
     },
     /// Create config file with interactive setup
     Init,
-    /// Edit settings in a terminal UI
-    Config,
+    /// Read and change settings
+    ///
+    /// With no subcommand and a terminal, this opens the settings screen;
+    /// without one it behaves as `config list`.
+    Config {
+        #[command(subcommand)]
+        action: Option<commands::config::ConfigAction>,
+    },
     /// Update credentials (re-authenticate with your email provider)
     Reauth,
     /// Remove config, data, keychain entry, and binary
@@ -203,7 +209,9 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         Commands::Init => return commands::setup::cmd_init(&config_dir).map(succeeded),
         // Routed before the config-file check below so it can give its own
         // pointer to `init` rather than the generic one.
-        Commands::Config => return commands::config::cmd_config(&config_dir).map(succeeded),
+        Commands::Config { action } => {
+            return commands::config::cmd_config(&config_dir, action.clone(), cli.json, tty)
+        }
         Commands::Reauth => return commands::setup::cmd_reauth(&config_dir).map(succeeded),
         Commands::Uninstall => return commands::setup::cmd_uninstall(&config_dir).map(succeeded),
         Commands::Completions { shell } => return commands::misc::cmd_completions(*shell),
@@ -218,8 +226,8 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         .into());
     }
 
-    let (account, credential) = load_account(&config_dir)?;
-    let preferences = TomlConfigStore::new(&config_dir).read_preferences()?;
+    let config_store = TomlConfigStore::new(&config_dir);
+    let preferences = config_store.read_preferences()?;
     let store = FileDataStore::new();
     // A corrupt cache should be reported, not worked around silently -- but it
     // costs the user nothing to fix, so say so.
@@ -244,10 +252,40 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
         .as_ref()
         .map(|store| store as &dyn HistoryStore);
 
-    match cli.command {
+    // `history` reads records and the last scan and contacts nothing, so it
+    // runs before credentials are resolved: a report should not need a keyring
+    // to be unlocked.
+    if let Commands::History {
+        sender,
+        resumed,
+        since,
+        timeline,
+    } = &cli.command
+    {
+        let account = config_store.read_config("")?.with_context(|| {
+            format!("Failed to read config: {}", config_path.display())
+        })?;
+        return commands::history::cmd_history(
+            &account,
+            &cache_store,
+            history,
+            &preferences,
+            &commands::history::HistoryRequest {
+                sender: sender.clone(),
+                resumed: *resumed,
+                since: since.clone(),
+                timeline: *timeline,
+                json: cli.json,
+            },
+        );
+    }
+
+    // Built before credentials are resolved: a `run` with nothing to select by
+    // and no terminal to ask at should say so, rather than failing first on a
+    // keyring nobody is there to unlock.
+    let run_request = match &cli.command {
         Commands::Run {
             dry_run,
-            min_emails,
             cached,
             rescan,
             resumed,
@@ -257,33 +295,47 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
             senders_file,
             yes,
             max_senders,
+            ..
         } => {
             let request = RunRequest {
-                dry_run,
-                cached,
-                rescan,
-                yes,
+                dry_run: *dry_run,
+                cached: *cached,
+                rescan: *rescan,
+                yes: *yes,
                 json: cli.json,
                 policy: selection_policy(
-                    resumed,
-                    all_active,
-                    stale,
-                    senders,
+                    *resumed,
+                    *all_active,
+                    *stale,
+                    senders.clone(),
                     senders_file.as_deref(),
-                    max_senders,
+                    *max_senders,
                 )?,
                 tty,
             };
-            commands::run::cmd_run(
-                &account,
-                &credential,
-                &store,
-                &cache_store,
-                history,
-                &with_min_emails(preferences, min_emails),
-                &request,
-            )
+            if decide_run_mode(&request.policy, tty.stdin) == RunMode::SelectionRequired {
+                return Err(ExitError::usage(commands::run::SELECTION_REQUIRED).into());
+            }
+            Some(request)
         }
+        _ => None,
+    };
+
+    // Everything below talks to the mailbox, so credentials are resolved here.
+    // A failure at this point is always an authentication problem.
+    let (account, credential) = load_account(&config_dir)
+        .map_err(|e| ExitError::new(Exit::Auth, format!("{e:#}")))?;
+
+    match cli.command {
+        Commands::Run { min_emails, .. } => commands::run::cmd_run(
+            &account,
+            &credential,
+            &store,
+            &cache_store,
+            history,
+            &with_min_emails(preferences, min_emails),
+            &run_request.expect("the run request is built for the run command"),
+        ),
         Commands::Scan { min_emails } => commands::scan::cmd_scan(
             &account,
             &credential,
@@ -311,28 +363,11 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
             tty,
         ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential, cli.json),
-        Commands::History {
-            sender,
-            resumed,
-            since,
-            timeline,
-        } => commands::history::cmd_history(
-            &account,
-            &cache_store,
-            history,
-            &preferences,
-            &commands::history::HistoryRequest {
-                sender,
-                resumed,
-                since,
-                timeline,
-                json: cli.json,
-            },
-        ),
-        Commands::Warnings
+        Commands::History { .. }
+        | Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
-        | Commands::Config
+        | Commands::Config { .. }
         | Commands::Reauth
         | Commands::Uninstall
         | Commands::Completions { .. } => unreachable!(),

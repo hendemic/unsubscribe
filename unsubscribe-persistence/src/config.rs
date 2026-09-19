@@ -7,6 +7,7 @@ use unsubscribe_core::{
     AccountConfig, AuthType, ConfigStore, PreferenceField, Preferences, ProviderType,
 };
 
+use crate::settings::{split_folders, SettingKey, SettingKind, Settings};
 use crate::KEYRING_SERVICE;
 
 /// On-disk TOML structure -- matches the existing config format exactly.
@@ -67,11 +68,11 @@ struct FileScanConfig {
     archive_folder: String,
 }
 
-fn default_folders() -> Vec<String> {
+pub(crate) fn default_folders() -> Vec<String> {
     vec!["INBOX".to_string()]
 }
 
-fn default_archive_folder() -> String {
+pub(crate) fn default_archive_folder() -> String {
     "Unsubscribed".to_string()
 }
 
@@ -243,6 +244,149 @@ impl TomlConfigStore {
         }
         std::fs::write(&path, content)?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading and writing one setting at a time
+// ---------------------------------------------------------------------------
+
+/// Key-at-a-time access, for `unsubscribe config` and anything else scripting
+/// the file.
+///
+/// The whole-document writers ([`ConfigStore::write_config`],
+/// [`ConfigStore::write_preferences`]) rewrite every key they model, which
+/// would materialise defaults the user never asked for. These touch exactly the
+/// key named and leave the rest of the file -- comments, order, unknown keys --
+/// as it was.
+impl TomlConfigStore {
+    /// Where the config file lives.
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.config_path("")
+    }
+
+    /// Every setting as text: what the file says, or the default where it is
+    /// silent.
+    pub fn read_settings(&self) -> Result<Settings> {
+        let path = self.config_file();
+        let account = self.read_config("")?.with_context(|| {
+            format!(
+                "No config file found at {}. Run `unsubscribe init` to set one up.",
+                path.display()
+            )
+        })?;
+        Ok(Settings::from_config(&account, &self.read_preferences()?))
+    }
+
+    /// Which settings the file states explicitly; everything else is a default.
+    pub fn explicit_settings(&self) -> Result<Vec<SettingKey>> {
+        let path = self.config_file();
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            return Ok(Vec::new());
+        };
+        let doc: DocumentMut = contents
+            .parse()
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+
+        Ok(SettingKey::ALL
+            .into_iter()
+            .filter(|key| {
+                let (section, name) = key.location();
+                let section = section_name(&doc, section);
+                doc.get(section)
+                    .and_then(Item::as_table)
+                    .is_some_and(|table| table.contains_key(name))
+            })
+            .collect())
+    }
+
+    /// Validate `value` against the schema and write it to `key`.
+    ///
+    /// Blanking an optional key removes it, which is the same thing the user
+    /// means by `config unset`.
+    pub fn set_setting(&self, key: SettingKey, value: &str) -> Result<()> {
+        if value.trim().is_empty() && key.is_optional() {
+            return self.unset_setting(key);
+        }
+
+        let mut settings = self.read_settings()?;
+        settings.set(key, value.to_string());
+        settings
+            .validate(key)
+            .map_err(|e| anyhow!("Invalid value for `{}`: {e}", key.key()))?;
+
+        let (section, name) = key.location();
+        self.edit_section(section, |table| {
+            match key.kind() {
+                SettingKind::Integer => {
+                    let parsed: u32 = value.trim().parse().map_err(|_| {
+                        anyhow!("`{}` must be a whole number", key.key())
+                    })?;
+                    set_int(table, name, parsed);
+                }
+                SettingKind::List => set_str_array(table, name, &split_folders(value)),
+                SettingKind::Text | SettingKind::Choice => set_str(table, name, value.trim()),
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove an optional key so its default applies again.
+    pub fn unset_setting(&self, key: SettingKey) -> Result<()> {
+        if !key.is_optional() {
+            bail!(
+                "`{}` is required and cannot be unset. Use `config set` to change it.",
+                key.key()
+            );
+        }
+
+        // Check the file would still make sense without it: an IMAP account
+        // with no host is not a config, it is a broken one.
+        let mut settings = self.read_settings()?;
+        settings.set(key, key.default_value());
+        settings
+            .validate(key)
+            .map_err(|e| anyhow!("Cannot unset `{}`: {e}", key.key()))?;
+
+        let (section, name) = key.location();
+        self.edit_section(section, |table| {
+            table.remove(name);
+            Ok(())
+        })
+    }
+
+    /// Edit one section of the document in place, creating it if needed.
+    ///
+    /// A `[preferences]` section created here is annotated the same way
+    /// [`ConfigStore::write_preferences`] annotates it, and one left with
+    /// nothing in it is removed: every key is back at its default, so the
+    /// header is describing an empty promise.
+    fn edit_section(
+        &self,
+        section: &str,
+        apply: impl FnOnce(&mut Table) -> Result<()>,
+    ) -> Result<()> {
+        edit_document(&self.config_file(), |doc| {
+            let section = section_name(doc, section);
+            let created = !doc.contains_key(section);
+            apply(table_mut(doc, section)?)?;
+
+            if section == PREFERENCES_SECTION {
+                let emptied = doc
+                    .get(section)
+                    .and_then(Item::as_table)
+                    .is_some_and(Table::is_empty);
+                if emptied {
+                    doc.remove(section);
+                } else if created {
+                    if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
+                        table.decor_mut().set_prefix(PREFERENCES_HEADER_COMMENT);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -738,6 +882,18 @@ fn account_section_name(doc: &DocumentMut) -> &'static str {
         LEGACY_ACCOUNT_SECTION
     } else {
         ACCOUNT_SECTION
+    }
+}
+
+/// Resolve a section name against the document, honouring the `[imap]` alias.
+fn section_name<'a>(doc: &DocumentMut, section: &'a str) -> &'a str
+where
+    'static: 'a,
+{
+    if section == ACCOUNT_SECTION {
+        account_section_name(doc)
+    } else {
+        section
     }
 }
 

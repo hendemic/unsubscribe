@@ -295,7 +295,10 @@ pub fn cmd_run(
 }
 
 /// The message a headless caller gets when it has not said what to act on.
-const SELECTION_REQUIRED: &str = "\
+///
+/// Public because `main` checks the mode before it unlocks anything, so the
+/// user hears about the missing flag rather than about their keyring.
+pub const SELECTION_REQUIRED: &str = "\
 `run` needs to know which senders to act on when there is no terminal to ask at.
 
 Pass one or more selection flags:
