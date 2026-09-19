@@ -18,7 +18,8 @@ use anyhow::Result;
 
 use crate::escalation::{next_step, Escalation, NextStep};
 use crate::history::{
-    observed_resumptions, split_previously_unsubscribed, PreviouslyUnsubscribed, Resumption,
+    forget_shared_list_ids, observed_resumptions, split_previously_unsubscribed,
+    PreviouslyUnsubscribed, Resumption,
     UnsubscribeAttempt,
 };
 use crate::ports::{
@@ -209,8 +210,9 @@ pub fn load_cached_senders(
         }
     };
 
-    let senders: Vec<_> = cached
-        .senders
+    // Identity is decided over the whole scan, so the shared-list rule is
+    // applied before the minimum-count filter thins it out.
+    let senders: Vec<_> = forget_shared_list_ids(cached.senders)
         .into_iter()
         .filter(|s| s.email_count >= min_emails)
         .collect();
@@ -268,8 +270,9 @@ pub fn scan_senders(
     }
 
     Ok(ObtainedSenders {
-        senders: scan
-            .senders
+        // The cache above keeps every header verbatim; what leaves this stage
+        // is identity, and a list identifier several addresses share is none.
+        senders: forget_shared_list_ids(scan.senders)
             .into_iter()
             .filter(|s| s.email_count >= min_emails)
             .collect(),

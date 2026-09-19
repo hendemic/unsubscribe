@@ -5,7 +5,7 @@
 //! sender kept mailing after a successful unsubscribe. Nothing here can be
 //! reconstructed after the fact, which is why failures are recorded too.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -217,6 +217,48 @@ pub(crate) fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_lowercase)
+}
+
+/// Drop the `List-Id` of every sender whose identifier is shared across a scan.
+///
+/// RFC 2919 names a *list*, not a sender. On a newsletter the two coincide, so
+/// the identifier is the stabler half of a sender's identity and we prefer it.
+/// On a discussion list they do not: every subscriber's post carries the same
+/// identifier, and taking it as identity would let one recorded unsubscribe
+/// speak for everybody who has ever posted -- the whole list turning up under
+/// "previously unsubscribed" after a single unsubscribe from one member.
+///
+/// Several distinct addresses behind one identifier in the same scan is the
+/// evidence that it names a list rather than a sender, so those senders keep
+/// only their address as identity. The cache stores the header verbatim
+/// regardless; this is about what the identifier is allowed to mean.
+#[must_use]
+pub fn forget_shared_list_ids(senders: Vec<SenderInfo>) -> Vec<SenderInfo> {
+    let addresses_per_list = senders.iter().fold(
+        HashMap::<String, HashSet<String>>::new(),
+        |mut counts, sender| {
+            if let Some(list_id) = normalized_list_id(sender.list_id.as_deref()) {
+                counts
+                    .entry(list_id)
+                    .or_default()
+                    .insert(sender.email.to_lowercase());
+            }
+            counts
+        },
+    );
+
+    senders
+        .into_iter()
+        .map(|mut sender| {
+            let shared = normalized_list_id(sender.list_id.as_deref())
+                .and_then(|list_id| addresses_per_list.get(&list_id))
+                .is_some_and(|addresses| addresses.len() > 1);
+            if shared {
+                sender.list_id = None;
+            }
+            sender
+        })
+        .collect()
 }
 
 /// An account's successful unsubscribes, indexed the two ways a sender can be
@@ -622,6 +664,60 @@ mod tests {
             messages: Vec::new(),
             last_seen: None,
         }
+    }
+
+    /// `sender` carrying a `List-Id`.
+    fn listed(email: &str, list_id: &str) -> SenderInfo {
+        let mut sender = sender(email);
+        sender.list_id = Some(list_id.to_string());
+        sender
+    }
+
+    // -----------------------------------------------------------------------
+    // forget_shared_list_ids
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_list_id_only_one_address_sends_under_is_kept() {
+        let kept = forget_shared_list_ids(vec![
+            listed("news@acme.com", "weekly.acme.com"),
+            listed("news@acme.com", "weekly.acme.com"),
+            listed("deals@other.com", "deals.other.com"),
+        ]);
+        assert!(kept.iter().all(|s| s.list_id.is_some()));
+    }
+
+    #[test]
+    fn a_list_id_several_addresses_share_is_dropped() {
+        let cleaned = forget_shared_list_ids(vec![
+            listed("alice@a.com", "members.list.example.org"),
+            listed("bob@b.com", "Members.List.Example.ORG"),
+            listed("news@acme.com", "weekly.acme.com"),
+        ]);
+        assert_eq!(cleaned[0].list_id, None);
+        assert_eq!(cleaned[1].list_id, None);
+        assert_eq!(cleaned[2].list_id.as_deref(), Some("weekly.acme.com"));
+    }
+
+    /// The report this guards: one unsubscribe from one member of a discussion
+    /// list put every other poster under "previously unsubscribed".
+    #[test]
+    fn one_unsubscribe_from_a_discussion_list_does_not_claim_its_other_posters() {
+        let attempts = vec![{
+            let mut a = success("alice@a.com", 1_000);
+            a.list_id = Some("members.list.example.org".to_string());
+            a
+        }];
+        let senders = forget_shared_list_ids(vec![
+            listed("alice@a.com", "members.list.example.org"),
+            listed("bob@b.com", "members.list.example.org"),
+            listed("carol@c.com", "members.list.example.org"),
+        ]);
+
+        let sections = split(senders, &attempts);
+        assert_eq!(sections.previously_unsubscribed.len(), 1);
+        assert_eq!(sections.previously_unsubscribed[0].sender.email, "alice@a.com");
+        assert_eq!(sections.remaining.len(), 2);
     }
 
     // -----------------------------------------------------------------------
