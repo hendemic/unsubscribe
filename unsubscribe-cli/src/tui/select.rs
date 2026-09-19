@@ -17,7 +17,8 @@ use super::keys::{self, Action};
 use crate::time::{is_scan_stale, utc_to_local_display, MONTH_NAMES};
 
 /// Number of selectable rows Ctrl+Up/Ctrl+Down jumps at a time.
-const JUMP_ROWS: usize = 5;
+/// Rows `Ctrl` with an arrow moves here, which is the app-wide jump.
+const JUMP_ROWS: usize = keys::JUMP;
 
 
 /// State for the TUI selection screen.
@@ -358,7 +359,6 @@ impl App {
     #[must_use]
     pub(crate) fn actions(&self) -> Vec<Action> {
         keys::list_actions(&[
-            Action::JumpUp,
             Action::Toggle,
             Action::Mnemonic('a'),
             Action::Mnemonic('n'),
