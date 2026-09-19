@@ -43,30 +43,6 @@ impl Exit {
         }
     }
 
-    /// One-line description, as the `--help` table prints it.
-    #[must_use]
-    pub const fn describe(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Failure => "unexpected error",
-            Self::Usage => "usage error",
-            Self::SomeFailed => "completed with some failed unsubscribes",
-            Self::Auth => "authentication failure",
-            Self::Locked => "another run holds the lock",
-            Self::NothingToDo => "nothing to do",
-        }
-    }
-
-    /// Every code, in numeric order, for the help text and the README.
-    pub const ALL: [Exit; 7] = [
-        Exit::Success,
-        Exit::Failure,
-        Exit::Usage,
-        Exit::SomeFailed,
-        Exit::Auth,
-        Exit::Locked,
-        Exit::NothingToDo,
-    ];
 }
 
 /// The exit-code table, as `--help` prints it and the README repeats it.

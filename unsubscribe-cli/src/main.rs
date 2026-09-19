@@ -125,6 +125,24 @@ enum Commands {
     ///
     /// Gmail accounts do not use folder-based scanning; this command is a no-op for them.
     ListFolders,
+    /// Show what has been asked of each sender, and what it did
+    ///
+    /// Reads the recorded history and the last scan; never contacts the
+    /// mailbox.
+    History {
+        /// Only senders whose address or list id contains this text
+        #[arg(long, value_name = "EMAIL")]
+        sender: Option<String>,
+        /// Only senders that ignored a previous unsubscribe
+        #[arg(long)]
+        resumed: bool,
+        /// Only senders with activity on or after this date (YYYY-MM-DD)
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Show every attempt and resumption, not just a summary row
+        #[arg(long)]
+        timeline: bool,
+    },
     /// Show recent scan warnings (unparseable headers)
     Warnings,
     /// Update to the latest release from GitHub
@@ -160,7 +178,6 @@ fn main() -> std::process::ExitCode {
         tty.stderr,
     ));
     output::set_quiet(cli.quiet);
-    output::set_json_mode(cli.json);
 
     let result = dispatch(cli, tty);
     if let Err(e) = &result {
@@ -294,6 +311,24 @@ fn dispatch(cli: Cli, tty: Tty) -> Result<Exit> {
             tty,
         ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential, cli.json),
+        Commands::History {
+            sender,
+            resumed,
+            since,
+            timeline,
+        } => commands::history::cmd_history(
+            &account,
+            &cache_store,
+            history,
+            &preferences,
+            &commands::history::HistoryRequest {
+                sender,
+                resumed,
+                since,
+                timeline,
+                json: cli.json,
+            },
+        ),
         Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init

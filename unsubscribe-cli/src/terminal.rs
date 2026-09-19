@@ -81,8 +81,9 @@ impl Tty {
         }
     }
 
-    /// A fully attached terminal, for tests and for the interactive default.
+    /// A fully attached terminal, for exercising the interactive paths.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn attached() -> Self {
         Self {
             stdin: true,
@@ -93,6 +94,7 @@ impl Tty {
 
     /// Nothing attached: the shape of a cron job or a systemd timer.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn detached() -> Self {
         Self {
             stdin: false,

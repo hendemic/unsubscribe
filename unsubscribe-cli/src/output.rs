@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 pub const SCHEMA_VERSION: u32 = 1;
 
 static QUIET: AtomicBool = AtomicBool::new(false);
-static JSON: AtomicBool = AtomicBool::new(false);
 
 /// Whether narration is suppressed.
 #[must_use]
@@ -29,16 +28,6 @@ pub fn quiet() -> bool {
 
 pub fn set_quiet(quiet: bool) {
     QUIET.store(quiet, Ordering::Relaxed);
-}
-
-/// Whether the result goes out as JSON.
-#[must_use]
-pub fn json_mode() -> bool {
-    JSON.load(Ordering::Relaxed)
-}
-
-pub fn set_json_mode(json: bool) {
-    JSON.store(json, Ordering::Relaxed);
 }
 
 /// Narration for a person: everything that is not the command's result.
