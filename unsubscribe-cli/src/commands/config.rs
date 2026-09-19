@@ -111,3 +111,132 @@ impl SettingsIo for ConfigIo {
         format!("OS keychain ({KEYRING_SERVICE}) — never shown or edited here")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The kind of annotated file a user ends up with, which a save on their
+    /// behalf must not quietly rewrite.
+    const ANNOTATED: &str = r#"# Password is stored in your OS keychain (email-unsubscribe)
+# To use a command instead, add:
+#   password_command = "pass show email/imap"
+
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password_command = "pass show email/imap"
+auth_type = "password"
+provider = "imap"
+
+[scan]
+# Folders swept for List-Unsubscribe headers.
+folders = ["INBOX", "Promotions"]
+archive_folder = "Unsubscribed"
+
+[preferences]
+min_emails = 5
+stale_after_months = 6
+cache_max_age_days = 21
+"#;
+
+    struct Fixture {
+        _dir: TempDir,
+        path: PathBuf,
+        io_ops: ConfigIo,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, ANNOTATED).unwrap();
+
+        let account = TomlConfigStore::new(dir.path())
+            .read_config("")
+            .unwrap()
+            .unwrap();
+        let io_ops = ConfigIo {
+            config_dir: dir.path().to_path_buf(),
+            account: RefCell::new(account),
+        };
+        Fixture { _dir: dir, path, io_ops }
+    }
+
+    impl Fixture {
+        fn text(&self) -> String {
+            std::fs::read_to_string(&self.path).unwrap()
+        }
+
+        fn current(&self) -> (AccountConfig, Preferences) {
+            self.io_ops.reload().unwrap()
+        }
+    }
+
+    #[test]
+    fn saving_without_changing_anything_leaves_the_file_byte_identical() {
+        let fixture = fixture();
+        let (account, preferences) = fixture.current();
+        fixture.io_ops.save(&account, &preferences).unwrap();
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn saving_a_changed_account_setting_touches_only_that_line() {
+        let fixture = fixture();
+        let (mut account, preferences) = fixture.current();
+        account.archive_folder = "Archive".to_string();
+        fixture.io_ops.save(&account, &preferences).unwrap();
+
+        let expected = ANNOTATED.replace(
+            r#"archive_folder = "Unsubscribed""#,
+            r#"archive_folder = "Archive""#,
+        );
+        assert_eq!(fixture.text(), expected);
+    }
+
+    #[test]
+    fn saving_a_changed_preference_touches_only_that_line() {
+        let fixture = fixture();
+        let (account, mut preferences) = fixture.current();
+        preferences.stale_after_months = 3;
+        fixture.io_ops.save(&account, &preferences).unwrap();
+
+        let expected = ANNOTATED.replace("stale_after_months = 6", "stale_after_months = 3");
+        assert_eq!(fixture.text(), expected);
+    }
+
+    #[test]
+    fn a_saved_password_command_is_never_lost() {
+        let fixture = fixture();
+        let (mut account, preferences) = fixture.current();
+        account.username = "renamed@example.com".to_string();
+        fixture.io_ops.save(&account, &preferences).unwrap();
+
+        assert!(
+            fixture.text().contains(r#"password_command = "pass show email/imap""#),
+            "the credential command was dropped:\n{}",
+            fixture.text(),
+        );
+    }
+
+    #[test]
+    fn a_save_updates_the_account_the_folder_listing_authenticates_as() {
+        // Folder listing must not use a username the user only half-typed,
+        // but after a save the new one is what is on disk.
+        let fixture = fixture();
+        let (mut account, preferences) = fixture.current();
+        account.username = "renamed@example.com".to_string();
+        fixture.io_ops.save(&account, &preferences).unwrap();
+
+        assert_eq!(fixture.io_ops.account.borrow().username, "renamed@example.com");
+    }
+
+    #[test]
+    fn a_gmail_account_has_no_folders_to_list() {
+        let fixture = fixture();
+        fixture.io_ops.account.borrow_mut().provider_type = ProviderType::Gmail;
+        assert_eq!(fixture.io_ops.list_folders().unwrap(), Vec::<String>::new());
+    }
+}

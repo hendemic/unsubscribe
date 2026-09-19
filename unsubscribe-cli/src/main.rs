@@ -465,3 +465,54 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["unsubscribe", "scan", "--rescan"]).is_err());
     }
 }
+
+/// Tests for the `--min-emails` flag's precedence over `[preferences]`.
+#[cfg(test)]
+mod with_min_emails_tests {
+    use super::*;
+
+    /// Deliberately not `Preferences::default()`: distinct values make it
+    /// visible if the override copies the wrong field.
+    fn configured() -> Preferences {
+        Preferences {
+            min_emails: 5,
+            stale_after_months: 6,
+            cache_max_age_days: 21,
+        }
+    }
+
+    #[test]
+    fn the_flag_overrides_the_configured_minimum() {
+        let result = with_min_emails(configured(), Some(25));
+        assert_eq!(result.min_emails, 25);
+    }
+
+    #[test]
+    fn the_configured_minimum_stands_when_the_flag_is_absent() {
+        let result = with_min_emails(configured(), None);
+        assert_eq!(result.min_emails, 5);
+    }
+
+    #[test]
+    fn a_zero_flag_overrides_rather_than_being_treated_as_unset() {
+        // `--min-emails 0` asks for every sender; it is not the same as
+        // omitting the flag.
+        let result = with_min_emails(configured(), Some(0));
+        assert_eq!(result.min_emails, 0);
+    }
+
+    #[test]
+    fn the_flag_leaves_the_other_preferences_alone() {
+        let result = with_min_emails(configured(), Some(25));
+        assert_eq!(result.stale_after_months, 6);
+        assert_eq!(result.cache_max_age_days, 21);
+    }
+
+    #[test]
+    fn the_flag_applies_on_top_of_the_defaults_when_nothing_is_configured() {
+        let result = with_min_emails(Preferences::default(), Some(1));
+        assert_eq!(result.min_emails, 1);
+        assert_eq!(result.stale_after_months, 12);
+        assert_eq!(result.cache_max_age_days, 7);
+    }
+}
