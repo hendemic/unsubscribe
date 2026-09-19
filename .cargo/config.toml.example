@@ -1,0 +1,13 @@
+# .cargo/config.toml
+#
+# This file injects OAuth client credentials at build time for the Gmail
+# integration. It is gitignored because it contains secrets.
+#
+# To build locally with Gmail support:
+#   1. Copy this file to .cargo/config.toml
+#   2. Replace the placeholder values with real credentials from Google Cloud Console
+#      (see CONTRIBUTING.md for instructions on setting up the OAuth app)
+
+[env]
+GOOGLE_CLIENT_ID = "YOUR_CLIENT_ID_HERE"
+GOOGLE_CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"

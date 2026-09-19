@@ -3,6 +3,13 @@ set -euo pipefail
 
 REPO="hendemic/unsubscribe"
 BINARY="unsubscribe"
+PRE=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --pre) PRE=true ;;
+    esac
+done
 
 # Detect OS
 OS="$(uname -s)"
@@ -26,9 +33,16 @@ INSTALL_DIR="${HOME}/.local/bin"
 
 echo "Installing ${BINARY} (${OS_TAG}-${ARCH_TAG})..."
 
-# Get latest release download URL
-LATEST_URL="https://api.github.com/repos/${REPO}/releases/latest"
-DOWNLOAD_URL=$(curl -sL "$LATEST_URL" | grep "browser_download_url.*${ASSET}\"" | head -1 | cut -d '"' -f 4)
+# Get release download URL
+if [ "$PRE" = true ]; then
+    RELEASE_URL="https://api.github.com/repos/${REPO}/releases"
+    RELEASE_JSON=$(curl -sL "$RELEASE_URL")
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url.*${ASSET}\"" | head -1 | cut -d '"' -f 4)
+else
+    RELEASE_URL="https://api.github.com/repos/${REPO}/releases/latest"
+    RELEASE_JSON=$(curl -sL "$RELEASE_URL")
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url.*${ASSET}\"" | head -1 | cut -d '"' -f 4)
+fi
 
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "Error: Could not find binary for ${OS_TAG}-${ARCH_TAG}"

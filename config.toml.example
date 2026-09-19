@@ -3,11 +3,19 @@
 #   password_command = "pass show email/imap"
 
 [imap]
+# Provider type: "imap" (default) or "gmail"
+# Gmail uses OAuth and the Gmail REST API instead of IMAP.
+provider = "imap"
 host = "imap.sample.com"
 port = 993
 username = "you@sample.com"
+auth_type = "password"
 # password_command = "pass show email/zoho"
 # password = "fallback-plaintext-password"  # not recommended
+# SMTP settings for mailto unsubscribe (sent automatically during `run`)
+# If omitted, derived from IMAP host (imap.X -> smtp.X, port 465)
+# smtp_host = "smtp.sample.com"
+# smtp_port = 465
 
 [scan]
 # Folders to scan for unsubscribe links
@@ -15,8 +23,20 @@ folders = ["INBOX"]
 # Folder to move archived emails into
 archive_folder = "Unsubscribed"
 
+# Optional. Omit the section, or any single key, to use the defaults shown.
+# `unsubscribe config` edits these without disturbing the comments in this file.
+[preferences]
+# Only show senders with at least this many emails (0 shows every sender).
+# Overridden for a single run by --min-emails / -m.
+min_emails = 3
+# Months without a message before a sender is listed as stale. Stale senders
+# start deselected and are archived without an unsubscribe request. (1-1200)
+stale_after_months = 12
+# Days a cached scan stays fresh. Past this, `run` flags the scan as old. (1-3650)
+cache_max_age_days = 7
+
 # Common IMAP hosts:
-#   Gmail:      imap.gmail.com (app password required, https://myaccount.google.com/apppasswords)
+#   Gmail:      imap.gmail.com (or use provider = "gmail" for OAuth)
 #   Outlook:    outlook.office365.com
 #   Yahoo:      imap.mail.yahoo.com
 #   Zoho:       imap.zoho.com
@@ -27,3 +47,15 @@ archive_folder = "Unsubscribed"
 #   Gmail:   folders use "[Gmail]/" prefix, e.g. "[Gmail]/All Mail", "[Gmail]/Promotions"
 #   Outlook: "Inbox", "Junk Email", etc.
 #   Most others: "INBOX", "Sent", etc.
+
+# --- Gmail OAuth example ---
+# [imap]
+# provider = "gmail"
+# host = "gmail.googleapis.com"
+# port = 443
+# username = "you@gmail.com"
+# auth_type = "oauth"
+#
+# [scan]
+# folders = ["INBOX"]
+# archive_folder = "Unsubscribed"

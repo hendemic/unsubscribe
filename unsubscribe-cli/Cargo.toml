@@ -1,0 +1,37 @@
+[package]
+name = "unsubscribe-cli"
+version = "0.3.0"
+edition = "2024"
+license = "GPL-3.0-only"
+authors = ["Mike Henderson"]
+
+[[bin]]
+name = "unsubscribe"
+path = "src/main.rs"
+
+[dependencies]
+unsubscribe-core = { path = "../unsubscribe-core" }
+unsubscribe-email = { path = "../unsubscribe-email" }
+unsubscribe-persistence = { path = "../unsubscribe-persistence" }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+crossterm = "0.28"
+csv = "1"
+indicatif = "0.17"
+libc = "0.2"
+ratatui = "0.29"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+semver = "1"
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+
+[dev-dependencies]
+# Lets tests hand `finish_response` a synthetic `reqwest::blocking::Response`
+# (via its `From<http::Response<T>>` impl) so the body cap can be exercised
+# without standing up a server.
+http = "1"
+tempfile = "3"

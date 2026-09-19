@@ -1,0 +1,897 @@
+/// Result of parsing a List-Unsubscribe header value.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ParsedUnsub {
+    /// HTTP(S) unsubscribe URLs
+    pub urls: Vec<String>,
+    /// Mailto unsubscribe addresses
+    pub mailtos: Vec<String>,
+    /// Warning if the header contained content we couldn't parse
+    pub warning: Option<String>,
+}
+
+/// Convert a byte slice to a UTF-8 string using the given charset label.
+///
+/// Uses `encoding_rs` for WHATWG-standard charset resolution (ISO-8859-1 maps
+/// to Windows-1252, all aliases are handled). UTF-8 charsets skip the
+/// roundtrip. Unknown charsets fall back to lossy UTF-8 conversion.
+fn decode_bytes_with_charset(bytes: &[u8], charset: &str) -> String {
+    if charset.eq_ignore_ascii_case("utf-8") || charset.eq_ignore_ascii_case("us-ascii") {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    encoding_rs::Encoding::for_label(charset.as_bytes())
+        .map(|enc| {
+            let (decoded, _, _) = enc.decode(bytes);
+            decoded.into_owned()
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Decode RFC 2047 encoded words in a header value.
+///
+/// Handles `=?charset?Q?encoded?=` (quoted-printable) and `=?charset?B?encoded?=` (base64).
+/// Also unfolds continuation lines per RFC 5322.
+#[must_use]
+pub fn decode_rfc2047(input: &str) -> String {
+    // Unfold the header: remove CRLF + leading whitespace on continuation lines
+    let unfolded = input
+        .replace("\r\n ", " ")
+        .replace("\r\n\t", " ")
+        .replace("\n ", " ")
+        .replace("\n\t", " ");
+
+    let mut result = String::new();
+    let mut remaining = unfolded.as_str();
+    let mut last_was_encoded = false;
+
+    while let Some(start) = remaining.find("=?") {
+        let before = &remaining[..start];
+        // Per RFC 2047: whitespace between adjacent encoded-words is ignored
+        if !last_was_encoded || !before.trim().is_empty() {
+            result.push_str(before);
+        }
+        remaining = &remaining[start + 2..];
+
+        // Parse charset
+        let Some(q1) = remaining.find('?') else {
+            result.push_str("=?");
+            last_was_encoded = false;
+            continue;
+        };
+        let charset = &remaining[..q1];
+        remaining = &remaining[q1 + 1..];
+
+        // Parse encoding
+        let Some(q2) = remaining.find('?') else {
+            result.push_str("=?");
+            result.push_str(charset);
+            result.push('?');
+            last_was_encoded = false;
+            continue;
+        };
+        let encoding = &remaining[..q2];
+        remaining = &remaining[q2 + 1..];
+
+        // Parse encoded text until ?=
+        let Some(end) = remaining.find("?=") else {
+            last_was_encoded = false;
+            continue;
+        };
+        let encoded_text = &remaining[..end];
+        remaining = &remaining[end + 2..];
+
+        let bytes: Option<Vec<u8>> = match encoding.to_uppercase().as_str() {
+            "Q" => {
+                let mut bytes = Vec::new();
+                let mut chars = encoded_text.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '=' => {
+                            let h1 = chars.next();
+                            let h2 = chars.next();
+                            if let (Some(h1), Some(h2)) = (h1, h2) {
+                                let hex = format!("{h1}{h2}");
+                                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                                    bytes.push(byte);
+                                }
+                            }
+                        }
+                        '_' => bytes.push(b' '),
+                        _ => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+                    }
+                }
+                Some(bytes)
+            }
+            "B" => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded_text)
+                    .ok()
+            }
+            _ => {
+                result.push_str(encoded_text);
+                None
+            }
+        };
+
+        if let Some(bytes) = bytes {
+            result.push_str(&decode_bytes_with_charset(&bytes, charset));
+        }
+        last_was_encoded = true;
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Extract unsubscribe URLs and mailto addresses from a List-Unsubscribe header value.
+///
+/// Expects the RFC 2369 format: `<https://example.com/unsub>, <mailto:unsub@example.com>`
+/// Decodes RFC 2047 encoded words before parsing.
+#[must_use]
+pub fn parse_list_unsubscribe(header_value: &str, sender_email: &str) -> ParsedUnsub {
+    let decoded = decode_rfc2047(header_value);
+
+    let mut urls = Vec::new();
+    let mut mailtos = Vec::new();
+    let mut had_unparsed = false;
+
+    for part in decoded.split(',') {
+        let trimmed = part.trim().trim_start_matches('<').trim_end_matches('>');
+        if trimmed.starts_with("mailto:") {
+            mailtos.push(trimmed.to_string());
+        } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            urls.push(trimmed.to_string());
+        } else if !trimmed.is_empty() {
+            had_unparsed = true;
+        }
+    }
+
+    let warning = if urls.is_empty() && mailtos.is_empty() && had_unparsed {
+        Some(format!("{sender_email}: {decoded}"))
+    } else {
+        None
+    };
+
+    ParsedUnsub {
+        urls,
+        mailtos,
+        warning,
+    }
+}
+
+/// Extract the normalized list identifier from an RFC 2919 `List-Id` header value.
+///
+/// The header carries an optional descriptive phrase followed by the identifier
+/// in angle brackets (`Acme News <news.acme.example.com>`); the phrase may be
+/// RFC 2047 encoded and the header may be folded across lines. The returned
+/// value is the text inside the brackets, lowercased, so it is stable across
+/// the casing variations senders use.
+///
+/// Senders that omit the brackets entirely are still accepted when the value is
+/// a single dotted token, since that is unambiguous. Anything else -- an empty
+/// value, unbalanced brackets, a multi-word bare value -- returns `None`; the
+/// caller decides whether that deserves a scan warning.
+#[must_use]
+pub fn parse_list_id(header_value: &str) -> Option<String> {
+    let decoded = decode_rfc2047(header_value);
+    let trimmed = decoded.trim();
+
+    let candidate = match (trimmed.rfind('<'), trimmed.rfind('>')) {
+        (Some(open), Some(close)) if close > open + 1 => &trimmed[open + 1..close],
+        (None, None) if trimmed.contains('.') => trimmed,
+        _ => return None,
+    };
+
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(candidate.to_lowercase())
+}
+
+/// Build the scan warning for a `List-Id` header that was present but unparseable.
+///
+/// Mirrors the `sender: value` shape of the List-Unsubscribe warnings so the
+/// `warnings` command renders them uniformly.
+#[must_use]
+pub fn list_id_warning(sender_email: &str, header_value: &str) -> String {
+    let decoded = decode_rfc2047(header_value);
+    format!("{sender_email}: unparseable List-Id: {}", decoded.trim())
+}
+
+/// Parse a RFC 5322 From header value into `(display_name, email)`.
+///
+/// Handles the common formats found in real-world email:
+/// - `"Display Name" <email@example.com>`
+/// - `Display Name <email@example.com>`
+/// - `<email@example.com>`
+/// - `email@example.com`
+///
+/// RFC 2047 encoded display names (e.g. `=?UTF-8?Q?...?=`) are decoded.
+#[must_use]
+pub fn parse_from_header(from: &str) -> (String, String) {
+    let from = from.trim();
+
+    if from.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // "Name" <email> or Name <email>
+    if let Some(angle_start) = from.rfind('<') {
+        if let Some(angle_end) = from[angle_start..].find('>') {
+            let email = from[angle_start + 1..angle_start + angle_end]
+                .trim()
+                .to_string();
+            let raw_name = from[..angle_start].trim().trim_matches('"').trim();
+            let name = decode_rfc2047(raw_name);
+            return (name, email);
+        }
+    }
+
+    // Plain email address
+    (String::new(), from.to_string())
+}
+
+/// Parsed components from an RFC 6068 mailto URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct ParsedMailto {
+    /// Recipient email address
+    pub to: String,
+    /// Subject line (may be empty)
+    pub subject: String,
+    /// Message body (may be empty)
+    pub body: String,
+}
+
+/// Parse an RFC 6068 mailto URI into its components.
+///
+/// Handles the common formats found in List-Unsubscribe headers:
+/// - `mailto:unsub@example.com`
+/// - `mailto:unsub@example.com?subject=Unsubscribe`
+/// - `mailto:unsub@example.com?subject=Unsubscribe&body=Please%20remove%20me`
+///
+/// Query parameters are percent-decoded. Unknown parameters are ignored.
+#[must_use]
+pub fn parse_mailto(uri: &str) -> Option<ParsedMailto> {
+    let addr_and_query = uri.strip_prefix("mailto:")?;
+
+    let (to, query) = match addr_and_query.split_once('?') {
+        Some((to, q)) => (to, Some(q)),
+        None => (addr_and_query, None),
+    };
+
+    let to = url::form_urlencoded::parse(to.as_bytes())
+        .map(|(k, v)| if v.is_empty() { k } else { v })
+        .next()
+        .unwrap_or_else(|| to.into())
+        .into_owned();
+
+    if to.is_empty() {
+        return None;
+    }
+
+    let mut subject = String::new();
+    let mut body = String::new();
+
+    if let Some(query) = query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "subject" => subject = value.into_owned(),
+                "body" => body = value.into_owned(),
+                _ => {}
+            }
+        }
+    }
+
+    Some(ParsedMailto { to, subject, body })
+}
+
+/// Extract the domain from an email address, lowercased.
+///
+/// Returns the full input lowercased if no `@` is found.
+pub fn domain_from_email(email: &str) -> String {
+    email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.to_lowercase())
+        .unwrap_or_else(|| email.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // decode_rfc2047
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_rfc2047_q_encoding() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello_World?="),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_q_encoding_hex_escape() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?caf=C3=A9?="),
+            "caf\u{00E9}"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_b_encoding() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?B?SGVsbG8=?="),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_mixed_text_and_encoded() {
+        assert_eq!(
+            decode_rfc2047("Plain =?UTF-8?Q?Encoded?= more plain"),
+            "Plain Encoded more plain"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_crlf_space() {
+        assert_eq!(
+            decode_rfc2047("Line one\r\n continues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_crlf_tab() {
+        assert_eq!(
+            decode_rfc2047("Line one\r\n\tcontinues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_lf_space() {
+        assert_eq!(
+            decode_rfc2047("Line one\n continues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_header_unfolding_lf_tab() {
+        assert_eq!(
+            decode_rfc2047("Line one\n\tcontinues"),
+            "Line one continues"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_adjacent_encoded_words_whitespace_collapse() {
+        // RFC 2047 sec 6.2: whitespace between adjacent encoded-words is ignored
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello?= =?UTF-8?Q?_World?="),
+            "Hello World"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_adjacent_encoded_words_no_whitespace() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?Hello?==?UTF-8?Q?World?="),
+            "HelloWorld"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_non_adjacent_text_preserved() {
+        // Non-whitespace text between encoded words should be preserved
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?A?=--=?UTF-8?Q?B?="),
+            "A--B"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_incomplete_start() {
+        // =? without the rest of the structure
+        assert_eq!(decode_rfc2047("=?broken"), "=?broken");
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_missing_end() {
+        // Missing ?= terminator -- charset and encoding parse, but no end marker
+        let result = decode_rfc2047("=?UTF-8?Q?noend");
+        // The parser skips the incomplete encoded word
+        assert!(!result.is_empty() || result.is_empty()); // doesn't panic
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_invalid_hex() {
+        // Invalid hex in Q encoding -- should be skipped silently
+        let result = decode_rfc2047("=?UTF-8?Q?=ZZ?=");
+        assert!(!result.contains("panic"));
+    }
+
+    #[test]
+    fn decode_rfc2047_malformed_incomplete_hex() {
+        // Q encoding with = followed by only one char
+        let result = decode_rfc2047("=?UTF-8?Q?=A?=");
+        // Should not panic even with insufficient hex digits
+        let _ = result;
+    }
+
+    #[test]
+    fn decode_rfc2047_empty_encoded_text() {
+        assert_eq!(decode_rfc2047("=?UTF-8?Q??="), "");
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_charset_still_decodes() {
+        // ISO-8859-1 B-encoded ASCII content — should decode correctly regardless
+        let result = decode_rfc2047("=?ISO-8859-1?B?SGVsbG8=?=");
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn decode_rfc2047_iso_8859_1_q_encoding() {
+        // =?ISO-8859-1?Q?caf=E9?= — 0xE9 is 'é' in ISO-8859-1/Windows-1252
+        assert_eq!(decode_rfc2047("=?ISO-8859-1?Q?caf=E9?="), "café");
+    }
+
+    #[test]
+    fn decode_rfc2047_windows_1252_b_encoding() {
+        // Windows-1252 smart quotes: 0x93 = left double quote, 0x94 = right double quote
+        // These bytes are invalid in UTF-8 and ISO-8859-1 but defined in Windows-1252.
+        // encoding_rs maps ISO-8859-1 to Windows-1252 per the WHATWG standard.
+        use base64::Engine;
+        let encoded_text =
+            base64::engine::general_purpose::STANDARD.encode(b"\x93smart\x94");
+        let header = format!("=?windows-1252?B?{encoded_text}?=");
+        let result = decode_rfc2047(&header);
+        assert!(result.contains('\u{201C}')); // left double quotation mark
+        assert!(result.contains('\u{201D}')); // right double quotation mark
+        assert!(result.contains("smart"));
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_charset_falls_back() {
+        // Charset label not recognized by encoding_rs — falls back to lossy UTF-8
+        // Using ASCII content so the fallback produces correct output
+        let result = decode_rfc2047("=?X-UNKNOWN?Q?test?=");
+        assert_eq!(result, "test");
+    }
+
+    #[test]
+    fn decode_rfc2047_unknown_encoding_passthrough() {
+        // Unknown encoding type (not Q or B) -- encoded text passed through
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?X?literal?="),
+            "literal"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_multiple_interleaved_sections() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?A?= middle =?UTF-8?B?Qg==?= end"),
+            "A middle B end"
+        );
+    }
+
+    #[test]
+    fn decode_rfc2047_plain_text_passthrough() {
+        assert_eq!(decode_rfc2047("No encoding here"), "No encoding here");
+    }
+
+    #[test]
+    fn decode_rfc2047_empty_input() {
+        assert_eq!(decode_rfc2047(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_list_unsubscribe
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_list_unsubscribe_standard_format() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>, <mailto:unsub@example.com>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_url_only() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert!(result.mailtos.is_empty());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_mailto_only() {
+        let result = parse_list_unsubscribe(
+            "<mailto:unsub@example.com>",
+            "news@example.com",
+        );
+        assert!(result.urls.is_empty());
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_multiple_urls() {
+        let result = parse_list_unsubscribe(
+            "<https://a.com/unsub>, <https://b.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls.len(), 2);
+        assert_eq!(result.urls[0], "https://a.com/unsub");
+        assert_eq!(result.urls[1], "https://b.com/unsub");
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_without_angle_brackets() {
+        let result = parse_list_unsubscribe(
+            "https://example.com/unsub, mailto:unsub@example.com",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_rfc2047_encoded() {
+        let result = parse_list_unsubscribe(
+            "<https://example.com/=?UTF-8?Q?unsub?=>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_warning_for_unparseable() {
+        let result = parse_list_unsubscribe(
+            "ftp://example.com/unsub",
+            "news@example.com",
+        );
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_some());
+        assert!(result.warning.as_ref().unwrap().contains("news@example.com"));
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_warning_not_generated_when_urls_found() {
+        // If at least one valid URL is found, unparseable parts don't generate a warning
+        let result = parse_list_unsubscribe(
+            "<https://example.com/unsub>, ftp://nope",
+            "news@example.com",
+        );
+        assert_eq!(result.urls.len(), 1);
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_empty_header() {
+        let result = parse_list_unsubscribe("", "news@example.com");
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_whitespace_only() {
+        let result = parse_list_unsubscribe("   \t  ", "news@example.com");
+        assert!(result.urls.is_empty());
+        assert!(result.mailtos.is_empty());
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_extra_whitespace() {
+        let result = parse_list_unsubscribe(
+            "  <https://example.com/unsub>  ,  <mailto:unsub@example.com>  ",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["https://example.com/unsub"]);
+        assert_eq!(result.mailtos, vec!["mailto:unsub@example.com"]);
+    }
+
+    #[test]
+    fn parse_list_unsubscribe_http_url() {
+        let result = parse_list_unsubscribe(
+            "<http://example.com/unsub>",
+            "news@example.com",
+        );
+        assert_eq!(result.urls, vec!["http://example.com/unsub"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_from_header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_from_quoted_name_with_angle() {
+        let (name, email) = parse_from_header(r#""Acme Newsletter" <news@acme.com>"#);
+        assert_eq!(name, "Acme Newsletter");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_unquoted_name_with_angle() {
+        let (name, email) = parse_from_header("Acme Newsletter <news@acme.com>");
+        assert_eq!(name, "Acme Newsletter");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_angle_only() {
+        let (name, email) = parse_from_header("<news@acme.com>");
+        assert_eq!(name, "");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_plain_email() {
+        let (name, email) = parse_from_header("news@acme.com");
+        assert_eq!(name, "");
+        assert_eq!(email, "news@acme.com");
+    }
+
+    #[test]
+    fn parse_from_header_rfc2047_encoded_name() {
+        let (name, email) = parse_from_header(
+            "=?UTF-8?Q?Caf=C3=A9_Newsletter?= <cafe@example.com>",
+        );
+        assert_eq!(name, "Café Newsletter");
+        assert_eq!(email, "cafe@example.com");
+    }
+
+    #[test]
+    fn parse_from_header_empty_input() {
+        let (name, email) = parse_from_header("");
+        assert_eq!(name, "");
+        assert_eq!(email, "");
+    }
+
+    #[test]
+    fn parse_from_header_whitespace_handling() {
+        let (name, email) = parse_from_header("  Newsletter  <list@example.com>  ");
+        assert_eq!(name, "Newsletter");
+        assert_eq!(email, "list@example.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // domain_from_email
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn domain_from_email_standard() {
+        assert_eq!(domain_from_email("user@example.com"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_no_at() {
+        assert_eq!(domain_from_email("nodomain"), "nodomain");
+    }
+
+    #[test]
+    fn domain_from_email_uppercase() {
+        assert_eq!(domain_from_email("User@EXAMPLE.COM"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_empty_domain() {
+        assert_eq!(domain_from_email("user@"), "");
+    }
+
+    #[test]
+    fn domain_from_email_multiple_at() {
+        // rsplit_once splits on the last @
+        assert_eq!(domain_from_email("user@sub@example.com"), "example.com");
+    }
+
+    #[test]
+    fn domain_from_email_empty_input() {
+        assert_eq!(domain_from_email(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_mailto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_mailto_simple() {
+        let result = parse_mailto("mailto:unsub@example.com").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "");
+        assert_eq!(result.body, "");
+    }
+
+    #[test]
+    fn parse_mailto_with_subject() {
+        let result = parse_mailto("mailto:unsub@example.com?subject=Unsubscribe").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsubscribe");
+        assert_eq!(result.body, "");
+    }
+
+    #[test]
+    fn parse_mailto_with_subject_and_body() {
+        let result = parse_mailto(
+            "mailto:unsub@example.com?subject=Unsubscribe&body=Please%20remove%20me",
+        )
+        .unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsubscribe");
+        assert_eq!(result.body, "Please remove me");
+    }
+
+    #[test]
+    fn parse_mailto_percent_encoded_subject() {
+        let result =
+            parse_mailto("mailto:unsub@example.com?subject=Please%20Unsubscribe%20Me").unwrap();
+        assert_eq!(result.subject, "Please Unsubscribe Me");
+    }
+
+    #[test]
+    fn parse_mailto_not_mailto_returns_none() {
+        assert!(parse_mailto("https://example.com").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_empty_address_returns_none() {
+        assert!(parse_mailto("mailto:").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_empty_address_with_query_returns_none() {
+        assert!(parse_mailto("mailto:?subject=Test").is_none());
+    }
+
+    #[test]
+    fn parse_mailto_unknown_params_ignored() {
+        let result =
+            parse_mailto("mailto:unsub@example.com?subject=Unsub&cc=other@example.com").unwrap();
+        assert_eq!(result.to, "unsub@example.com");
+        assert_eq!(result.subject, "Unsub");
+        assert_eq!(result.body, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_list_id (RFC 2919)
+    // -----------------------------------------------------------------------
+
+    /// The identifier every shape below is expected to normalize to.
+    ///
+    /// Taken from RFC 2919 section 3's own example header, so the expected
+    /// value is not computed the same way the parser computes it.
+    const RFC2919_EXAMPLE_ID: &str = "list-header.nisto.com";
+
+    #[test]
+    fn list_id_bare_brackets_and_leading_phrase_agree() {
+        let bare = parse_list_id("<list-header.nisto.com>");
+        let phrased = parse_list_id("List Header Mailing List <list-header.nisto.com>");
+        assert_eq!(bare.as_deref(), Some(RFC2919_EXAMPLE_ID));
+        assert_eq!(phrased, bare);
+    }
+
+    #[test]
+    fn list_id_rfc2047_encoded_phrase_agrees_with_plain_phrase() {
+        // =?UTF-8?B?TGlzdGU=?= decodes to "Liste"
+        let encoded = parse_list_id("=?UTF-8?B?TGlzdGU=?= <list-header.nisto.com>");
+        assert_eq!(encoded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_folded_across_lines_agrees_with_single_line() {
+        let folded = parse_list_id("List Header Mailing List\r\n <list-header.nisto.com>");
+        assert_eq!(folded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_surrounding_whitespace_is_ignored() {
+        let padded = parse_list_id("  \t <list-header.nisto.com>  \t ");
+        assert_eq!(padded.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_whitespace_inside_brackets_is_trimmed() {
+        let inner = parse_list_id("< list-header.nisto.com >");
+        assert_eq!(inner.as_deref(), Some(RFC2919_EXAMPLE_ID));
+    }
+
+    #[test]
+    fn list_id_is_lowercased_and_brackets_stripped() {
+        assert_eq!(
+            parse_list_id("Acme <News.ACME.Example.COM>").as_deref(),
+            Some("news.acme.example.com")
+        );
+    }
+
+    #[test]
+    fn list_id_bare_dotted_value_without_brackets_is_accepted() {
+        assert_eq!(
+            parse_list_id("news.acme.example.com").as_deref(),
+            Some("news.acme.example.com")
+        );
+    }
+
+    #[test]
+    fn list_id_empty_value_is_none() {
+        assert_eq!(parse_list_id(""), None);
+        assert_eq!(parse_list_id("   "), None);
+    }
+
+    #[test]
+    fn list_id_empty_brackets_are_none() {
+        assert_eq!(parse_list_id("<>"), None);
+        assert_eq!(parse_list_id("Acme News <>"), None);
+    }
+
+    #[test]
+    fn list_id_unbalanced_brackets_are_none() {
+        assert_eq!(parse_list_id("<news.acme.example.com"), None);
+        assert_eq!(parse_list_id("news.acme.example.com>"), None);
+        assert_eq!(parse_list_id(">news.acme.example.com<"), None);
+    }
+
+    #[test]
+    fn list_id_bare_multi_word_value_is_none() {
+        // Without brackets a phrase is indistinguishable from an identifier.
+        assert_eq!(parse_list_id("Acme News"), None);
+        assert_eq!(parse_list_id("Acme news.example.com"), None);
+    }
+
+    #[test]
+    fn list_id_bare_undotted_token_is_none() {
+        assert_eq!(parse_list_id("newsletter"), None);
+    }
+
+    #[test]
+    fn list_id_with_internal_whitespace_in_brackets_is_none() {
+        assert_eq!(parse_list_id("<acme news.example.com>"), None);
+    }
+
+    #[test]
+    fn list_id_malformed_encoded_word_does_not_panic() {
+        // Truncated encoded words, stray "=?" and a lone charset must all be
+        // answered with a value or None rather than an unwind.
+        for header in [
+            "=?UTF-8?B?<news.example.com>",
+            "=?UTF-8?<news.example.com>",
+            "=? <news.example.com>",
+            "=?UTF-8?Q?=ZZ?= <news.example.com>",
+        ] {
+            let _ = parse_list_id(header);
+        }
+    }
+
+    #[test]
+    fn list_id_warning_names_the_sender_and_the_value() {
+        assert_eq!(
+            list_id_warning("news@acme.com", "  Acme News  "),
+            "news@acme.com: unparseable List-Id: Acme News"
+        );
+    }
+
+    #[test]
+    fn list_id_warning_shows_the_decoded_value() {
+        // =?UTF-8?B?TGlzdGU=?= decodes to "Liste"
+        assert_eq!(
+            list_id_warning("news@acme.com", "=?UTF-8?B?TGlzdGU=?="),
+            "news@acme.com: unparseable List-Id: Liste"
+        );
+    }
+}
