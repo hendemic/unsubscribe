@@ -205,8 +205,9 @@ pub(crate) fn render(f: &mut Frame, area: Rect, panel: &RunPanel, focused: bool)
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // the last scan, in numbers
-            Constraint::Min(4),    // the two actions
+            Constraint::Length(RunChoice::ALL.len() as u16),
             Constraint::Length(2), // what the highlighted one does
+            Constraint::Min(0),    // the panel is taller than it needs to be
         ])
         .split(area);
 

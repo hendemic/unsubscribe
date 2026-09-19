@@ -310,20 +310,19 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
             Paragraph::new(vec![
                 Line::raw(""),
                 Line::styled(
-                    "  Nothing here yet.",
+                    " Nothing here yet.",
                     Style::default().fg(Color::Cyan).bold(),
                 ),
                 Line::raw(""),
                 Line::styled(
-                    "  History starts with your first run: every unsubscribe attempt is",
+                    " History starts with your first run: every unsubscribe attempt is",
                     Style::default().fg(Color::DarkGray),
                 ),
                 Line::styled(
-                    "  recorded here, along with whether the mail actually stopped.",
+                    " recorded here, along with whether the mail actually stopped.",
                     Style::default().fg(Color::DarkGray),
                 ),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" History ")),
+            ]),
             area,
         );
         return;
@@ -331,10 +330,11 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(area);
 
-    let height = (chunks[0].height as usize).saturating_sub(2);
+    // The working area draws the border and the title; the rows fill it.
+    let height = chunks[0].height as usize;
     screen.scroll_into_view(height);
 
     let rows: Vec<Line> = screen
@@ -354,12 +354,7 @@ pub(crate) fn render_list(f: &mut Frame, area: Rect, screen: &mut HistoryScreen)
             )]
         } else {
             rows
-        })
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " History \u{2014} {} of {} sender(s) ",
-            screen.visible.len(),
-            screen.views.len()
-        ))),
+        }),
         chunks[0],
     );
 
@@ -443,14 +438,21 @@ fn controls(screen: &HistoryScreen) -> Paragraph<'static> {
         ),
         Span::styled("   search ", Style::default().fg(Color::DarkGray)),
         Span::styled(search, Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!(
+                "   {} of {} sender(s)",
+                screen.visible.len(),
+                screen.views.len()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]))
-    .block(Block::default().borders(Borders::ALL))
 }
 
 pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(5)])
+        .constraints([Constraint::Length(4), Constraint::Min(3)])
         .split(area);
 
     let view = &screen.view;
@@ -476,9 +478,10 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
             ),
             Line::styled(
                 format!(
-                    " {}   {} violation(s)",
+                    " {}   {} violation(s)   {} event(s)",
                     outcome_label(view),
-                    view.violation_count
+                    view.violation_count,
+                    view.timeline.len()
                 ),
                 if view.is_resumed() {
                     Style::default().fg(Color::Red)
@@ -491,7 +494,7 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
         chunks[0],
     );
 
-    let height = (chunks[1].height as usize).saturating_sub(2);
+    let height = chunks[1].height as usize;
     screen.scroll_into_view(height);
 
     let rows: Vec<Line> = screen
@@ -510,17 +513,7 @@ pub(crate) fn render_detail(f: &mut Frame, area: Rect, screen: &mut DetailScreen
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " Timeline \u{2014} {} event(s) ",
-                    screen.view.timeline.len()
-                )),
-        ),
-        chunks[1],
-    );
+    f.render_widget(Paragraph::new(rows), chunks[1]);
 }
 
 /// The display name of a stored method id, falling back to the id itself so

@@ -66,21 +66,35 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut WarningsScreen) {
             Paragraph::new(vec![
                 Line::raw(""),
                 Line::styled(
-                    "  No warnings from the last scan.",
+                    " No warnings from the last scan.",
                     Style::default().fg(Color::Green),
                 ),
                 Line::styled(
-                    "  Every List-Unsubscribe header parsed cleanly.",
+                    " Every List-Unsubscribe header parsed cleanly.",
                     Style::default().fg(Color::DarkGray),
                 ),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" Warnings ")),
+            ]),
             area,
         );
         return;
     }
 
-    let height = (area.height as usize).saturating_sub(2);
+    // The working area already draws the border and the title, so the rows
+    // fill it edge to edge and the count goes on a line of its own.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {} unparseable header(s)", screen.warnings.len()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[0],
+    );
+
+    let area = chunks[1];
+    let height = area.height as usize;
     screen.scroll_into_view(height);
 
     let rows: Vec<Line> = screen
@@ -99,15 +113,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut WarningsScreen) {
         })
         .collect();
 
-    f.render_widget(
-        Paragraph::new(rows).block(
-            Block::default().borders(Borders::ALL).title(format!(
-                " Warnings \u{2014} {} unparseable header(s) ",
-                screen.warnings.len()
-            )),
-        ),
-        area,
-    );
+    f.render_widget(Paragraph::new(rows), area);
 }
 
 #[cfg(test)]

@@ -1200,7 +1200,7 @@ impl Shell {
         let rows: Vec<Line> = Section::ALL
             .iter()
             .enumerate()
-            .map(|(index, section)| {
+            .flat_map(|(index, section)| {
                 let badge = match (section, warnings) {
                     (Section::Warnings, 0) => String::new(),
                     (Section::Warnings, n) => format!(" ({n})"),
@@ -1213,11 +1213,11 @@ impl Shell {
                     _ => Style::default().fg(Color::Gray),
                 };
                 // Quit sits apart: it is a way out, not a place to look at.
-                let lead = if *section == Section::Quit { "\n" } else { "" };
-                Line::styled(
-                    format!("{lead} {marker} {}{badge}", section.label()),
+                let spacer = (*section == Section::Quit).then(|| Line::raw(""));
+                spacer.into_iter().chain([Line::styled(
+                    format!(" {marker} {}{badge}", section.label()),
                     style,
-                )
+                )])
             })
             .collect();
 
@@ -1231,15 +1231,33 @@ impl Shell {
         );
     }
 
+    /// The working area: a title line in the focus colour, then the content.
+    ///
+    /// No box of its own -- several panels draw their own, and a border around
+    /// a border reads as a frame rather than as focus. Focus shows in the
+    /// title's colour, in the nav's border, and in the cursor highlight, which
+    /// only the focused pane draws.
     fn render_panel(&mut self, f: &mut Frame, area: Rect) {
         let focused = !self.nav.nav_has_focus();
         let title = self.panel_title();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style(focused))
-            .title(format!(" {title} "));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {title}"),
+                if focused {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            )),
+            chunks[0],
+        );
+
+        let inner = chunks[1];
         if inner.width == 0 || inner.height == 0 {
             return;
         }
