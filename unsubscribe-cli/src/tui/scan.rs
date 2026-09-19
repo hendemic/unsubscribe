@@ -14,6 +14,7 @@ use unsubscribe_core::ObtainedSenders;
 
 use super::app::{Effect, Nav};
 use super::keys::Action;
+use super::components::Button;
 use super::worker::{ScanOutcome, ScanShared};
 
 /// Where the scan has got to.
@@ -62,16 +63,14 @@ impl ScanScreen {
 
     /// The screen's one focusable element, and what it says it does.
     ///
-    /// Part of the state rather than a decoration the renderer invents:
-    /// `Enter` acts on it, so it has to exist where the key handler can see
-    /// it. `None` while the scan is already stopping -- there is nothing left
-    /// for a button to do.
+    /// Always there: while the scan is stopping it reads as inert rather than
+    /// vanishing, so the row says what is happening instead of leaving a gap.
     #[must_use]
-    pub fn button(&self) -> Option<&'static str> {
+    pub fn button(&self) -> Button {
         match self.state {
-            ScanState::Running => Some("Cancel scan"),
-            ScanState::Cancelling => None,
-            ScanState::Ended => Some("Close"),
+            ScanState::Running => Button::new("Cancel scan"),
+            ScanState::Cancelling => Button::inert("Cancelling\u{2026}"),
+            ScanState::Ended => Button::new("Close"),
         }
     }
 
@@ -115,7 +114,7 @@ impl ScanScreen {
             Action::Back => Nav::Park,
             // The button is the only thing on this screen to focus, so it
             // always has focus and Enter is the same key as `c`.
-            Action::Activate if self.button().is_some() => self.cancel(),
+            Action::Activate if self.button().enabled => self.cancel(),
             // Stopping is its own key now, and it asks first. Already
             // stopping, asking again would change nothing.
             Action::Mnemonic('c') => self.cancel(),
@@ -136,15 +135,15 @@ impl ScanScreen {
     /// The actions this sub-view answers, for the footer and the `?` overlay.
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
-        match self.button() {
-            None => vec![Action::Help, Action::Back],
-            Some(_) => vec![
-                Action::Activate,
-                Action::Mnemonic('c'),
-                Action::Help,
-                Action::Back,
-            ],
+        if !self.button().enabled {
+            return vec![Action::Help, Action::Back];
         }
+        vec![
+            Action::Activate,
+            Action::Mnemonic('c'),
+            Action::Help,
+            Action::Back,
+        ]
     }
 
     /// A word for what the scan is doing, for the working area's title.
@@ -171,7 +170,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &ScanScreen) {
         .constraints([
             Constraint::Min(5),                                    // per-folder bars
             Constraint::Length(4),                                 // totals
-            Constraint::Length(u16::from(screen.button().is_some())), // the button
+            Constraint::Length(1),                                 // the button
         ])
         .split(area);
 
@@ -241,9 +240,11 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &ScanScreen) {
         chunks[1],
     );
 
-    if let Some(label) = screen.button() {
-        f.render_widget(super::components::button(label, true), chunks[2]);
-    }
+    let button = screen.button();
+    f.render_widget(
+        super::components::button(button, button.enabled),
+        chunks[2],
+    );
 }
 
 /// A fixed-width progress bar. An unknown total draws as empty rather than
@@ -386,7 +387,7 @@ mod tests {
         // A scan has nothing else worth focusing, so stopping it must not
         // depend on knowing the hotkey.
         let (mut screen, _tx) = running();
-        assert_eq!(screen.button(), Some("Cancel scan"));
+        assert_eq!(screen.button(), Button::new("Cancel scan"));
 
         assert_eq!(
             nav_name(&screen.on_action(Action::Activate)),
@@ -395,11 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn the_button_goes_once_there_is_nothing_left_for_it_to_do() {
+    fn a_scan_that_is_stopping_says_so_where_the_button_was() {
         let (mut screen, _tx) = running();
         screen.request_cancel();
 
-        assert_eq!(screen.button(), None, "already stopping");
+        // The row is still there -- it just reads as inert, so the screen
+        // does not lose a line and then find it again.
+        assert_eq!(screen.button(), Button::inert("Cancelling\u{2026}"));
+        assert!(!screen.button().enabled);
         assert_eq!(nav_name(&screen.on_action(Action::Activate)), "stay");
     }
 
@@ -408,7 +412,16 @@ mod tests {
         let mut screen = ended_with(ScanOutcome::Cancelled);
         screen.tick();
 
-        assert_eq!(screen.button(), Some("Close"));
+        assert_eq!(screen.button(), Button::new("Close"));
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "pop");
+    }
+
+    #[test]
+    fn a_failed_scan_offers_the_same_way_out_as_any_other_ending() {
+        let mut screen = ended_with(ScanOutcome::Failed("connection refused".to_string()));
+        screen.tick();
+
+        assert_eq!(screen.button(), Button::new("Close"));
         assert_eq!(nav_name(&screen.on_action(Action::Activate)), "pop");
     }
 
@@ -430,7 +443,7 @@ mod tests {
 
         for action in [Action::MoveUp, Action::MoveDown, Action::First, Action::Last] {
             assert_eq!(nav_name(&screen.on_action(action)), "stay", "{action:?}");
-            assert_eq!(screen.button(), Some("Cancel scan"));
+            assert_eq!(screen.button(), Button::new("Cancel scan"));
         }
     }
 

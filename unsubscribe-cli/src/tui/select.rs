@@ -1615,7 +1615,10 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &mut App) {
                 let selected = app.stale_selected[idx];
                 items.push(stale_sender_row(sender, selected, is_cursor));
             }
-            RowKind::Cancel => items.push(super::components::button_line("Discard selection", is_cursor)),
+            RowKind::Cancel => items.push(super::components::button_line(
+                super::components::Button::new("Discard selection"),
+                is_cursor,
+            )),
         }
     }
 

@@ -14,6 +14,7 @@ use ratatui::widgets::*;
 use unsubscribe_core::{RunOutcome, RunPlan};
 
 use super::app::{Effect, Nav};
+use super::components::Button;
 use super::keys::{self, Action};
 use super::worker::{RunEvent, RunResult, RunShared};
 
@@ -144,21 +145,22 @@ impl RunScreen {
             .collect()
     }
 
-    /// The action row under the list, and what it says it does. `None` while
-    /// the run is already stopping: there is nothing left for it to do.
+    /// The action row under the list, and what it says it does. While the run
+    /// is already stopping it reads as inert rather than vanishing, so the
+    /// row says what is happening instead of leaving a gap.
     #[must_use]
-    pub fn button(&self) -> Option<&'static str> {
+    pub fn button(&self) -> Button {
         match self.state {
-            RunState::Running => Some("Stop run"),
-            RunState::Cancelling => None,
-            RunState::Finished => Some("Close"),
+            RunState::Running => Button::new("Stop run"),
+            RunState::Cancelling => Button::inert("Stopping\u{2026}"),
+            RunState::Finished => Button::new("Close"),
         }
     }
 
     /// Whether the button is what `Enter` would act on right now.
     #[must_use]
     pub fn button_focused(&self) -> bool {
-        self.on_button && self.button().is_some()
+        self.on_button && self.button().enabled
     }
 
     /// Move between the attempt rows and the button below them.
@@ -281,7 +283,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut RunScreen) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(u16::from(screen.button().is_some())),
+            Constraint::Length(1), // the button
             Constraint::Length(6),
         ])
         .split(area);
@@ -333,12 +335,10 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut RunScreen) {
         chunks[0],
     );
 
-    if let Some(label) = screen.button() {
-        f.render_widget(
-            super::components::button(label, screen.button_focused()),
-            chunks[1],
-        );
-    }
+    f.render_widget(
+        super::components::button(screen.button(), screen.button_focused()),
+        chunks[1],
+    );
 
     f.render_widget(footer(screen, &events), chunks[2]);
 
@@ -878,7 +878,7 @@ mod tests {
         let (screen, _shared, _tx) = screen_with(2);
 
         assert!(screen.button_focused());
-        assert_eq!(screen.button(), Some("Stop run"));
+        assert_eq!(screen.button(), Button::new("Stop run"));
     }
 
     #[test]
@@ -914,17 +914,35 @@ mod tests {
     }
 
     #[test]
-    fn the_button_says_what_it_does_at_each_stage_and_goes_when_there_is_nothing_to_do() {
+    fn the_button_says_what_it_does_at_each_stage_and_goes_inert_with_nothing_to_do() {
         let (mut screen, _shared, _tx) = screen_with(1);
-        assert_eq!(screen.button(), Some("Stop run"));
+        assert_eq!(screen.button(), Button::new("Stop run"));
 
         screen.request_cancel();
-        assert_eq!(screen.button(), None, "already stopping");
-        assert!(!screen.button_focused());
+
+        // The row stays put and says what is happening; it just stops
+        // answering, so there is no hole where the button was.
+        assert_eq!(screen.button(), Button::inert("Stopping\u{2026}"));
+        assert!(!screen.button().enabled);
+        assert!(!screen.button_focused(), "and it is not drawn as focused");
         assert_eq!(nav_name(&screen.on_action(Action::Activate)), "stay");
 
         let finished = finished(RunResult::Done(Box::default()));
-        assert_eq!(finished.button(), Some("Close"));
+        assert_eq!(finished.button(), Button::new("Close"));
+    }
+
+    #[test]
+    fn an_inert_button_is_not_advertised_as_a_key() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        assert!(screen.actions().contains(&Action::Activate));
+
+        screen.request_cancel();
+
+        assert!(!screen.actions().contains(&Action::Activate));
+        assert!(
+            screen.actions().contains(&Action::Back),
+            "but the nav is still reachable"
+        );
     }
 
     #[test]

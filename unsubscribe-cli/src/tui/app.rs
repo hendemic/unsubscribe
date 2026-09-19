@@ -2689,12 +2689,12 @@ mod tests {
         fn every_run_sub_view_has_a_button_the_cursor_can_reach() {
             for build in [scanning as fn() -> Shell, unsubscribing] {
                 let shell = build();
-                let labelled = match shell.stacks.run.last() {
-                    Some(SubView::Scan(screen)) => screen.button().is_some(),
-                    Some(SubView::Running(screen)) => screen.button().is_some(),
+                let pressable = match shell.stacks.run.last() {
+                    Some(SubView::Scan(screen)) => screen.button().enabled,
+                    Some(SubView::Running(screen)) => screen.button().enabled,
                     _ => false,
                 };
-                assert!(labelled, "a Run sub-view with nothing to press");
+                assert!(pressable, "a Run sub-view with nothing to press");
                 assert!(shell.focus_actions().contains(&Action::Activate));
             }
         }
