@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
@@ -655,7 +655,19 @@ impl ConfigStore for TomlConfigStore {
             .validate()
             .map_err(|e| anyhow!("Refusing to write invalid preferences: {e}"))?;
 
-        edit_document(&self.config_path(""), |doc| {
+        // Preferences amend an existing config; `init` is what creates one. A
+        // file holding only `[preferences]` has no account, so nothing could
+        // load it -- and its existence would hide the "run `unsubscribe init`"
+        // pointer behind a TOML parse error.
+        let path = self.config_path("");
+        if !path.exists() {
+            bail!(
+                "No config file found at {}. Run `unsubscribe init` to set up your config.",
+                path.display()
+            );
+        }
+
+        edit_document(&path, |doc| {
             let created = !doc.contains_key(PREFERENCES_SECTION);
             let table = table_mut(doc, PREFERENCES_SECTION)?;
             if created {
@@ -1391,22 +1403,31 @@ archive_folder = "Unsubscribed"
 
     // ─── a config file that does not exist yet ──────────────────────────────
 
+    // A preferences-only config.toml has no account, so nothing can load it,
+    // and its existence would get past the "run `unsubscribe init`" check.
     #[test]
-    #[ignore = "bug: write_preferences on a missing config file writes a \
-                preferences-only config.toml that read_preferences then rejects \
-                for a missing [account] section"]
-    fn writing_preferences_without_a_config_file_creates_a_readable_one() {
+    fn writing_preferences_without_a_config_file_is_refused_and_creates_nothing() {
         let dir = TempDir::new().unwrap();
-        let store = TomlConfigStore::new(dir.path().join("nested"));
-        store
+        let config_dir = dir.path().join("nested");
+        let store = TomlConfigStore::new(&config_dir);
+
+        let err = store
             .write_preferences(&Preferences {
                 min_emails: 6,
                 stale_after_months: 6,
                 cache_max_age_days: 6,
             })
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(store.read_preferences().unwrap().min_emails, 6);
+        assert!(
+            err.to_string().contains("unsubscribe init"),
+            "the error should point the user at init, got: {err}"
+        );
+        assert!(
+            !config_dir.join("config.toml").exists(),
+            "a refused write must not leave a config file behind"
+        );
+        assert_eq!(store.read_preferences().unwrap(), Preferences::default());
     }
 
     // ─── a file that cannot be parsed is not overwritten ────────────────────
