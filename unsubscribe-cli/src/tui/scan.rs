@@ -249,6 +249,7 @@ mod tests {
             Nav::Quit => "quit",
             Nav::Effect(Effect::ScanEnded) => "scan ended",
             Nav::Effect(Effect::ConfirmCancelScan) => "confirm cancel",
+            Nav::Effect(Effect::CancelSelection) => "cancel selection",
             Nav::Effect(_) => "other effect",
         }
     }
@@ -290,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_is_working_until_its_worker_has_reported() {
+        let (mut screen, _tx) = running();
+        assert!(screen.is_working());
+
+        screen.request_cancel();
+        assert!(screen.is_working(), "the worker has not stopped yet");
+
+        let mut ended = ended_with(ScanOutcome::Cancelled);
+        ended.tick();
+        assert!(!ended.is_working());
+    }
+
+    #[test]
     fn a_scan_that_has_not_reported_yet_asks_the_shell_for_nothing() {
         let (mut screen, _tx) = running();
 
@@ -298,12 +312,60 @@ mod tests {
     }
 
     #[test]
-    fn esc_while_scanning_asks_before_stopping() {
+    fn esc_while_scanning_parks_the_scan_rather_than_ending_it() {
         let (mut screen, _tx) = running();
 
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "confirm cancel");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
+        assert_eq!(screen.state, ScanState::Running, "the worker was left alone");
         // q is never "back", so it cannot silently abandon a scan.
         assert_eq!(nav_name(&screen.on_action(Action::Quit)), "stay");
+    }
+
+    #[test]
+    fn esc_keeps_parking_once_the_scan_is_stopping() {
+        // Cancelling is already under way; Esc still means "let me look at
+        // something else", not "ask me about it again".
+        let (mut screen, _tx) = running();
+        screen.request_cancel();
+
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
+        assert_eq!(screen.state, ScanState::Cancelling);
+    }
+
+    #[test]
+    fn c_while_scanning_asks_before_stopping() {
+        let (mut screen, _tx) = running();
+
+        assert_eq!(
+            nav_name(&screen.on_action(Action::Mnemonic('c'))),
+            "confirm cancel"
+        );
+        assert!(
+            !screen.shared.cancel_requested(),
+            "nothing is cancelled until the question is answered"
+        );
+    }
+
+    #[test]
+    fn c_is_offered_wherever_it_would_do_something() {
+        let (mut screen, _tx) = running();
+        assert!(screen.actions().contains(&Action::Mnemonic('c')));
+
+        screen.request_cancel();
+        assert!(
+            !screen.actions().contains(&Action::Mnemonic('c')),
+            "there is nothing left for it to do"
+        );
+    }
+
+    #[test]
+    fn a_letter_the_screen_does_not_offer_does_nothing_at_all() {
+        let (mut screen, _tx) = running();
+
+        for c in ['a', 'n', 's', 'd', 'u', 'w', 'x', 'y'] {
+            assert_eq!(nav_name(&screen.on_action(Action::Mnemonic(c))), "stay", "{c}");
+        }
+        assert_eq!(screen.state, ScanState::Running);
     }
 
     #[test]
@@ -324,8 +386,16 @@ mod tests {
         let (mut screen, _tx) = running();
         screen.request_cancel();
 
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::Mnemonic('c'))), "stay");
         assert_eq!(screen.state, ScanState::Cancelling);
+    }
+
+    #[test]
+    fn c_over_a_scan_that_has_already_ended_only_closes_it() {
+        let mut screen = ended_with(ScanOutcome::Cancelled);
+        screen.tick();
+
+        assert_eq!(nav_name(&screen.on_action(Action::Mnemonic('c'))), "pop");
     }
 
     #[test]
@@ -403,13 +473,21 @@ mod tests {
     fn the_working_area_says_what_the_scan_is_doing() {
         let (mut screen, _tx) = running();
         assert_eq!(screen.state_label(), "scanning");
-        assert!(screen.actions().contains(&Action::Back), "cancel is offered");
+        assert!(
+            screen.actions().contains(&Action::Mnemonic('c')),
+            "cancel is offered"
+        );
+        assert!(screen.actions().contains(&Action::Back), "so is the way out");
 
         screen.request_cancel();
         assert!(screen.state_label().contains("stopping"));
         assert!(
-            !screen.actions().contains(&Action::Back),
+            !screen.actions().contains(&Action::Mnemonic('c')),
             "asking again would change nothing"
+        );
+        assert!(
+            screen.actions().contains(&Action::Back),
+            "but the nav is still reachable while it stops"
         );
     }
 }

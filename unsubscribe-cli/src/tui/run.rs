@@ -613,12 +613,58 @@ mod tests {
     // -- cancelling ----------------------------------------------------------
 
     #[test]
-    fn esc_while_running_asks_before_stopping() {
-        let (mut screen, _shared, _tx) = screen_with(1);
+    fn esc_while_running_parks_the_run_rather_than_ending_it() {
+        let (mut screen, shared, _tx) = screen_with(1);
 
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "confirm cancel");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
+        assert_eq!(screen.state, RunState::Running);
+        assert!(!shared.cancel_requested(), "the worker was left alone");
         // q is never "back", so it cannot silently abandon a run.
         assert_eq!(nav_name(&screen.on_action(Action::Quit)), "stay");
+    }
+
+    #[test]
+    fn esc_keeps_parking_once_the_run_is_stopping() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        screen.request_cancel();
+
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
+        assert_eq!(screen.state, RunState::Cancelling);
+    }
+
+    #[test]
+    fn c_while_running_asks_before_stopping() {
+        let (mut screen, shared, _tx) = screen_with(1);
+
+        assert_eq!(
+            nav_name(&screen.on_action(Action::Mnemonic('c'))),
+            "confirm cancel"
+        );
+        assert!(
+            !shared.cancel_requested(),
+            "nothing is cancelled until the question is answered"
+        );
+    }
+
+    #[test]
+    fn a_letter_the_screen_does_not_offer_does_nothing_at_all() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+
+        for c in ['a', 'n', 's', 'd', 'u', 'w', 'x', 'y'] {
+            assert_eq!(nav_name(&screen.on_action(Action::Mnemonic(c))), "stay", "{c}");
+        }
+    }
+
+    #[test]
+    fn a_run_is_working_until_its_worker_has_reported() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        assert!(screen.is_working());
+
+        screen.request_cancel();
+        assert!(screen.is_working(), "the worker has not stopped yet");
+
+        let finished = finished(RunResult::Done(Box::default()));
+        assert!(!finished.is_working());
     }
 
     #[test]
@@ -636,7 +682,7 @@ mod tests {
         let (mut screen, _shared, _tx) = screen_with(1);
         screen.request_cancel();
 
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "stay");
+        assert_eq!(nav_name(&screen.on_action(Action::Mnemonic('c'))), "stay");
         assert_eq!(screen.state, RunState::Cancelling);
     }
 
@@ -644,9 +690,21 @@ mod tests {
     fn the_working_area_says_the_run_is_stopping_after_the_current_sender() {
         let (mut screen, _shared, _tx) = screen_with(1);
         assert_eq!(screen.state_label(), "running");
-        assert!(screen.actions().contains(&Action::Back), "cancel is offered");
+        assert!(
+            screen.actions().contains(&Action::Mnemonic('c')),
+            "cancel is offered"
+        );
 
         screen.request_cancel();
+
+        assert!(
+            !screen.actions().contains(&Action::Mnemonic('c')),
+            "asking again would change nothing"
+        );
+        assert!(
+            screen.actions().contains(&Action::Back),
+            "but the nav is still reachable while it stops"
+        );
 
         assert!(
             screen.state_label().contains("stopping after the current sender"),
@@ -677,10 +735,28 @@ mod tests {
     // -- leaving -------------------------------------------------------------
 
     #[test]
-    fn esc_after_the_run_finished_goes_back_to_the_run_panel() {
+    fn esc_over_the_results_parks_them_rather_than_closing_them() {
+        // The results are worth coming back to, and the Run workflow's Esc
+        // means the same thing on every one of its screens.
         let mut screen = finished(RunResult::Done(Box::default()));
 
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "pop");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
+    }
+
+    #[test]
+    fn c_over_the_results_closes_them_without_asking() {
+        // There is no work left to stop and nothing to lose, so the question
+        // a running run asks would be noise here.
+        let mut screen = finished(RunResult::Done(Box::default()));
+
+        assert_eq!(nav_name(&screen.on_action(Action::Mnemonic('c'))), "pop");
+    }
+
+    #[test]
+    fn c_closes_a_run_that_ended_badly_just_the_same() {
+        let mut screen = finished(RunResult::Failed("mailbox refused".to_string()));
+
+        assert_eq!(nav_name(&screen.on_action(Action::Mnemonic('c'))), "pop");
     }
 
     // -- the attempt list ----------------------------------------------------
@@ -773,7 +849,7 @@ mod tests {
             "stay",
             "Esc closes the overlay; leaving takes a second press"
         );
-        assert_eq!(nav_name(&screen.on_action(Action::Back)), "pop");
+        assert_eq!(nav_name(&screen.on_action(Action::Back)), "park");
     }
 
     // -- plan counts ---------------------------------------------------------

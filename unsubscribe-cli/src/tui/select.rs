@@ -1844,9 +1844,66 @@ mod key_handling_tests {
     }
 
     #[test]
-    fn esc_backs_out_without_running_and_q_is_never_back() {
-        assert_eq!(app().on_key(key(KeyCode::Esc)), SelectAction::Cancel);
-        assert_eq!(app().on_key(key(KeyCode::Char('q'))), SelectAction::None);
+    fn esc_parks_the_selection_and_q_is_never_back() {
+        // Esc leaves the ticks exactly where they are: the screen is handed
+        // to the nav, not thrown away. Discarding it is `c`.
+        let mut app = app();
+
+        assert_eq!(app.on_key(key(KeyCode::Esc)), SelectAction::Park);
+        assert_eq!(app.on_key(key(KeyCode::Char('q'))), SelectAction::None);
+        assert!(!app.cancelled);
+    }
+
+    #[test]
+    fn c_discards_an_untouched_selection_without_asking() {
+        // Nothing has been chosen yet, so there is nothing to lose and a
+        // question would only be in the way.
+        let mut app = app();
+
+        assert!(!app.is_dirty());
+        assert_eq!(app.on_key(key(KeyCode::Char('c'))), SelectAction::Cancel);
+    }
+
+    #[test]
+    fn c_asks_first_once_a_tick_has_been_changed() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char(' ')));
+
+        assert!(app.is_dirty());
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('c'))),
+            SelectAction::ConfirmCancel
+        );
+    }
+
+    #[test]
+    fn a_selection_put_back_the_way_it_started_is_not_dirty() {
+        // Dirtiness is about the ticks, not about how much was pressed.
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.is_dirty());
+
+        app.on_key(key(KeyCode::Char('n')));
+
+        assert!(!app.is_dirty(), "every tick is back at its default");
+        assert_eq!(app.on_key(key(KeyCode::Char('c'))), SelectAction::Cancel);
+    }
+
+    #[test]
+    fn a_resumed_sender_starts_ticked_and_that_is_not_a_change() {
+        // The screen opens with the senders that ignored an unsubscribe
+        // already ticked; the user has not chosen anything by arriving.
+        let app = app();
+
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn the_screen_advertises_cancelling_and_the_way_out() {
+        let actions = app().actions();
+
+        assert!(actions.contains(&Action::Mnemonic('c')));
+        assert!(actions.contains(&Action::Back));
     }
 
     #[test]

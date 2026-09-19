@@ -727,7 +727,7 @@ impl Shell {
                     let toggled = dialog.toggled();
                     self.dialog = None;
                     if let Some(pending) = self.pending.take() {
-                        self.resolve(pending, toggled, terminal)?;
+                        self.resolve(pending, toggled);
                     }
                 }
                 DialogOutcome::Dismissed => {
@@ -925,6 +925,20 @@ impl Shell {
     // -- effects ----------------------------------------------------------
 
     fn perform(&mut self, effect: Effect, terminal: &mut Tui) -> Result<()> {
+        // Only the two settings flows need the real terminal; everything else
+        // just moves state, and lives in the pure half so it can be tested.
+        match effect {
+            Effect::SettingsFolders => self.settings_folders(terminal),
+            Effect::SettingsReauth => self.settings_reauth(terminal),
+            other => {
+                self.perform_pure(other);
+                Ok(())
+            }
+        }
+    }
+
+    /// Every effect that needs nothing but the shell's own state.
+    fn perform_pure(&mut self, effect: Effect) {
         match effect {
             Effect::Scan => self.start_scan(),
             Effect::Review => self.review(),
@@ -982,14 +996,16 @@ impl Shell {
             }
             Effect::RunFromHistory => self.run_from_history(),
             Effect::SettingsSave => self.settings_save(),
-            Effect::SettingsFolders => self.settings_folders(terminal)?,
-            Effect::SettingsReauth => self.settings_reauth(terminal)?,
+            // Answered above, where the terminal is still in reach.
+            Effect::SettingsFolders | Effect::SettingsReauth => {}
         }
-        Ok(())
     }
 
-    fn resolve(&mut self, pending: Pending, toggled: bool, terminal: &mut Tui) -> Result<()> {
-        let _ = terminal;
+    /// Carry out what a confirmed question asked for.
+    ///
+    /// Pure, and terminal-free: every answer the shell asks for moves state
+    /// and nothing else, which is what makes the confirmation rules testable.
+    fn resolve(&mut self, pending: Pending, toggled: bool) {
         match pending {
             Pending::Run { plan, counts } => self.start_run(*plan, *counts, toggled),
             Pending::UseCachedScan { cached } => self.open_selection(*cached),
@@ -1006,7 +1022,6 @@ impl Shell {
             Pending::CancelSelection => self.cancel_selection(),
             Pending::Quit => self.quit_after_cancelling(),
         }
-        Ok(())
     }
 
     /// Decide between the cached scan and a fresh one, then act on it.
@@ -1744,10 +1759,10 @@ mod tests {
     }
 
     #[test]
-    fn backing_out_of_the_selection_closes_only_that_sub_view() {
+    fn backing_out_of_the_selection_parks_it_with_every_tick_kept() {
         let mut view = selection_view();
 
-        assert_eq!(nav_name(&view.on_action(Action::Back)), "pop");
+        assert_eq!(nav_name(&view.on_action(Action::Back)), "park");
     }
 
     #[test]
@@ -1767,16 +1782,84 @@ mod tests {
     }
 
     #[test]
-    fn esc_backs_out_of_a_sub_view_and_asks_first_while_work_is_running() {
+    fn esc_parks_every_run_sub_view_and_still_pops_the_timeline() {
         for mut view in sub_views() {
             let title = view.title();
             let expected = match view {
-                // The running views ask before throwing work away.
-                SubView::Scan(_) | SubView::Running(_) => "other effect",
-                _ => "pop",
+                // Outside the Run workflow nothing changed: one level back.
+                SubView::SenderHistory(_) => "pop",
+                _ => "park",
             };
             assert_eq!(nav_name(&view.on_action(Action::Back)), expected, "{title}");
         }
+    }
+
+    #[test]
+    fn c_is_answered_by_every_run_sub_view_and_by_nothing_else() {
+        for mut view in sub_views() {
+            let title = view.title();
+            let answered = !matches!(nav_name(&view.on_action(Action::Mnemonic('c'))), "stay");
+            let expected = !matches!(view, SubView::SenderHistory(_));
+
+            assert_eq!(answered, expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn c_is_advertised_by_exactly_the_sub_views_that_answer_it() {
+        for view in sub_views() {
+            let title = view.title();
+            let offered = view.actions().contains(&Action::Mnemonic('c'));
+
+            assert_eq!(
+                offered,
+                !matches!(view, SubView::SenderHistory(_)),
+                "{title}"
+            );
+        }
+    }
+
+    // -- what the nav says Run has waiting -----------------------------------
+
+    #[test]
+    fn a_working_scan_or_run_names_itself_in_the_nav() {
+        for view in sub_views() {
+            let title = view.title();
+            let expected = match view {
+                SubView::Scan(_) => RunActivity::Scanning,
+                SubView::Running(_) => RunActivity::Unsubscribing,
+                SubView::Select { .. } => RunActivity::Parked,
+                SubView::SenderHistory(_) => RunActivity::Idle,
+            };
+            assert_eq!(view.activity(), expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn a_scan_that_has_ended_is_parked_rather_than_still_scanning() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(worker::ScanOutcome::Cancelled).expect("listening");
+        let mut view = SubView::Scan(Box::new(ScanScreen::new(ScanShared::new(), rx)));
+        view.tick();
+
+        assert_eq!(view.activity(), RunActivity::Parked);
+        assert!(!view.activity().is_working());
+    }
+
+    #[test]
+    fn every_activity_but_idle_leaves_a_mark_the_user_can_see() {
+        assert_eq!(RunActivity::Idle.badge(), "");
+        for activity in [
+            RunActivity::Scanning,
+            RunActivity::Unsubscribing,
+            RunActivity::Parked,
+        ] {
+            assert!(!activity.badge().is_empty(), "{activity:?}");
+        }
+        assert!(RunActivity::Scanning.is_working());
+        assert!(RunActivity::Unsubscribing.is_working());
+        assert!(!RunActivity::Parked.is_working());
+        assert!(!RunActivity::Idle.is_working());
     }
 
     // -- the run confirmation ------------------------------------------------
@@ -1913,9 +1996,26 @@ mod tests {
         /// Press one key's worth of action and carry out the pure half of the
         /// answer, the way the event loop does.
         pub(super) fn press(shell: &mut Shell, action: Action) -> Option<&'static str> {
+            // The loop rebuilds a panel it has invalidated before the next
+            // key lands; without this a panel dropped by `refresh` would
+            // silently swallow the press that follows it.
+            shell.ensure_panel(shell.nav.section());
             let nav = shell.dispatch_action(action);
             let name = nav_name(&nav);
             shell.apply(nav).map(|_| name)
+        }
+
+        /// Press a key and carry out the effect it asks for, for the flows
+        /// whose whole point is the question the shell then puts up.
+        ///
+        /// Separate from [`press`] because performing an effect can start a
+        /// worker, and most tests want only the state transition.
+        pub(super) fn act(shell: &mut Shell, action: Action) {
+            shell.ensure_panel(shell.nav.section());
+            let nav = shell.dispatch_action(action);
+            if let Some(effect) = shell.apply(nav) {
+                shell.perform_pure(effect);
+            }
         }
 
         pub(super) fn section(shell: &Shell) -> Section {
@@ -1934,6 +2034,69 @@ mod tests {
         /// The sections with a working area to focus.
         pub(super) fn panels() -> impl Iterator<Item = Section> {
             Section::ALL.into_iter().filter(|s| s.has_panel())
+        }
+
+        /// The senders ticked in the selection waiting under Run.
+        pub(super) fn selected_emails(shell: &Shell) -> Vec<String> {
+            match shell.stacks.run.last() {
+                Some(SubView::Select { app, .. }) => app
+                    .selected_senders()
+                    .into_iter()
+                    .map(|sender| sender.email)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        /// What a finished scan hands back.
+        pub(super) fn scanned(count: usize) -> Box<ObtainedSenders> {
+            Box::new(ObtainedSenders {
+                senders: (0..count)
+                    .map(|i| sender(&format!("s{i}@acme.example.com"), 3))
+                    .collect(),
+                warnings: Vec::new(),
+                scanned_at: "2026-06-01T09:00:00Z".to_string(),
+                from_cache: false,
+            })
+        }
+
+        /// A shell with a scan running under Run, focused on it.
+        pub(super) fn scanning() -> Shell {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            // Held so the worker channel never reports "disconnected".
+            std::mem::forget(tx);
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+            shell
+        }
+
+        /// A shell with a run under way, focused on it.
+        pub(super) fn unsubscribing() -> Shell {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            std::mem::forget(tx);
+            shell.apply(Nav::Push(SubView::Running(Box::new(RunScreen::new(
+                RunShared::new(),
+                rx,
+                PlanCounts::default(),
+                false,
+            )))));
+            shell
+        }
+
+        /// Answer the open dialog the way the event loop does.
+        pub(super) fn answer(shell: &mut Shell, yes: bool) {
+            assert!(shell.dialog.is_some(), "nothing was being asked");
+            shell.dialog = None;
+            let pending = shell.pending.take().expect("a question was asked");
+            if yes {
+                shell.resolve(pending, false);
+            }
         }
 
         // -- where focus starts ---------------------------------------------
@@ -2004,10 +2167,15 @@ mod tests {
 
         #[test]
         fn esc_climbs_one_level_per_press_from_the_bottom_of_a_stack() {
+            // Outside the Run workflow, where Esc still means one level back.
             let mut shell = shell();
-            open(&mut shell, Section::Run);
-            shell.apply(Nav::Push(selection_view()));
-            shell.apply(Nav::Push(selection_view()));
+            open(&mut shell, Section::List);
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
             assert_eq!(shell.depth(), 2);
 
             press(&mut shell, Action::Back);
@@ -2020,6 +2188,18 @@ mod tests {
 
             press(&mut shell, Action::Back);
             assert!(shell.nav.nav_has_focus());
+        }
+
+        #[test]
+        fn esc_in_the_run_workflow_reaches_the_nav_in_one_press_however_deep_it_is() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+
+            press(&mut shell, Action::Back);
+
+            assert!(shell.nav.nav_has_focus(), "the nav answers keys again");
+            assert_eq!(shell.depth(), 1, "and the selection is still standing");
         }
 
         #[test]
@@ -2040,8 +2220,7 @@ mod tests {
             let mut shell = shell();
             open(&mut shell, Section::Run);
             shell.apply(Nav::Push(selection_view()));
-            press(&mut shell, Action::Back); // back to the panel
-            press(&mut shell, Action::Back); // back to the nav
+            press(&mut shell, Action::Back); // parks it at the nav
 
             press(&mut shell, Action::Back);
 
@@ -2101,30 +2280,28 @@ mod tests {
         // -- the sub-view stack belongs to a section ------------------------
 
         #[test]
-        fn a_pushed_sub_view_highlights_and_focuses_the_section_it_belongs_to() {
+        fn a_pushed_sub_view_waits_in_its_own_section_without_stealing_focus() {
+            // The shell pushes on a worker's behalf too, and a scan that
+            // finishes while the user is reading the Logs must not drag them
+            // out of it. The view waits on its section's stack instead.
             let mut shell = shell();
+            open(&mut shell, Section::Logs);
 
-            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
-                DetailScreen::new(timeline_view()),
-            ))));
+            shell.apply(Nav::Push(selection_view()));
 
-            assert_eq!(section(&shell), Section::List, "a timeline is a List view");
-            assert!(!shell.nav.nav_has_focus());
-            assert_eq!(shell.depth(), 1);
+            assert_eq!(section(&shell), Section::Logs, "the user was left alone");
+            assert_eq!(shell.depth(), 0, "the Logs panel has no sub-view");
+            assert_eq!(shell.stacks.run.len(), 1, "it is waiting under Run");
         }
 
         #[test]
-        #[ignore = "no key reaches the nav without unwinding the sub-view -- see the report"]
         fn runs_sub_view_stack_survives_walking_the_nav_away_and_back() {
             let mut shell = shell();
             open(&mut shell, Section::Run);
             shell.apply(Nav::Push(selection_view()));
 
-            // Esc is the only key that leaves the working area, and inside a
-            // sub-view it closes that sub-view first -- so this sequence
-            // throws the selection away instead of parking it.
-            press(&mut shell, Action::Back); // meant: to the panel
-            press(&mut shell, Action::Back); // meant: to the nav
+            // Esc inside the Run workflow parks the selection at the nav.
+            press(&mut shell, Action::Back);
             press(&mut shell, Action::MoveDown); // preview the list
             press(&mut shell, Action::Activate); // and look at it
             press(&mut shell, Action::Back);
@@ -2140,21 +2317,77 @@ mod tests {
         }
 
         #[test]
-        fn esc_inside_a_sub_view_closes_it_rather_than_parking_it_at_the_nav() {
-            // What the key sequence above actually does today. Pinned so the
-            // shape of the gap is recorded rather than only its absence.
+        fn a_parked_selection_keeps_its_cursor_and_its_ticks() {
             let mut shell = shell();
             open(&mut shell, Section::Run);
             shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::MoveDown);
+            press(&mut shell, Action::Toggle);
+            let chosen = selected_emails(&shell);
+            assert!(!chosen.is_empty(), "something was ticked");
 
+            press(&mut shell, Action::Back); // park it
+            press(&mut shell, Action::MoveDown); // walk off to the List
+            press(&mut shell, Action::Activate);
             press(&mut shell, Action::Back);
+            press(&mut shell, Action::MoveUp);
+            press(&mut shell, Action::Activate); // and come back
 
-            assert_eq!(shell.depth(), 0, "the selection was thrown away");
-            assert!(!shell.nav.nav_has_focus(), "and focus is still in Run");
+            assert_eq!(selected_emails(&shell), chosen, "the ticks survived");
         }
 
         #[test]
-        #[ignore = "a running scan answers Esc with a cancel question, so the nav is unreachable -- see the report"]
+        fn a_parked_run_workflow_survives_a_timeline_being_opened_elsewhere() {
+            // Each section owns its own stack, so looking a sender up in the
+            // Unsubscribe List cannot throw a running scan away.
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::Back);
+
+            open(&mut shell, Section::List);
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+            assert_eq!(shell.depth(), 1, "the timeline is on the List's stack");
+
+            press(&mut shell, Action::Back); // close the timeline
+            press(&mut shell, Action::Back); // back to the nav
+            press(&mut shell, Action::MoveUp);
+            press(&mut shell, Action::Activate);
+
+            assert_eq!(
+                shell.active_sub_view().map(SubView::title).as_deref(),
+                Some("Select senders")
+            );
+        }
+
+        #[test]
+        fn enter_on_run_returns_to_a_parked_workflow_rather_than_offering_to_start_another() {
+            // With something parked there is no way to press Enter on "Scan
+            // and unsubscribe": the sub-view is what answers keys.
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            std::mem::forget(tx);
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+            press(&mut shell, Action::Back);
+
+            press(&mut shell, Action::Activate);
+
+            assert!(shell.active_sub_view().is_some(), "back in the scan");
+            let effect = {
+                let nav = shell.dispatch_action(Action::Activate);
+                shell.apply(nav)
+            };
+            assert!(effect.is_none(), "Enter did not start a second scan");
+            assert_eq!(shell.stacks.run.len(), 1);
+        }
+
+        #[test]
         fn the_nav_is_reachable_while_a_scan_is_running() {
             let mut shell = shell();
             open(&mut shell, Section::Run);
@@ -2164,12 +2397,13 @@ mod tests {
                 rx,
             )))));
 
-            // Esc asks whether to cancel; answering no leaves focus where it
-            // was, and there is no other key that reaches the nav.
+            // Esc parks the scan: focus goes to the nav and nothing is asked.
             press(&mut shell, Action::Back);
 
             assert!(shell.nav.nav_has_focus(), "the scan should keep running");
-            assert_eq!(shell.depth(), 0, "and stay on Run's stack");
+            assert!(shell.dialog.is_none(), "and nothing should be asked");
+            assert_eq!(shell.depth(), 1, "and stay on Run's stack");
+            assert!(shell.work_in_flight());
         }
 
         #[test]
@@ -2177,10 +2411,7 @@ mod tests {
             let mut shell = shell();
             open(&mut shell, Section::Run);
             shell.apply(Nav::Push(selection_view()));
-            // Parked without a key: Esc would close it (see the ignored test
-            // above), and this is the state the shell's own transitions --
-            // a worker finishing while the user is elsewhere -- produce.
-            shell.nav.focus_nav();
+            press(&mut shell, Action::Back); // park it
             open(&mut shell, Section::Logs);
 
             assert_eq!(shell.depth(), 0, "the Logs panel has no sub-view");
@@ -2191,11 +2422,11 @@ mod tests {
             // And Esc here backs out of Logs, not out of Run's selection.
             press(&mut shell, Action::Back);
             assert!(shell.nav.nav_has_focus());
-            assert_eq!(shell.stack.len(), 1, "Run's stack is untouched");
+            assert_eq!(shell.stacks.run.len(), 1, "Run's stack is untouched");
         }
 
         #[test]
-        fn opening_a_view_under_another_section_replaces_the_stack_rather_than_interleaving_it() {
+        fn a_view_opened_under_another_section_joins_that_sections_own_stack() {
             let mut shell = shell();
             open(&mut shell, Section::Run);
             shell.apply(Nav::Push(selection_view()));
@@ -2205,8 +2436,8 @@ mod tests {
                 DetailScreen::new(timeline_view()),
             ))));
 
-            assert_eq!(shell.stack_section, Section::List);
-            assert_eq!(shell.depth(), 1, "only the timeline is left");
+            assert_eq!(shell.stacks.list.len(), 1, "the timeline is the List's");
+            assert_eq!(shell.stacks.run.len(), 2, "and Run keeps both of its own");
         }
 
         // -- text fields ----------------------------------------------------
@@ -2321,6 +2552,311 @@ mod tests {
 
             assert!(shell.dialog.is_none(), "the question outlived its subject");
             assert!(shell.pending.is_none());
+        }
+
+        // -- cancelling, which is now its own key ---------------------------
+
+        #[test]
+        fn c_over_a_running_scan_asks_and_only_then_stops_it() {
+            let mut shell = scanning();
+
+            act(&mut shell, Action::Mnemonic('c'));
+            assert!(shell.dialog.is_some(), "it asked first");
+            assert!(shell.work_in_flight(), "and nothing has stopped yet");
+
+            answer(&mut shell, true);
+
+            assert!(
+                matches!(shell.stacks.run.last(), Some(SubView::Scan(_))),
+                "the screen stays up until the worker reports"
+            );
+            assert!(!shell.nav.nav_has_focus(), "focus is still in Run");
+        }
+
+        #[test]
+        fn declining_the_cancel_question_leaves_the_scan_exactly_as_it_was() {
+            let mut shell = scanning();
+            act(&mut shell, Action::Mnemonic('c'));
+
+            answer(&mut shell, false);
+
+            assert!(shell.work_in_flight());
+            assert_eq!(shell.depth(), 1);
+            assert!(shell.dialog.is_none());
+        }
+
+        #[test]
+        fn c_over_a_running_run_asks_before_stopping_it_too() {
+            let mut shell = unsubscribing();
+
+            act(&mut shell, Action::Mnemonic('c'));
+
+            assert!(shell.dialog.is_some());
+            assert!(matches!(shell.pending, Some(Pending::CancelRun)));
+        }
+
+        #[test]
+        fn c_over_an_untouched_selection_closes_it_without_asking() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+
+            act(&mut shell, Action::Mnemonic('c'));
+
+            assert!(shell.dialog.is_none(), "nothing was chosen to lose");
+            assert_eq!(shell.depth(), 0, "back at the Run panel");
+            assert!(!shell.nav.nav_has_focus());
+        }
+
+        #[test]
+        fn c_over_a_selection_with_ticks_changed_asks_first() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::Mnemonic('a')); // tick everything
+
+            act(&mut shell, Action::Mnemonic('c'));
+            assert!(shell.dialog.is_some());
+            assert_eq!(shell.depth(), 1, "still there while it asks");
+
+            answer(&mut shell, true);
+            assert_eq!(shell.depth(), 0, "and gone once it is answered");
+        }
+
+        #[test]
+        fn declining_that_question_keeps_every_tick() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::Mnemonic('a'));
+            let chosen = selected_emails(&shell);
+
+            act(&mut shell, Action::Mnemonic('c'));
+            answer(&mut shell, false);
+
+            assert_eq!(shell.depth(), 1);
+            assert_eq!(selected_emails(&shell), chosen);
+        }
+
+        #[test]
+        fn c_is_inert_in_every_panel_outside_the_run_workflow() {
+            for target in panels() {
+                let mut shell = shell();
+                open(&mut shell, target);
+                let depth = shell.depth();
+
+                let nav = shell.dispatch_action(Action::Mnemonic('c'));
+                let effect = shell.apply(nav);
+
+                assert!(effect.is_none(), "{target:?} acted on c");
+                assert!(!shell.quit, "{target:?}");
+                assert_eq!(shell.depth(), depth, "{target:?}");
+                assert!(!shell.nav.nav_has_focus(), "{target:?}");
+                assert!(shell.dialog.is_none(), "{target:?} asked something");
+            }
+        }
+
+        #[test]
+        fn c_is_inert_on_a_sender_timeline_too() {
+            let mut shell = shell();
+            open(&mut shell, Section::List);
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            press(&mut shell, Action::Mnemonic('c'));
+
+            assert_eq!(shell.depth(), 1);
+            assert!(shell.dialog.is_none());
+        }
+
+        // -- what the nav says Run has waiting ------------------------------
+
+        #[test]
+        fn the_nav_says_nothing_about_run_until_there_is_something_to_say() {
+            assert_eq!(shell().run_activity(), RunActivity::Idle);
+            assert_eq!(shell().run_activity().badge(), "");
+        }
+
+        #[test]
+        fn the_nav_names_a_scan_a_run_and_a_parked_selection_from_any_section() {
+            fn parked_selection() -> Shell {
+                let mut shell = shell();
+                open(&mut shell, Section::Run);
+                shell.apply(Nav::Push(selection_view()));
+                shell
+            }
+
+            let cases: [(RunActivity, fn() -> Shell); 3] = [
+                (RunActivity::Scanning, scanning),
+                (RunActivity::Unsubscribing, unsubscribing),
+                (RunActivity::Parked, parked_selection),
+            ];
+
+            for (expected, build) in cases {
+                let mut shell = build();
+                assert_eq!(shell.run_activity(), expected);
+
+                press(&mut shell, Action::Back); // park it
+                open(&mut shell, Section::Logs); // and walk away
+
+                assert_eq!(
+                    shell.run_activity(),
+                    expected,
+                    "the marker must still be there from {:?}",
+                    Section::Logs
+                );
+                assert!(!shell.run_activity().badge().is_empty());
+            }
+        }
+
+        #[test]
+        fn a_timeline_waiting_under_the_list_is_not_something_run_advertises() {
+            let mut shell = shell();
+            open(&mut shell, Section::List);
+            shell.apply(Nav::Push(SubView::SenderHistory(Box::new(
+                DetailScreen::new(timeline_view()),
+            ))));
+
+            assert_eq!(shell.run_activity(), RunActivity::Idle);
+        }
+
+        // -- work that finishes while the user is somewhere else ------------
+
+        #[test]
+        fn a_scan_that_ends_while_the_user_is_elsewhere_still_advances_the_workflow() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+            press(&mut shell, Action::Back); // park the scan
+            open(&mut shell, Section::Logs); // and go and read the Logs
+
+            tx.send(worker::ScanOutcome::Done(scanned(2)))
+                .expect("the screen is listening");
+            let nav = shell.stacks.run.last_mut().map(SubView::tick).expect("a scan");
+            let effect = shell.apply(nav).expect("the scan reports its ending");
+            shell.perform_pure(effect);
+
+            assert_eq!(section(&shell), Section::Logs, "the user was left alone");
+            assert!(
+                matches!(shell.stacks.run.last(), Some(SubView::Select { .. })),
+                "and the selection is waiting under Run"
+            );
+            assert_eq!(shell.run_activity(), RunActivity::Parked);
+        }
+
+        #[test]
+        fn a_scan_that_fails_while_the_user_is_elsewhere_still_says_so() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+            press(&mut shell, Action::Back);
+            open(&mut shell, Section::Settings);
+
+            tx.send(worker::ScanOutcome::Failed("connection refused".to_string()))
+                .expect("listening");
+            let nav = shell.stacks.run.last_mut().map(SubView::tick).expect("a scan");
+            let effect = shell.apply(nav).expect("an ending");
+            shell.perform_pure(effect);
+
+            assert!(
+                shell.dialog.is_some(),
+                "an error must not be lost because the user walked away"
+            );
+            assert_eq!(shell.stacks.run.len(), 0, "and the scan is gone");
+        }
+
+        #[test]
+        fn a_worker_that_dies_while_the_user_is_elsewhere_surfaces_rather_than_hanging() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel::<worker::ScanOutcome>();
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+            press(&mut shell, Action::Back);
+            drop(tx);
+
+            let nav = shell.stacks.run.last_mut().map(SubView::tick).expect("a scan");
+            let effect = shell.apply(nav).expect("an ending");
+            shell.perform_pure(effect);
+
+            assert!(shell.dialog.is_some());
+        }
+
+        // -- quitting with work in flight -----------------------------------
+
+        #[test]
+        fn q_at_the_nav_quits_at_once_when_there_is_nothing_running() {
+            let mut shell = shell();
+
+            press(&mut shell, Action::Quit);
+
+            assert!(shell.quit);
+            assert!(shell.dialog.is_none());
+        }
+
+        #[test]
+        fn q_asks_first_while_a_scan_is_running_and_waits_for_it_to_stop() {
+            let mut shell = scanning();
+            press(&mut shell, Action::Back); // park it at the nav
+
+            press(&mut shell, Action::Quit);
+            assert!(shell.dialog.is_some(), "it asked");
+            assert!(!shell.quit);
+
+            answer(&mut shell, true);
+
+            assert!(!shell.quit, "the worker has not stopped yet");
+            assert!(shell.quit_when_idle, "but the app is on its way out");
+            assert!(
+                matches!(shell.stacks.run.last(), Some(SubView::Scan(_))),
+                "the scan was asked to stop, not abandoned"
+            );
+        }
+
+        #[test]
+        fn declining_the_quit_question_leaves_the_app_and_the_worker_alone() {
+            let mut shell = scanning();
+            press(&mut shell, Action::Back);
+
+            press(&mut shell, Action::Quit);
+            answer(&mut shell, false);
+
+            assert!(!shell.quit);
+            assert!(!shell.quit_when_idle);
+            assert!(shell.work_in_flight());
+        }
+
+        #[test]
+        fn q_asks_the_same_question_while_a_run_is_under_way() {
+            let mut shell = unsubscribing();
+            press(&mut shell, Action::Back);
+
+            press(&mut shell, Action::Quit);
+
+            assert!(matches!(shell.pending, Some(Pending::Quit)));
+        }
+
+        #[test]
+        fn a_parked_selection_is_not_work_in_flight_so_quitting_is_immediate() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            shell.apply(Nav::Push(selection_view()));
+            press(&mut shell, Action::Back);
+
+            press(&mut shell, Action::Quit);
+
+            assert!(shell.quit, "there is no worker to wait for");
         }
 
         #[test]
@@ -2570,6 +3106,82 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+
+        #[test]
+        fn esc_reaches_the_nav_from_every_run_focus_without_unwinding_anything() {
+            // The Run workflow's whole contract in one table: one press, the
+            // nav answers keys, and everything that was open is still open.
+            for (name, build) in focuses() {
+                let mut shell = build();
+                if shell.nav.section() != Section::Run {
+                    continue;
+                }
+                let depth = shell.depth();
+
+                let nav = shell.dispatch_action(Action::Back);
+                shell.apply(nav);
+
+                assert!(shell.nav.nav_has_focus(), "{name} did not reach the nav");
+                assert_eq!(shell.depth(), depth, "{name} unwound its stack");
+                assert!(shell.dialog.is_none(), "{name} asked a question");
+                assert_eq!(shell.nav.section(), Section::Run, "{name}");
+            }
+        }
+
+        #[test]
+        fn left_does_the_same_thing_as_esc_in_every_run_focus() {
+            for (name, build) in focuses() {
+                let mut shell = build();
+                if shell.nav.section() != Section::Run {
+                    continue;
+                }
+                let depth = shell.depth();
+
+                let nav = shell.dispatch_action(Action::FocusOut);
+                shell.apply(nav);
+
+                assert!(shell.nav.nav_has_focus(), "{name}");
+                assert_eq!(shell.depth(), depth, "{name}");
+            }
+        }
+
+        #[test]
+        fn esc_outside_the_run_workflow_still_climbs_exactly_one_level() {
+            for (name, build) in focuses() {
+                let mut shell = build();
+                if shell.nav.section() == Section::Run {
+                    continue;
+                }
+                let depth = shell.depth();
+
+                let nav = shell.dispatch_action(Action::Back);
+                shell.apply(nav);
+
+                if depth > 0 {
+                    assert_eq!(shell.depth(), depth - 1, "{name}");
+                    assert!(!shell.nav.nav_has_focus(), "{name} left the panel too");
+                } else {
+                    assert!(shell.nav.nav_has_focus(), "{name}");
+                }
+            }
+        }
+
+        #[test]
+        fn every_run_focus_advertises_the_cancel_key() {
+            for (name, build) in focuses() {
+                let shell = build();
+                // The Run panel's own top level has nothing to cancel; every
+                // sub-view of the workflow above it does.
+                if shell.nav.section() != Section::Run || shell.depth() == 0 {
+                    continue;
+                }
+
+                assert!(
+                    shell.focus_actions().contains(&Action::Mnemonic('c')),
+                    "{name} hides c"
+                );
             }
         }
 

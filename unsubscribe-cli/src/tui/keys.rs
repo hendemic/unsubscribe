@@ -299,6 +299,19 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_is_never_read_as_the_cancel_letter() {
+        // `c` cancels the work in front of the user; `Ctrl-C` leaves the app.
+        // The shell answers Ctrl-C before this map, and the map must not
+        // claim it either if that interception ever moves.
+        assert_eq!(action(ctrl(KeyCode::Char('c')), false), None);
+        assert_eq!(action(ctrl(KeyCode::Char('c')), true), None);
+        assert_eq!(
+            action(key(KeyCode::Char('c')), false),
+            Some(Action::Mnemonic('c'))
+        );
+    }
+
+    #[test]
     fn a_letter_that_is_not_a_mnemonic_means_nothing() {
         assert_eq!(action(key(KeyCode::Char('z')), false), None);
         assert_eq!(action(key(KeyCode::Char('m')), false), None);
