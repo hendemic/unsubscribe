@@ -256,3 +256,494 @@ fn rung_of(attempt: &UnsubscribeAttempt) -> Option<Rung> {
         .and_then(RungMethod::of_attempt)
         .map(|method| Rung::new(method, &attempt.url))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SENDER: &str = "news@acme.example.com";
+    const U1: &str = "https://acme.example.com/unsub?id=1";
+    const U2: &str = "https://acme.example.com/other?id=2";
+    const M1: &str = "mailto:unsub@acme.example.com";
+    const M2: &str = "mailto:leave@acme.example.com";
+
+    /// A sender carrying exactly the unsubscribe targets a test cares about.
+    fn sender(one_click: bool, urls: &[&str], mailtos: &[&str]) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: SENDER.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: urls.iter().map(|u| (*u).to_string()).collect(),
+            unsubscribe_mailto: mailtos.iter().map(|m| (*m).to_string()).collect(),
+            one_click,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: 3,
+            messages: Vec::new(),
+            last_seen: Some(1_700_000_000),
+        }
+    }
+
+    /// One recorded attempt, identified so a resumption can point at it.
+    fn attempt(
+        id: &str,
+        at: i64,
+        method: UnsubscribeMethod,
+        url: &str,
+        success: bool,
+    ) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: id.to_string(),
+            account: "user@example.com".to_string(),
+            sender_email: SENDER.to_string(),
+            sender_domain: "acme.example.com".to_string(),
+            list_id: None,
+            attempted_at: at,
+            method: method.as_id().to_string(),
+            success,
+            http_status: Some(200),
+            url: url.to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            follows_attempt_id: None,
+            detail: String::new(),
+        }
+    }
+
+    /// An observation that the attempt with this id was ignored.
+    fn ignored(attempt_id: &str) -> Resumption {
+        Resumption {
+            id: format!("res-{attempt_id}"),
+            account: "user@example.com".to_string(),
+            sender_email: SENDER.to_string(),
+            list_id: None,
+            attempt_id: attempt_id.to_string(),
+            observed_at: 9_000,
+            last_seen: 8_000,
+            email_count: 2,
+        }
+    }
+
+    /// The rung an `Escalate` step points at, or a readable panic.
+    fn escalated(step: &NextStep) -> &Escalation {
+        match step {
+            NextStep::Escalate(escalation) => escalation,
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_ladder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ladder_runs_one_click_then_urls_then_mailtos_in_header_order() {
+        let ladder = build_ladder(&sender(true, &[U1, U2], &[M1, M2]));
+
+        assert_eq!(
+            ladder,
+            vec![
+                Rung::new(RungMethod::OneClickPost, U1),
+                Rung::new(RungMethod::HttpFlow, U1),
+                Rung::new(RungMethod::HttpFlow, U2),
+                Rung::new(RungMethod::Mailto, M1),
+                Rung::new(RungMethod::Mailto, M2),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_click_only_ever_aims_at_the_first_url() {
+        let ladder = build_ladder(&sender(true, &[U1, U2], &[]));
+        let posts: Vec<&Rung> = ladder
+            .iter()
+            .filter(|r| r.method == RungMethod::OneClickPost)
+            .collect();
+
+        assert_eq!(posts, vec![&Rung::new(RungMethod::OneClickPost, U1)]);
+    }
+
+    #[test]
+    fn a_sender_without_one_click_gets_no_post_rung() {
+        let ladder = build_ladder(&sender(false, &[U1, U2], &[M1]));
+
+        assert_eq!(
+            ladder,
+            vec![
+                Rung::new(RungMethod::HttpFlow, U1),
+                Rung::new(RungMethod::HttpFlow, U2),
+                Rung::new(RungMethod::Mailto, M1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mailto_only_sender_has_a_ladder_of_mailtos() {
+        assert_eq!(
+            build_ladder(&sender(false, &[], &[M1, M2])),
+            vec![
+                Rung::new(RungMethod::Mailto, M1),
+                Rung::new(RungMethod::Mailto, M2),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_click_claimed_without_a_url_contributes_no_rung() {
+        // `List-Unsubscribe-Post` can arrive on a header whose only target is a
+        // mailto. There is nothing to POST to, so the ladder must not invent one.
+        assert_eq!(
+            build_ladder(&sender(true, &[], &[M1])),
+            vec![Rung::new(RungMethod::Mailto, M1)]
+        );
+    }
+
+    #[test]
+    fn a_sender_with_no_targets_has_an_empty_ladder() {
+        assert!(build_ladder(&sender(false, &[], &[])).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // RungMethod::of_attempt
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_request_shaped_method_maps_to_the_rung_it_climbed() {
+        use UnsubscribeMethod as M;
+
+        // Expected pairs written out rather than derived, so a rewiring of the
+        // match has to disagree with this list to pass.
+        let expected = [
+            (M::OneClickPost, RungMethod::OneClickPost),
+            (M::Get, RungMethod::HttpFlow),
+            (M::FormPost, RungMethod::HttpFlow),
+            (M::FormGet, RungMethod::HttpFlow),
+            (M::ConfirmLink, RungMethod::HttpFlow),
+            (M::MailtoSent, RungMethod::Mailto),
+            (M::MailtoFailed, RungMethod::Mailto),
+        ];
+
+        for (method, rung) in expected {
+            assert_eq!(
+                RungMethod::of_attempt(method),
+                Some(rung),
+                "{} climbed the wrong rung",
+                method.as_id()
+            );
+        }
+    }
+
+    #[test]
+    fn methods_that_describe_an_absence_climb_no_rung() {
+        use UnsubscribeMethod as M;
+
+        for method in [M::MailtoSkipped, M::None, M::DryRun] {
+            assert_eq!(
+                RungMethod::of_attempt(method),
+                None,
+                "{} is not a request that was made",
+                method.as_id()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // next_step: nothing tried and ignored yet
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_history_means_the_full_flow() {
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &[], &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn an_attempt_that_was_never_ignored_still_gets_the_full_flow() {
+        // Succeeding and then staying quiet is the loop closing, not a reason
+        // to narrow the next attempt.
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true)];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &attempts, &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn another_senders_history_is_not_this_senders_history() {
+        let mut theirs = attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true);
+        theirs.sender_email = "deals@other.example.com".to_string();
+        let mut their_resumption = ignored("a1");
+        their_resumption.sender_email = "deals@other.example.com".to_string();
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &[theirs], &[their_resumption]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn a_resumption_against_a_failed_attempt_spends_nothing() {
+        // Only a rung the sender said yes to can be spent; a failure never
+        // promised anything, so there is nothing to have broken.
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, false)];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &attempts, &[ignored("a1")]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // next_step: spent rungs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_ignored_one_click_escalates_to_the_get_flow() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true)];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &[ignored("a1")]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U1));
+    }
+
+    #[test]
+    fn an_ignored_get_flow_escalates_to_mailto() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U1, true),
+        ];
+        let resumptions = vec![ignored("a1"), ignored("a2")];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &resumptions);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::Mailto, M1));
+    }
+
+    #[test]
+    fn a_confirmation_form_and_a_plain_get_spend_the_same_rung() {
+        // `form_post` and `get` are the same request to make, so honouring the
+        // form and then ignoring it must not leave a plain GET looking untried.
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::FormPost, U1, true)];
+        let step = next_step(&sender(false, &[U1], &[M1]), &attempts, &[ignored("a1")]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::Mailto, M1));
+    }
+
+    #[test]
+    fn every_rung_ignored_leaves_nothing_to_try() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U1, true),
+            attempt("a3", 3_000, UnsubscribeMethod::MailtoSent, M1, true),
+        ];
+        let resumptions = vec![ignored("a1"), ignored("a2"), ignored("a3")];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &attempts, &resumptions),
+            NextStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn a_spent_rung_is_skipped_even_when_the_sender_offers_a_new_target() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::Get, U1, true)];
+        let step = next_step(&sender(false, &[U1, U2], &[]), &attempts, &[ignored("a1")]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U2));
+    }
+
+    // -----------------------------------------------------------------------
+    // next_step: what an escalation answers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_escalation_names_the_ignored_attempt_and_the_rung_it_used() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true)];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &[ignored("a1")]);
+        let escalation = escalated(&step);
+
+        assert_eq!(escalation.follows_attempt_id.as_deref(), Some("a1"));
+        assert_eq!(escalation.from, Some(RungMethod::OneClickPost));
+    }
+
+    #[test]
+    fn an_escalation_answers_the_most_recent_ignored_attempt() {
+        let attempts = vec![
+            attempt("older", 1_000, UnsubscribeMethod::OneClickPost, U1, true),
+            attempt("newer", 2_000, UnsubscribeMethod::Get, U1, true),
+        ];
+        let resumptions = vec![ignored("older"), ignored("newer")];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &resumptions);
+
+        assert_eq!(
+            escalated(&step).follows_attempt_id.as_deref(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn an_escalation_forced_by_breakage_alone_answers_nothing() {
+        // Two dead requests are a reason to try elsewhere, but no attempt was
+        // ignored, so there is no earlier attempt for this one to point at.
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::OneClickPost, U1, false),
+        ];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &[]);
+        let escalation = escalated(&step);
+
+        assert_eq!(escalation.follows_attempt_id, None);
+        assert_eq!(escalation.from, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // next_step: broken rungs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_failure_does_not_write_a_rung_off() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, false)];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &attempts, &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn two_consecutive_failures_write_a_rung_off() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::OneClickPost, U1, false),
+        ];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &[]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U1));
+    }
+
+    #[test]
+    fn a_success_between_two_failures_keeps_the_rung_alive() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::OneClickPost, U1, true),
+            attempt("a3", 3_000, UnsubscribeMethod::OneClickPost, U1, false),
+        ];
+
+        assert_eq!(
+            next_step(&sender(true, &[U1], &[M1]), &attempts, &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn a_broken_rung_is_worth_trying_again_at_a_new_target() {
+        // A rung is identified by its target, so a rotated URL is an untried
+        // rung rather than the dead one written off earlier.
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::Get, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U1, false),
+        ];
+        let step = next_step(&sender(false, &[U2], &[M1]), &attempts, &[]);
+
+        assert_eq!(escalated(&step).rung, Rung::new(RungMethod::HttpFlow, U2));
+    }
+
+    #[test]
+    fn failures_at_two_different_targets_break_neither_rung() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::Get, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U2, false),
+        ];
+
+        assert_eq!(
+            next_step(&sender(false, &[U1, U2], &[M1]), &attempts, &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn every_rung_broken_leaves_nothing_to_try() {
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::Get, U1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::Get, U1, false),
+        ];
+
+        assert_eq!(
+            next_step(&sender(false, &[U1], &[]), &attempts, &[]),
+            NextStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn a_skipped_mailto_never_writes_the_mailto_rung_off() {
+        // `MailtoSkipped` means no sender was configured, so nothing was asked.
+        // Counting it would permanently deny the rung to anyone who later
+        // configures SMTP.
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::MailtoSkipped, M1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::MailtoSkipped, M1, false),
+        ];
+
+        assert_eq!(
+            next_step(&sender(false, &[], &[M1]), &attempts, &[]),
+            NextStep::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn a_failed_send_does_write_the_mailto_rung_off() {
+        // Unlike a skip, `MailtoFailed` is a request that was made and did not
+        // land, so two of them are evidence about the target.
+        let attempts = vec![
+            attempt("a1", 1_000, UnsubscribeMethod::MailtoFailed, M1, false),
+            attempt("a2", 2_000, UnsubscribeMethod::MailtoFailed, M1, false),
+        ];
+
+        assert_eq!(
+            next_step(&sender(false, &[], &[M1]), &attempts, &[]),
+            NextStep::Exhausted
+        );
+    }
+
+    #[test]
+    #[ignore = "bug: next_step returns FirstAttempt for a sender with an empty ladder (issue #99)"]
+    fn a_sender_with_no_targets_at_all_has_nothing_to_try() {
+        // Reachable: a message whose `List-Unsubscribe` header is present but
+        // yields no usable URL or mailto still becomes a scanned sender. Its
+        // ladder is empty, so there is nothing to ask -- but `next_step`
+        // short-circuits to `FirstAttempt` before it ever builds the ladder,
+        // so the sender is attempted (and recorded as a `none` failure) on
+        // every run and never reaches the exhausted list.
+        assert_eq!(
+            next_step(&sender(false, &[], &[]), &[], &[]),
+            NextStep::Exhausted
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Labels
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_step_reads_as_the_rung_it_points_at() {
+        let attempts = vec![attempt("a1", 1_000, UnsubscribeMethod::OneClickPost, U1, true)];
+        let step = next_step(&sender(true, &[U1], &[M1]), &attempts, &[ignored("a1")]);
+
+        assert_eq!(step.label(), "next: GET/form");
+        assert_eq!(NextStep::FirstAttempt.label(), "next: full flow");
+        assert_eq!(NextStep::Exhausted.label(), "exhausted \u{2014} no methods left");
+    }
+
+    #[test]
+    fn only_exhausted_reports_itself_as_exhausted() {
+        assert!(NextStep::Exhausted.is_exhausted());
+        assert!(!NextStep::FirstAttempt.is_exhausted());
+        assert!(!NextStep::Escalate(Escalation {
+            rung: Rung::new(RungMethod::Mailto, M1),
+            from: None,
+            follows_attempt_id: None,
+        })
+        .is_exhausted());
+    }
+}
