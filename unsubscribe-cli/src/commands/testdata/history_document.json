@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "command": "history",
+  "account": "user@example.com",
+  "filter": {
+    "sender": null,
+    "resumed": false,
+    "since": null
+  },
+  "senders": [
+    {
+      "sender_email": "news@acme.example.com",
+      "sender_domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "last_attempt_at": 1700000000,
+      "last_method": "one_click_post",
+      "outcome": {
+        "state": "resumed",
+        "days_after": 30
+      },
+      "violation_count": 1,
+      "next_step": {
+        "kind": "exhausted"
+      },
+      "in_current_scan": true,
+      "timeline": [
+        {
+          "kind": "attempt",
+          "at": 1700000000,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "sender_email": "news@acme.example.com",
+          "sender_domain": "acme.example.com",
+          "list_id": "acme.list.example.com",
+          "attempted_at": 1700000000,
+          "method": "one_click_post",
+          "success": true,
+          "http_status": 200,
+          "url": "https://acme.example.com/u?id=1",
+          "final_url": "https://acme.example.com/done",
+          "follows_attempt_id": null,
+          "detail": "HTTP 200"
+        },
+        {
+          "kind": "resumption",
+          "at": 1702592000,
+          "id": "22222222-2222-4222-8222-222222222222",
+          "attempt_id": "11111111-1111-4111-8111-111111111111",
+          "sender_email": "news@acme.example.com",
+          "list_id": "acme.list.example.com",
+          "observed_at": 1702592000,
+          "last_seen": 1702500000,
+          "email_count": 4
+        }
+      ]
+    },
+    {
+      "sender_email": "old@gone.example.com",
+      "sender_domain": "gone.example.com",
+      "list_id": null,
+      "last_attempt_at": 1690000000,
+      "last_method": "get",
+      "outcome": null,
+      "violation_count": 0,
+      "next_step": null,
+      "in_current_scan": false,
+      "timeline": []
+    }
+  ],
+  "count": 2
+}

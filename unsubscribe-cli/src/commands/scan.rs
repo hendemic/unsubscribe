@@ -773,3 +773,153 @@ mod tests {
         .is_err());
     }
 }
+
+/// The shape of the `--json` document `scan` emits.
+#[cfg(test)]
+mod scan_document_tests {
+    use super::*;
+    use unsubscribe_core::{AuthType, FolderMessage, MessageId, NextStep, ProviderType};
+
+    fn account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@example.com".to_string(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.example.com".to_string()),
+            port: Some(993),
+            username: "user@example.com".to_string(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    /// Far enough in the past that no `stale_after_months` under test could
+    /// call it recent.
+    const LONG_AGO: i64 = 1_000_000_000;
+
+    fn sender(email: &str, one_click: bool, last_seen: Option<i64>) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/u?id=1".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click,
+            list_id: Some("acme.list.example.com".to_string()),
+            list_unsubscribe_raw: None,
+            email_count: 6,
+            messages: vec![FolderMessage {
+                folder: Folder::new("INBOX"),
+                message_id: MessageId::new(format!("INBOX:{email}")),
+            }],
+            last_seen,
+        }
+    }
+
+    fn verdict() -> SenderVerdict {
+        SenderVerdict {
+            attempt_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            unsubscribed_at: 1_600_000_000,
+            outcome: UnsubscribeOutcome::Resumed { days_after: 30 },
+            violation_count: 2,
+            next_step: NextStep::Exhausted,
+        }
+    }
+
+    /// One recent sender and one long-silent one. The recent one is left
+    /// undated so the fixture does not go stale as the calendar moves.
+    fn senders() -> Vec<SenderInfo> {
+        vec![
+            sender("resumed@acme.example.com", true, None),
+            sender("quiet@acme.example.com", false, Some(LONG_AGO)),
+        ]
+    }
+
+    fn document() -> Value {
+        scan_document(
+            &account(),
+            &senders(),
+            &[Some(verdict()), None],
+            &Preferences::default(),
+            &["Unparseable header in INBOX".to_string()],
+        )
+    }
+
+    #[test]
+    fn the_scan_document_matches_its_golden_shape() {
+        // Pinned so a renamed or dropped field fails here rather than in a
+        // script someone has already written against it.
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/scan_document.json")).unwrap();
+        assert_eq!(document(), golden);
+    }
+
+    #[test]
+    fn the_document_names_the_command_and_the_account_it_is_about() {
+        let document = document();
+        assert_eq!(document["command"], json!("scan"));
+        assert_eq!(document["account"], json!("user@example.com"));
+        assert_eq!(document["schema_version"], json!(output::SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn a_sender_with_no_history_reports_null_rather_than_an_empty_record() {
+        let document = document();
+        assert_eq!(document["senders"][1]["history"], Value::Null);
+        assert_eq!(
+            document["senders"][0]["history"]["previously_unsubscribed"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn the_offered_method_is_reported_as_a_stable_identifier() {
+        let document = document();
+        assert_eq!(document["senders"][0]["method"], json!("one_click"));
+        assert_eq!(document["senders"][1]["method"], json!("http"));
+    }
+
+    #[test]
+    fn the_totals_count_the_senders_the_rows_describe() {
+        let totals = &document()["totals"];
+        assert_eq!(totals["senders"], json!(2));
+        assert_eq!(totals["emails"], json!(12));
+        assert_eq!(totals["previously_unsubscribed"], json!(1));
+        assert_eq!(totals["resumed"], json!(1));
+        assert_eq!(totals["stale"], json!(1));
+    }
+
+    #[test]
+    fn a_sender_whose_date_is_unknown_is_not_counted_as_stale() {
+        // Staleness is a claim about when mail last arrived; with no date
+        // there is nothing to claim.
+        let document = scan_document(
+            &account(),
+            &[sender("undated@acme.example.com", true, None)],
+            &[None],
+            &Preferences::default(),
+            &[],
+        );
+        assert_eq!(document["senders"][0]["stale"], json!(false));
+        assert_eq!(document["totals"]["stale"], json!(0));
+    }
+
+    #[test]
+    fn a_scan_that_found_nothing_is_still_a_well_formed_document() {
+        let document = scan_document(&account(), &[], &[], &Preferences::default(), &[]);
+        assert_eq!(document["senders"], json!([]));
+        assert_eq!(document["totals"]["senders"], json!(0));
+        assert_eq!(document["totals"]["emails"], json!(0));
+        assert_eq!(document["warnings"], json!([]));
+    }
+
+    #[test]
+    fn warnings_travel_with_the_document_rather_than_only_to_stderr() {
+        assert_eq!(
+            document()["warnings"],
+            json!(["Unparseable header in INBOX"])
+        );
+    }
+}

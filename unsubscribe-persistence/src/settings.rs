@@ -456,3 +456,407 @@ impl SettingKey {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A complete, valid IMAP account as text.
+    fn settings() -> Settings {
+        Settings {
+            provider: "imap".to_string(),
+            host: "imap.example.com".to_string(),
+            port: "993".to_string(),
+            username: "user@example.com".to_string(),
+            auth_type: "password".to_string(),
+            smtp_host: String::new(),
+            smtp_port: String::new(),
+            folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            min_emails: "3".to_string(),
+            stale_after_months: "12".to_string(),
+            cache_max_age_days: "7".to_string(),
+            grace_period_days: "14".to_string(),
+        }
+    }
+
+    fn with(key: SettingKey, value: &str) -> Settings {
+        let mut settings = settings();
+        settings.set(key, value.to_string());
+        settings
+    }
+
+    // -----------------------------------------------------------------------
+    // Dotted keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_key_is_named_by_its_place_in_the_toml_file() {
+        // The dotted path is deliberately the file's own layout, so a script
+        // and a text editor agree about what a setting is called.
+        let expected = [
+            (SettingKey::Provider, "account.provider"),
+            (SettingKey::Host, "account.host"),
+            (SettingKey::Port, "account.port"),
+            (SettingKey::Username, "account.username"),
+            (SettingKey::AuthType, "account.auth_type"),
+            (SettingKey::SmtpHost, "account.smtp_host"),
+            (SettingKey::SmtpPort, "account.smtp_port"),
+            (SettingKey::Folders, "scan.folders"),
+            (SettingKey::ArchiveFolder, "scan.archive_folder"),
+            (SettingKey::MinEmails, "preferences.min_emails"),
+            (SettingKey::StaleAfterMonths, "preferences.stale_after_months"),
+            (SettingKey::CacheMaxAgeDays, "preferences.cache_max_age_days"),
+            (SettingKey::GracePeriodDays, "preferences.grace_period_days"),
+        ];
+        for (key, name) in expected {
+            assert_eq!(key.key(), name);
+        }
+        assert_eq!(expected.len(), SettingKey::ALL.len(), "a key is missing from this table");
+    }
+
+    #[test]
+    fn every_key_parses_back_from_its_own_name() {
+        for key in SettingKey::ALL {
+            assert_eq!(SettingKey::parse(key.key()), Some(key));
+        }
+    }
+
+    #[test]
+    fn a_key_is_recognised_whatever_case_or_padding_it_is_typed_in() {
+        assert_eq!(SettingKey::parse("SCAN.FOLDERS"), Some(SettingKey::Folders));
+        assert_eq!(SettingKey::parse("  scan.folders  "), Some(SettingKey::Folders));
+    }
+
+    #[test]
+    fn an_unknown_key_is_not_resolved_to_anything() {
+        for name in ["", "folders", "scan", "scan.folder", "account.hostname", "preferences"] {
+            assert_eq!(SettingKey::parse(name), None, "{name:?} should be unknown");
+        }
+    }
+
+    #[test]
+    fn no_credential_is_addressable_as_a_setting() {
+        // Credentials live in the keychain; `config` can say where and no more.
+        for name in [
+            "account.password",
+            "account.password_command",
+            "account.refresh_token",
+            "account.access_token",
+            "credentials",
+        ] {
+            assert_eq!(SettingKey::parse(name), None, "{name} must not be a setting");
+        }
+        for key in SettingKey::ALL {
+            let name = key.key();
+            assert!(
+                !name.contains("password") && !name.contains("token") && !name.contains("secret"),
+                "{name} looks like a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keys_location_is_its_section_and_name() {
+        assert_eq!(SettingKey::Folders.location(), ("scan", "folders"));
+        assert_eq!(
+            SettingKey::GracePeriodDays.location(),
+            ("preferences", "grace_period_days")
+        );
+        for key in SettingKey::ALL {
+            let (section, name) = key.location();
+            assert_eq!(format!("{section}.{name}"), key.key());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Kinds and defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_the_folder_list_is_a_list() {
+        for key in SettingKey::ALL {
+            assert_eq!(
+                key.is_list(),
+                key == SettingKey::Folders,
+                "{} reported the wrong kind",
+                key.key()
+            );
+        }
+    }
+
+    #[test]
+    fn required_keys_are_the_ones_the_account_cannot_work_without() {
+        let optional: Vec<&str> = SettingKey::ALL
+            .into_iter()
+            .filter(|key| key.is_optional())
+            .map(SettingKey::key)
+            .collect();
+        assert_eq!(
+            optional,
+            [
+                "account.host",
+                "account.port",
+                "account.smtp_host",
+                "account.smtp_port",
+                "preferences.min_emails",
+                "preferences.stale_after_months",
+                "preferences.cache_max_age_days",
+                "preferences.grace_period_days",
+            ]
+        );
+    }
+
+    #[test]
+    fn preference_defaults_match_the_documented_values() {
+        // Written out rather than read from `Preferences::default()`, so a
+        // change to a default is a deliberate edit here too.
+        assert_eq!(SettingKey::MinEmails.default_value(), "3");
+        assert_eq!(SettingKey::StaleAfterMonths.default_value(), "12");
+        assert_eq!(SettingKey::CacheMaxAgeDays.default_value(), "7");
+        assert_eq!(SettingKey::GracePeriodDays.default_value(), "14");
+    }
+
+    #[test]
+    fn a_key_with_no_fallback_has_an_empty_default() {
+        for key in [
+            SettingKey::Host,
+            SettingKey::Port,
+            SettingKey::Username,
+            SettingKey::SmtpHost,
+            SettingKey::SmtpPort,
+        ] {
+            assert_eq!(key.default_value(), "", "{} invented a default", key.key());
+        }
+    }
+
+    #[test]
+    fn a_fixed_choice_key_defaults_to_one_of_its_choices() {
+        for key in [SettingKey::Provider, SettingKey::AuthType] {
+            let choices = key.choices().expect("a choice key has choices");
+            assert!(
+                choices.contains(&key.default_value().as_str()),
+                "{} defaults to something it cannot hold",
+                key.key()
+            );
+        }
+    }
+
+    #[test]
+    fn changing_who_the_account_is_invalidates_the_stored_credentials() {
+        let affected: Vec<&str> = SettingKey::ALL
+            .into_iter()
+            .filter(|key| key.affects_credentials())
+            .map(SettingKey::key)
+            .collect();
+        assert_eq!(
+            affected,
+            ["account.provider", "account.username", "account.auth_type"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_complete_account_has_nothing_invalid_in_it() {
+        assert_eq!(settings().first_invalid(), None);
+    }
+
+    #[test]
+    fn an_imap_account_without_a_host_is_refused() {
+        assert_eq!(
+            with(SettingKey::Host, "").validate(SettingKey::Host),
+            Err("Host cannot be empty".to_string())
+        );
+    }
+
+    #[test]
+    fn a_gmail_account_may_have_no_host_at_all() {
+        // Gmail talks to an API, so there is no host to require.
+        let mut settings = with(SettingKey::Host, "");
+        settings.set(SettingKey::Provider, "gmail".to_string());
+        assert_eq!(settings.validate(SettingKey::Host), Ok(()));
+        assert_eq!(settings.validate(SettingKey::Port), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_username_or_archive_folder_is_refused() {
+        assert!(with(SettingKey::Username, "  ")
+            .validate(SettingKey::Username)
+            .is_err());
+        assert!(with(SettingKey::ArchiveFolder, "")
+            .validate(SettingKey::ArchiveFolder)
+            .is_err());
+    }
+
+    #[test]
+    fn a_port_outside_the_addressable_range_is_refused() {
+        for value in ["0", "65536", "-1", "993.5", "imap"] {
+            assert_eq!(
+                with(SettingKey::Port, value).validate(SettingKey::Port),
+                Err("Port must be a number between 1 and 65535".to_string()),
+                "port {value:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edges_of_the_port_range_are_accepted() {
+        for value in ["1", "65535"] {
+            assert_eq!(with(SettingKey::Port, value).validate(SettingKey::Port), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_blank_smtp_port_falls_back_to_the_protocol_default() {
+        assert_eq!(with(SettingKey::SmtpPort, "").validate(SettingKey::SmtpPort), Ok(()));
+        assert!(with(SettingKey::SmtpPort, "70000")
+            .validate(SettingKey::SmtpPort)
+            .is_err());
+    }
+
+    #[test]
+    fn a_non_numeric_preference_says_it_must_be_a_whole_number() {
+        assert_eq!(
+            with(SettingKey::MinEmails, "lots").validate(SettingKey::MinEmails),
+            Err("`min_emails` must be a whole number".to_string())
+        );
+    }
+
+    #[test]
+    fn a_preference_outside_its_range_reports_the_range_and_the_value() {
+        assert_eq!(
+            with(SettingKey::StaleAfterMonths, "0").validate(SettingKey::StaleAfterMonths),
+            Err("`stale_after_months` must be between 1 and 1200 (got 0)".to_string())
+        );
+        assert_eq!(
+            with(SettingKey::GracePeriodDays, "3651").validate(SettingKey::GracePeriodDays),
+            Err("`grace_period_days` must be between 0 and 3650 (got 3651)".to_string())
+        );
+    }
+
+    #[test]
+    fn zero_is_a_meaningful_value_for_the_preferences_that_allow_it() {
+        // 0 emails disables the minimum filter; 0 grace days makes any new
+        // mail an immediate resumption. Neither is a typo to be rejected.
+        assert_eq!(with(SettingKey::MinEmails, "0").validate(SettingKey::MinEmails), Ok(()));
+        assert_eq!(
+            with(SettingKey::GracePeriodDays, "0").validate(SettingKey::GracePeriodDays),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_account_with_no_folders_to_scan_is_refused() {
+        assert_eq!(
+            with(SettingKey::Folders, "").validate(SettingKey::Folders),
+            Err("At least one folder is required".to_string())
+        );
+        assert_eq!(
+            with(SettingKey::Folders, " , , ").validate(SettingKey::Folders),
+            Err("At least one folder is required".to_string())
+        );
+    }
+
+    #[test]
+    fn first_invalid_reports_the_earliest_problem_on_screen() {
+        // The screen puts the cursor on what it reports, so the order matters.
+        let mut settings = settings();
+        settings.set(SettingKey::Host, String::new());
+        settings.set(SettingKey::MinEmails, "nope".to_string());
+        assert_eq!(settings.first_invalid().map(|(key, _)| key), Some(SettingKey::Host));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading and writing values as text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_folder_list_is_shown_comma_separated_and_read_back_the_same_way() {
+        let settings = with(SettingKey::Folders, "INBOX, Promotions ,Updates");
+        assert_eq!(settings.folders, ["INBOX", "Promotions", "Updates"]);
+        assert_eq!(settings.get(SettingKey::Folders), "INBOX, Promotions, Updates");
+    }
+
+    #[test]
+    fn splitting_folders_drops_blanks_and_trims_each_name() {
+        assert_eq!(split_folders(" INBOX ,, Promotions , "), ["INBOX", "Promotions"]);
+        assert!(split_folders("   ").is_empty());
+    }
+
+    #[test]
+    fn every_key_round_trips_through_set_and_get() {
+        let mut settings = settings();
+        for key in SettingKey::ALL {
+            settings.set(key, "INBOX".to_string());
+            assert_eq!(settings.get(key), "INBOX", "{} did not round-trip", key.key());
+        }
+    }
+
+    #[test]
+    fn cycling_a_fixed_choice_key_walks_its_choices_and_comes_back() {
+        let mut settings = settings();
+        assert_eq!(settings.get(SettingKey::Provider), "imap");
+        settings.cycle(SettingKey::Provider);
+        assert_eq!(settings.get(SettingKey::Provider), "gmail");
+        settings.cycle(SettingKey::Provider);
+        assert_eq!(settings.get(SettingKey::Provider), "imap");
+    }
+
+    #[test]
+    fn cycling_from_an_unrecognised_value_lands_on_the_first_choice() {
+        let mut settings = with(SettingKey::AuthType, "something-else");
+        settings.cycle(SettingKey::AuthType);
+        assert_eq!(settings.get(SettingKey::AuthType), "password");
+    }
+
+    #[test]
+    fn cycling_a_text_key_leaves_it_alone() {
+        let mut settings = settings();
+        settings.cycle(SettingKey::Host);
+        assert_eq!(settings.get(SettingKey::Host), "imap.example.com");
+    }
+
+    // -----------------------------------------------------------------------
+    // to_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_settings_convert_to_the_shapes_the_store_writes() {
+        let (account, preferences) = settings().to_config("hint").unwrap();
+        assert_eq!(account.account_id, "user@example.com");
+        assert_eq!(account.host.as_deref(), Some("imap.example.com"));
+        assert_eq!(account.port, Some(993));
+        assert_eq!(account.scan_folders, ["INBOX"]);
+        assert_eq!(account.smtp_host, None);
+        assert_eq!(preferences.grace_period_days, 14);
+    }
+
+    #[test]
+    fn converting_invalid_settings_names_the_field_that_is_wrong() {
+        let settings = with(SettingKey::CacheMaxAgeDays, "0");
+        let (key, message) = settings.to_config("hint").unwrap_err();
+        assert_eq!(key, SettingKey::CacheMaxAgeDays);
+        assert!(
+            message.contains("cache_max_age_days"),
+            "the message should name the key: {message}"
+        );
+    }
+
+    #[test]
+    fn a_settings_round_trip_through_a_config_changes_nothing() {
+        let original = settings();
+        let (account, preferences) = original.to_config("hint").unwrap();
+        assert_eq!(Settings::from_config(&account, &preferences), original);
+    }
+
+    #[test]
+    fn the_account_id_falls_back_to_the_hint_only_when_there_is_no_username() {
+        let mut settings = with(SettingKey::Username, "");
+        // An empty username is invalid, so fill in what the screen would have.
+        settings.set(SettingKey::Username, "  ".to_string());
+        assert!(settings.to_config("fallback").is_err());
+    }
+}

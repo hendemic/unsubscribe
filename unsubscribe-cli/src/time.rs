@@ -382,3 +382,74 @@ mod tests {
         assert!(!is_scan_stale(&ts, 1));
     }
 }
+
+/// `--since`, as a person types it.
+#[cfg(test)]
+mod parse_date_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_date_is_midnight_utc_on_that_day() {
+        // 1970-01-01 is the epoch by definition, and 1970-01-02 one day after.
+        assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(parse_date("1970-01-02"), Some(86_400));
+    }
+
+    #[test]
+    fn a_leap_day_is_read_as_the_day_it_is() {
+        // 2000 was a leap year (divisible by 400), so 2000-03-01 is one day
+        // after 2000-02-29.
+        let leap_day = parse_date("2000-02-29").unwrap();
+        assert_eq!(parse_date("2000-03-01"), Some(leap_day + 86_400));
+    }
+
+    #[test]
+    #[ignore = "bug: a date before 1970 panics on overflow, see issue #110"]
+    fn a_date_before_the_epoch_is_handled_rather_than_panicking() {
+        // `parse_iso8601_age_secs` returns seconds as `u64`, and casts a
+        // negative day count into it: `unsubscribe history --since 1969-12-31`
+        // panics in a debug build and yields nonsense in a release one.
+        // 1900 is also the leap-year edge case (not a leap year, being a
+        // century not divisible by 400), which this would otherwise pin.
+        let feb_28 = parse_date("1900-02-28");
+        assert_eq!(feb_28, None, "a pre-epoch date should be refused, not computed");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(parse_date("  1970-01-02  "), Some(86_400));
+    }
+
+    #[test]
+    fn a_full_timestamp_keeps_its_time_of_day() {
+        assert_eq!(parse_date("1970-01-01T01:02:03Z"), Some(3_723));
+    }
+
+    #[test]
+    fn something_that_is_not_a_date_is_rejected() {
+        for text in ["", "notadate", "18/03/2026", "2026-03", "march 18"] {
+            assert_eq!(parse_date(text), None, "{text:?} is not a date");
+        }
+    }
+
+    #[test]
+    #[ignore = "bug: separators are not checked, see issue #110"]
+    fn a_date_written_with_the_wrong_separators_is_rejected() {
+        // Only the digit positions are read, so `2026/03/18` is accepted as
+        // 2026-03-18 -- forgiving, but it means genuinely malformed input is
+        // never reported.
+        assert_eq!(parse_date("2026/03/18"), None);
+    }
+
+    #[test]
+    #[ignore = "bug: no range check on month or day, see issue #110"]
+    fn a_date_that_could_not_exist_is_rejected() {
+        // Each of these currently parses to a different, real day: month 13
+        // rolls into the next January, day 32 into the next month, and day 0
+        // back into the previous one. A mistyped `--since` therefore selects a
+        // window the user did not ask for instead of being reported.
+        for text in ["2026-13-01", "2026-00-10", "2026-02-30", "2026-01-32", "2026-01-00"] {
+            assert_eq!(parse_date(text), None, "{text:?} names a day that does not exist");
+        }
+    }
+}

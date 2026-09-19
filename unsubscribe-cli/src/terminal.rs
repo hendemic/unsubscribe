@@ -190,3 +190,151 @@ pub fn confirm(question: &str) -> Result<bool> {
     std::io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim().chars().next(), Some('y') | Some('Y')))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Colour is a process-wide switch, so the tests that flip it take turns.
+    fn colour_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Render every escape with colour forced on or off, then put the switch
+    /// back the way the rest of the suite expects it.
+    fn rendered(enabled: bool) -> String {
+        let _guard = colour_lock();
+        let previous = colors_enabled();
+        set_colors_enabled(enabled);
+        let text = format!("{BOLD}{DIM}{GREEN}{RED}{YELLOW}{CYAN}{BLUE}text{RESET}");
+        set_colors_enabled(previous);
+        text
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_colors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn colour_is_on_for_a_terminal_that_asked_for_nothing_else() {
+        assert!(decide_colors(false, false, true));
+    }
+
+    #[test]
+    fn the_no_color_flag_turns_colour_off_even_on_a_terminal() {
+        assert!(!decide_colors(true, false, true));
+    }
+
+    #[test]
+    fn the_no_color_environment_variable_turns_colour_off() {
+        // https://no-color.org: any value means no colour.
+        assert!(!decide_colors(false, true, true));
+    }
+
+    #[test]
+    fn colour_is_off_when_stderr_is_not_a_terminal() {
+        // Redirected output is read by something that does not draw escapes.
+        assert!(!decide_colors(false, false, false));
+    }
+
+    #[test]
+    fn any_single_reason_is_enough_to_turn_colour_off() {
+        for (flag, env, tty) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            assert!(
+                !decide_colors(flag, env, tty),
+                "colour should be off for (flag={flag}, env={env}, tty={tty})"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_but_an_attached_terminal_turns_colour_on() {
+        let on: Vec<(bool, bool, bool)> = [false, true]
+            .into_iter()
+            .flat_map(|flag| {
+                [false, true].into_iter().flat_map(move |env| {
+                    [false, true]
+                        .into_iter()
+                        .map(move |tty| (flag, env, tty))
+                })
+            })
+            .filter(|(flag, env, tty)| decide_colors(*flag, *env, *tty))
+            .collect();
+        assert_eq!(on, [(false, false, true)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ansi rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_escape_renders_nothing_at_all_when_colour_is_off() {
+        assert_eq!(rendered(false), "text");
+    }
+
+    #[test]
+    fn an_escape_renders_its_sequence_when_colour_is_on() {
+        let text = rendered(true);
+        assert!(text.starts_with("\x1b[1m"), "{text:?}");
+        assert!(text.ends_with("\x1b[0m"), "{text:?}");
+        assert!(text.contains("text"), "{text:?}");
+    }
+
+    #[test]
+    fn every_escape_is_distinct_so_none_is_a_copy_of_another() {
+        let all = [BOLD, DIM, RESET, GREEN, RED, YELLOW, CYAN, BLUE];
+        let mut seen: Vec<Ansi> = Vec::new();
+        for escape in all {
+            assert!(!seen.contains(&escape), "{escape:?} is defined twice");
+            seen.push(escape);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_detached_invocation_has_no_stream_to_prompt_on() {
+        let tty = Tty::detached();
+        assert!(!tty.stdin && !tty.stdout && !tty.stderr);
+    }
+
+    #[test]
+    fn an_attached_invocation_has_all_three() {
+        let tty = Tty::attached();
+        assert!(tty.stdin && tty.stdout && tty.stderr);
+    }
+
+    // -----------------------------------------------------------------------
+    // Prompts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_prompt_refuses_a_stdin_nobody_is_typing_into() {
+        // Under `cargo test` stdin is not a terminal, which is exactly the
+        // shape of a cron job: every prompt must fail rather than block.
+        assert!(!std::io::stdin().is_terminal(), "this test needs a piped stdin");
+        for result in [
+            prompt("Host", "imap.example.com"),
+            prompt_password("Password"),
+            confirm("Proceed?").map(|_| String::new()),
+        ] {
+            let error = result.unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("stdin is not a terminal"),
+                "a prompt should explain itself, got: {message}"
+            );
+        }
+    }
+}

@@ -243,3 +243,591 @@ pub fn parse_senders_file(contents: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::escalation::NextStep;
+    use crate::history::{PreviouslyUnsubscribed, SenderVerdict, UnsubscribeOutcome};
+    use crate::types::{Folder, FolderMessage, MessageId};
+
+    fn sender(email: &str) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: email.split('@').nth(1).unwrap_or("example.com").to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/u".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: 3,
+            messages: vec![FolderMessage {
+                folder: Folder::new("INBOX"),
+                message_id: MessageId::new(format!("INBOX:{email}:1")),
+            }],
+            last_seen: Some(1_700_000_000),
+        }
+    }
+
+    /// A previously unsubscribed sender carrying the given verdict.
+    fn previously(email: &str, outcome: UnsubscribeOutcome) -> PreviouslyUnsubscribed {
+        PreviouslyUnsubscribed {
+            sender: sender(email),
+            verdict: SenderVerdict {
+                attempt_id: format!("attempt-for-{email}"),
+                unsubscribed_at: 1_600_000_000,
+                outcome,
+                violation_count: u32::from(outcome.is_resumed()),
+                next_step: NextStep::FirstAttempt,
+            },
+        }
+    }
+
+    /// One sender of each annotation group, so a policy's exclusions are
+    /// visible rather than implied.
+    fn annotated() -> AnnotatedSenders {
+        AnnotatedSenders {
+            previously_unsubscribed: vec![
+                previously("resumed@acme.example.com", UnsubscribeOutcome::Resumed { days_after: 20 }),
+                previously("grace@acme.example.com", UnsubscribeOutcome::WithinGrace { days_left: 4 }),
+                previously("quiet@acme.example.com", UnsubscribeOutcome::NoNewMail),
+            ],
+            active: vec![
+                sender("active-one@acme.example.com"),
+                sender("active-two@acme.example.com"),
+            ],
+            stale: vec![sender("stale@acme.example.com")],
+            new_resumptions: Vec::new(),
+        }
+    }
+
+    /// The addresses a selection picked, in order.
+    fn emails(selection: &Selection) -> Vec<String> {
+        selection
+            .selected
+            .iter()
+            .map(|s| s.sender.email.clone())
+            .collect()
+    }
+
+    /// The reason recorded for one address.
+    fn reason_for(selection: &Selection, email: &str) -> Option<SelectionReason> {
+        selection
+            .selected
+            .iter()
+            .find(|s| s.sender.email == email)
+            .map(|s| s.reason)
+    }
+
+    fn policy() -> SelectionPolicy {
+        SelectionPolicy::default()
+    }
+
+    // -----------------------------------------------------------------------
+    // --resumed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resumed_selects_only_senders_that_ignored_an_unsubscribe() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                ..policy()
+            },
+        );
+        assert_eq!(emails(&selection), ["resumed@acme.example.com"]);
+    }
+
+    #[test]
+    fn resumed_excludes_a_sender_still_inside_its_grace_period() {
+        // Mail arriving four days after an unsubscribe is not yet a violation,
+        // so acting on it would be acting early.
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                ..policy()
+            },
+        );
+        assert!(!emails(&selection).contains(&"grace@acme.example.com".to_string()));
+    }
+
+    #[test]
+    fn resumed_excludes_a_sender_that_has_stopped_mailing() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                ..policy()
+            },
+        );
+        assert!(!emails(&selection).contains(&"quiet@acme.example.com".to_string()));
+    }
+
+    #[test]
+    fn a_resumed_sender_is_reported_as_selected_for_that_reason() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                ..policy()
+            },
+        );
+        assert_eq!(
+            reason_for(&selection, "resumed@acme.example.com"),
+            Some(SelectionReason::Resumed)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // --all-active
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn all_active_selects_every_active_sender() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                ..policy()
+            },
+        );
+        assert_eq!(
+            emails(&selection),
+            ["active-one@acme.example.com", "active-two@acme.example.com"]
+        );
+    }
+
+    #[test]
+    fn all_active_excludes_stale_senders() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                ..policy()
+            },
+        );
+        assert!(!emails(&selection).contains(&"stale@acme.example.com".to_string()));
+    }
+
+    #[test]
+    fn all_active_excludes_senders_already_unsubscribed_from() {
+        // Asking a sender again that has said nothing since is the one thing
+        // `--all-active` must never do on its own.
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                ..policy()
+            },
+        );
+        for already_asked in [
+            "resumed@acme.example.com",
+            "grace@acme.example.com",
+            "quiet@acme.example.com",
+        ] {
+            assert!(
+                !emails(&selection).contains(&already_asked.to_string()),
+                "{already_asked} had already been unsubscribed from"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_selects_only_the_stale_group() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                stale: true,
+                ..policy()
+            },
+        );
+        assert_eq!(emails(&selection), ["stale@acme.example.com"]);
+        assert_eq!(
+            reason_for(&selection, "stale@acme.example.com"),
+            Some(SelectionReason::Stale)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Flags combine as a union
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_flag_together_selects_each_matching_sender_exactly_once() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                all_active: true,
+                stale: true,
+                senders: vec![
+                    "active-one@acme.example.com".to_string(),
+                    "stale@acme.example.com".to_string(),
+                ],
+                max_senders: 0,
+            },
+        );
+        let picked = emails(&selection);
+        let mut sorted = picked.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), picked.len(), "a sender was selected twice: {picked:?}");
+        assert_eq!(picked.len(), 4);
+    }
+
+    #[test]
+    fn naming_a_sender_outranks_the_flag_that_would_also_have_matched_it() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                senders: vec!["active-one@acme.example.com".to_string()],
+                ..policy()
+            },
+        );
+        assert_eq!(
+            reason_for(&selection, "active-one@acme.example.com"),
+            Some(SelectionReason::Named)
+        );
+        assert_eq!(
+            reason_for(&selection, "active-two@acme.example.com"),
+            Some(SelectionReason::Active)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit sender list
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_named_sender_matches_regardless_of_case() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec!["Active-One@Acme.Example.COM".to_string()],
+                ..policy()
+            },
+        );
+        assert_eq!(emails(&selection), ["active-one@acme.example.com"]);
+        assert!(selection.unknown.is_empty());
+    }
+
+    #[test]
+    fn naming_reaches_a_sender_no_flag_could_have_selected() {
+        // A sender that was unsubscribed from and has gone quiet is reachable
+        // only by name -- that is the whole point of the flag.
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec!["quiet@acme.example.com".to_string()],
+                ..policy()
+            },
+        );
+        assert_eq!(emails(&selection), ["quiet@acme.example.com"]);
+    }
+
+    #[test]
+    fn an_address_that_is_not_in_this_scan_is_reported_rather_than_selected() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec!["gone@elsewhere.example.com".to_string()],
+                ..policy()
+            },
+        );
+        assert!(selection.is_empty());
+        assert_eq!(selection.unknown, ["gone@elsewhere.example.com"]);
+    }
+
+    #[test]
+    fn an_unknown_address_does_not_stop_the_known_ones_being_selected() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec![
+                    "gone@elsewhere.example.com".to_string(),
+                    "active-two@acme.example.com".to_string(),
+                ],
+                ..policy()
+            },
+        );
+        assert_eq!(emails(&selection), ["active-two@acme.example.com"]);
+        assert_eq!(selection.unknown, ["gone@elsewhere.example.com"]);
+    }
+
+    #[test]
+    fn a_named_address_that_matched_is_never_also_reported_as_unknown() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec!["ACTIVE-TWO@acme.example.com".to_string()],
+                ..policy()
+            },
+        );
+        assert!(
+            selection.unknown.is_empty(),
+            "a case-different spelling was treated as a different sender: {:?}",
+            selection.unknown
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // --max-senders
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_selection_exactly_at_the_cap_is_allowed() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                max_senders: 2,
+                ..policy()
+            },
+        );
+        assert_eq!(selection.selected.len(), 2);
+        assert_eq!(selection.over_cap, None);
+    }
+
+    #[test]
+    fn one_sender_over_the_cap_is_refused_rather_than_truncated() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                max_senders: 1,
+                ..policy()
+            },
+        );
+        assert_eq!(
+            selection.over_cap,
+            Some(CapExceeded {
+                selected: 2,
+                max_senders: 1,
+            })
+        );
+        // Nothing is dropped: the caller is told the real size so it can raise
+        // the limit deliberately.
+        assert_eq!(selection.selected.len(), 2);
+    }
+
+    #[test]
+    fn a_zero_cap_lifts_the_limit_entirely() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                resumed: true,
+                all_active: true,
+                stale: true,
+                max_senders: 0,
+                ..policy()
+            },
+        );
+        assert_eq!(selection.selected.len(), 4);
+        assert_eq!(selection.over_cap, None);
+    }
+
+    #[test]
+    fn an_empty_selection_is_never_over_the_cap() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                senders: vec!["gone@elsewhere.example.com".to_string()],
+                max_senders: 1,
+                ..policy()
+            },
+        );
+        assert!(selection.is_empty());
+        assert_eq!(selection.over_cap, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty selections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_policy_that_matches_nothing_yields_an_empty_selection() {
+        let empty = AnnotatedSenders::default();
+        let selection = select_by_policy(
+            &empty,
+            &SelectionPolicy {
+                resumed: true,
+                all_active: true,
+                stale: true,
+                ..policy()
+            },
+        );
+        assert!(selection.is_empty());
+        assert!(selection.senders().is_empty());
+    }
+
+    #[test]
+    fn senders_carries_the_selected_senders_in_selection_order() {
+        let selection = select_by_policy(
+            &annotated(),
+            &SelectionPolicy {
+                all_active: true,
+                ..policy()
+            },
+        );
+        let senders = selection.senders();
+        assert_eq!(
+            senders.iter().map(|s| s.email.as_str()).collect::<Vec<_>>(),
+            ["active-one@acme.example.com", "active-two@acme.example.com"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_empty / decide_run_mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_policy_with_no_selection_flag_names_nothing() {
+        assert!(SelectionPolicy::default().is_empty());
+    }
+
+    #[test]
+    fn a_cap_on_its_own_is_not_a_selection() {
+        // `--max-senders` narrows a selection; it never makes one.
+        assert!(SelectionPolicy {
+            max_senders: 10,
+            ..SelectionPolicy::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn each_selection_flag_on_its_own_makes_the_policy_non_empty() {
+        let policies = [
+            SelectionPolicy { resumed: true, ..SelectionPolicy::default() },
+            SelectionPolicy { all_active: true, ..SelectionPolicy::default() },
+            SelectionPolicy { stale: true, ..SelectionPolicy::default() },
+            SelectionPolicy {
+                senders: vec!["a@b.example.com".to_string()],
+                ..SelectionPolicy::default()
+            },
+        ];
+        for policy in policies {
+            assert!(!policy.is_empty(), "{policy:?} names something");
+        }
+    }
+
+    #[test]
+    fn a_selection_flag_runs_headless_even_with_a_terminal_attached() {
+        // Typing the flag by hand must do the same thing a timer's does.
+        let policy = SelectionPolicy {
+            resumed: true,
+            ..SelectionPolicy::default()
+        };
+        assert_eq!(decide_run_mode(&policy, true), RunMode::Headless);
+        assert_eq!(decide_run_mode(&policy, false), RunMode::Headless);
+    }
+
+    #[test]
+    fn no_selection_flag_with_a_terminal_opens_the_selection_screen() {
+        assert_eq!(
+            decide_run_mode(&SelectionPolicy::default(), true),
+            RunMode::Interactive
+        );
+    }
+
+    #[test]
+    fn no_selection_flag_and_no_terminal_demands_a_selection() {
+        assert_eq!(
+            decide_run_mode(&SelectionPolicy::default(), false),
+            RunMode::SelectionRequired
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_senders_file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_senders_file_reads_one_address_per_line() {
+        assert_eq!(
+            parse_senders_file("one@example.com\ntwo@example.com\n"),
+            ["one@example.com", "two@example.com"]
+        );
+    }
+
+    #[test]
+    fn blank_lines_in_a_senders_file_are_ignored() {
+        assert_eq!(
+            parse_senders_file("\n\none@example.com\n\n\ntwo@example.com\n\n"),
+            ["one@example.com", "two@example.com"]
+        );
+    }
+
+    #[test]
+    fn a_whole_line_comment_is_ignored() {
+        assert_eq!(
+            parse_senders_file("# senders to drop\none@example.com\n"),
+            ["one@example.com"]
+        );
+    }
+
+    #[test]
+    fn a_trailing_comment_is_stripped_from_an_address() {
+        assert_eq!(
+            parse_senders_file("one@example.com  # keeps mailing\n"),
+            ["one@example.com"]
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(
+            parse_senders_file("   one@example.com\t\n\t two@example.com   \n"),
+            ["one@example.com", "two@example.com"]
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_do_not_leave_a_carriage_return_on_the_address() {
+        // A list edited on Windows must match the same senders as one edited
+        // anywhere else.
+        assert_eq!(
+            parse_senders_file("one@example.com\r\ntwo@example.com\r\n"),
+            ["one@example.com", "two@example.com"]
+        );
+    }
+
+    #[test]
+    fn an_empty_senders_file_names_nobody() {
+        assert!(parse_senders_file("").is_empty());
+        assert!(parse_senders_file("\n\n   \n# only a comment\n").is_empty());
+    }
+
+    #[test]
+    fn a_file_without_a_trailing_newline_still_yields_its_last_address() {
+        assert_eq!(
+            parse_senders_file("one@example.com\ntwo@example.com"),
+            ["one@example.com", "two@example.com"]
+        );
+    }
+
+    #[test]
+    fn addresses_from_a_file_keep_the_case_they_were_written_in() {
+        // Matching lowercases both sides; the file's own spelling is what is
+        // reported back as unknown, so it must survive parsing.
+        assert_eq!(
+            parse_senders_file("One@Example.COM\n"),
+            ["One@Example.COM"]
+        );
+    }
+
+    #[test]
+    fn selection_reasons_have_stable_identifiers() {
+        // These are what a script matches on, so they are pinned here rather
+        // than left to follow whatever the labels become.
+        assert_eq!(SelectionReason::Chosen.as_id(), "chosen");
+        assert_eq!(SelectionReason::Named.as_id(), "named");
+        assert_eq!(SelectionReason::Resumed.as_id(), "resumed");
+        assert_eq!(SelectionReason::Active.as_id(), "active");
+        assert_eq!(SelectionReason::Stale.as_id(), "stale");
+    }
+}

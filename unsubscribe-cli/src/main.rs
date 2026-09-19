@@ -762,3 +762,323 @@ mod with_min_emails_tests {
         assert_eq!(result.cache_max_age_days, 7);
     }
 }
+
+/// The flags and subcommands a headless caller depends on.
+#[cfg(test)]
+mod headless_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("argv should parse")
+    }
+
+    // -----------------------------------------------------------------------
+    // Global flags
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_script_facing_flags_are_accepted_before_the_subcommand() {
+        let cli = parse(&["unsubscribe", "--json", "--quiet", "--no-color", "history"]);
+        assert!(cli.json && cli.quiet && cli.no_color);
+    }
+
+    #[test]
+    fn the_script_facing_flags_are_accepted_after_the_subcommand_too() {
+        // They are global, so neither position should be a surprise.
+        let cli = parse(&["unsubscribe", "history", "--json", "--quiet", "--no-color"]);
+        assert!(cli.json && cli.quiet && cli.no_color);
+    }
+
+    #[test]
+    fn none_of_the_script_facing_flags_is_on_by_default() {
+        let cli = parse(&["unsubscribe", "scan"]);
+        assert!(!cli.json && !cli.quiet && !cli.no_color);
+    }
+
+    #[test]
+    fn the_exit_code_table_is_printed_in_the_help() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("Exit codes:"), "{help}");
+        assert!(help.contains("5  another run holds the lock"), "{help}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The default front-end
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_subcommand_names_no_command_at_all() {
+        // The app is the default; `dispatch` decides whether there is a
+        // terminal to open it on.
+        assert!(parse(&["unsubscribe"]).command.is_none());
+    }
+
+    #[test]
+    fn the_app_can_also_be_asked_for_by_name() {
+        assert!(matches!(
+            parse(&["unsubscribe", "tui"]).command,
+            Some(Commands::Tui)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // run
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_selection_flag_is_accepted_together() {
+        // They union rather than exclude, so clap must not reject the pair.
+        let cli = parse(&[
+            "unsubscribe",
+            "run",
+            "--resumed",
+            "--all-active",
+            "--stale",
+            "--sender",
+            "one@example.com",
+            "--sender",
+            "two@example.com",
+            "--yes",
+        ]);
+        match cli.command {
+            Some(Commands::Run {
+                resumed,
+                all_active,
+                stale,
+                senders,
+                yes,
+                ..
+            }) => {
+                assert!(resumed && all_active && stale && yes);
+                assert_eq!(senders, ["one@example.com", "two@example.com"]);
+            }
+            other => panic!("expected `run`, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn the_sender_cap_defaults_to_fifty() {
+        // A default that refuses a runaway selection; 0 lifts it.
+        match parse(&["unsubscribe", "run"]).command {
+            Some(Commands::Run { max_senders, .. }) => assert_eq!(max_senders, 50),
+            _ => panic!("expected `run`"),
+        }
+        match parse(&["unsubscribe", "run", "--max-senders", "0"]).command {
+            Some(Commands::Run { max_senders, .. }) => assert_eq!(max_senders, 0),
+            _ => panic!("expected `run`"),
+        }
+    }
+
+    #[test]
+    fn no_selection_flag_is_on_by_default() {
+        match parse(&["unsubscribe", "run"]).command {
+            Some(Commands::Run {
+                resumed,
+                all_active,
+                stale,
+                senders,
+                senders_file,
+                yes,
+                ..
+            }) => {
+                assert!(!resumed && !all_active && !stale && !yes);
+                assert!(senders.is_empty());
+                assert_eq!(senders_file, None);
+            }
+            _ => panic!("expected `run`"),
+        }
+    }
+
+    #[test]
+    fn the_short_form_of_yes_is_accepted() {
+        match parse(&["unsubscribe", "run", "-y", "--resumed"]).command {
+            Some(Commands::Run { yes, .. }) => assert!(yes),
+            _ => panic!("expected `run`"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // history
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn history_accepts_each_of_its_filters() {
+        match parse(&[
+            "unsubscribe",
+            "history",
+            "--sender",
+            "acme",
+            "--resumed",
+            "--since",
+            "2026-03-18",
+            "--timeline",
+        ])
+        .command
+        {
+            Some(Commands::History {
+                sender,
+                resumed,
+                since,
+                timeline,
+            }) => {
+                assert_eq!(sender.as_deref(), Some("acme"));
+                assert!(resumed && timeline);
+                assert_eq!(since.as_deref(), Some("2026-03-18"));
+            }
+            _ => panic!("expected `history`"),
+        }
+    }
+
+    #[test]
+    fn history_with_no_filters_asks_for_everything() {
+        match parse(&["unsubscribe", "history"]).command {
+            Some(Commands::History {
+                sender,
+                resumed,
+                since,
+                timeline,
+            }) => {
+                assert_eq!(sender, None);
+                assert_eq!(since, None);
+                assert!(!resumed && !timeline);
+            }
+            _ => panic!("expected `history`"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_accepts_each_of_its_subcommands() {
+        use commands::config::ConfigAction;
+        let cases: [(&[&str], fn(&ConfigAction) -> bool); 5] = [
+            (&["unsubscribe", "config", "list"], |a| {
+                matches!(a, ConfigAction::List)
+            }),
+            (&["unsubscribe", "config", "path"], |a| {
+                matches!(a, ConfigAction::Path)
+            }),
+            (&["unsubscribe", "config", "get", "scan.folders"], |a| {
+                matches!(a, ConfigAction::Get { key } if key == "scan.folders")
+            }),
+            (
+                &["unsubscribe", "config", "set", "scan.folders", "INBOX"],
+                |a| matches!(a, ConfigAction::Set { key, value } if key == "scan.folders" && *value == ["INBOX"]),
+            ),
+            (&["unsubscribe", "config", "unset", "account.host"], |a| {
+                matches!(a, ConfigAction::Unset { key } if key == "account.host")
+            }),
+        ];
+        for (argv, check) in cases {
+            match parse(argv).command {
+                Some(Commands::Config { action: Some(action) }) => {
+                    assert!(check(&action), "{argv:?} parsed as {action:?}");
+                }
+                _ => panic!("expected `config` with a subcommand for {argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bare_config_names_no_action() {
+        match parse(&["unsubscribe", "config"]).command {
+            Some(Commands::Config { action }) => assert!(action.is_none()),
+            _ => panic!("expected `config`"),
+        }
+    }
+
+    #[test]
+    fn config_set_takes_several_values_for_a_list() {
+        use commands::config::ConfigAction;
+        match parse(&["unsubscribe", "config", "set", "scan.folders", "INBOX", "Sent"]).command {
+            Some(Commands::Config {
+                action: Some(ConfigAction::Set { value, .. }),
+            }) => assert_eq!(value, ["INBOX", "Sent"]),
+            _ => panic!("expected `config set`"),
+        }
+    }
+
+    #[test]
+    fn config_set_without_a_value_is_rejected() {
+        assert!(Cli::try_parse_from(["unsubscribe", "config", "set", "scan.folders"]).is_err());
+    }
+
+    #[test]
+    fn config_get_without_a_key_is_rejected() {
+        assert!(Cli::try_parse_from(["unsubscribe", "config", "get"]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // selection_policy
+    // -----------------------------------------------------------------------
+
+    fn senders_file(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("senders.txt");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn the_flags_and_the_file_become_one_list_of_senders() {
+        // A caller keeping a long list on disk should still be able to add one
+        // address on the command line.
+        let (_dir, path) = senders_file("from-file@example.com\n");
+        let policy = selection_policy(
+            false,
+            false,
+            false,
+            vec!["from-flag@example.com".to_string()],
+            Some(&path),
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.senders,
+            ["from-flag@example.com", "from-file@example.com"]
+        );
+    }
+
+    #[test]
+    fn a_senders_files_comments_and_blanks_never_reach_the_policy() {
+        let (_dir, path) = senders_file("# list\n\none@example.com  # noisy\n\ntwo@example.com\n");
+        let policy = selection_policy(false, false, false, Vec::new(), Some(&path), 50).unwrap();
+        assert_eq!(policy.senders, ["one@example.com", "two@example.com"]);
+    }
+
+    #[test]
+    fn a_senders_file_that_is_not_there_is_a_usage_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nope.txt");
+        let error = selection_policy(false, false, false, Vec::new(), Some(&missing), 50)
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+        assert!(message.contains("nope.txt"), "{message}");
+    }
+
+    #[test]
+    fn the_flags_carry_straight_through_to_the_policy() {
+        let policy = selection_policy(true, true, true, Vec::new(), None, 7).unwrap();
+        assert!(policy.resumed && policy.all_active && policy.stale);
+        assert_eq!(policy.max_senders, 7);
+    }
+
+    #[test]
+    fn a_run_with_no_selection_flag_and_no_terminal_demands_one() {
+        let policy = selection_policy(false, false, false, Vec::new(), None, 50).unwrap();
+        assert_eq!(decide_run_mode(&policy, false), RunMode::SelectionRequired);
+    }
+
+    #[test]
+    fn an_empty_senders_file_leaves_the_policy_with_nothing_to_act_on() {
+        // A file that lists nobody is not a selection, so the caller is told
+        // rather than silently running against everything.
+        let (_dir, path) = senders_file("# nobody today\n\n");
+        let policy = selection_policy(false, false, false, Vec::new(), Some(&path), 50).unwrap();
+        assert!(policy.is_empty());
+        assert_eq!(decide_run_mode(&policy, false), RunMode::SelectionRequired);
+    }
+}
