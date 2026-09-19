@@ -144,17 +144,6 @@ impl Navigator {
         }
     }
 
-    /// Move focus into the working area without going through a key, for the
-    /// shell's own transitions (a run finishing, a standalone entry point).
-    pub fn enter_panel(&mut self, section: Section) {
-        if let Some(index) = Section::ALL.iter().position(|s| *s == section) {
-            self.cursor = index;
-        }
-        if section.has_panel() {
-            self.focus = Focus::Panel;
-        }
-    }
-
     /// Give the nav focus again, leaving the highlight where it is.
     pub fn focus_nav(&mut self) {
         self.focus = Focus::Nav;
@@ -297,6 +286,21 @@ mod tests {
     }
 
     #[test]
+    fn parking_hands_focus_back_without_disturbing_anything_else() {
+        // What the Run workflow's Esc does: the nav answers keys again, and
+        // the shell's sub-view stack -- which the nav knows nothing about --
+        // is left entirely alone.
+        let mut nav = nav();
+        nav.on_action(Action::Activate);
+
+        nav.focus_nav();
+
+        assert!(nav.nav_has_focus());
+        assert_eq!(nav.section(), Section::Run);
+        assert_eq!(nav.back(2), Back::Nothing, "Esc at the nav still does nothing");
+    }
+
+    #[test]
     fn focusing_the_nav_again_leaves_the_highlight_where_it_was() {
         let mut nav = nav();
         nav.on_action(Action::MoveDown);
@@ -305,26 +309,6 @@ mod tests {
         nav.focus_nav();
 
         assert_eq!(nav.section(), Section::List);
-        assert!(nav.nav_has_focus());
-    }
-
-    #[test]
-    fn the_shell_can_open_a_section_without_a_keypress() {
-        let mut nav = nav();
-
-        nav.enter_panel(Section::Settings);
-
-        assert_eq!(nav.section(), Section::Settings);
-        assert!(!nav.nav_has_focus());
-    }
-
-    #[test]
-    fn opening_quit_that_way_highlights_it_without_focusing_anything() {
-        let mut nav = nav();
-
-        nav.enter_panel(Section::Quit);
-
-        assert_eq!(nav.section(), Section::Quit);
         assert!(nav.nav_has_focus());
     }
 

@@ -195,6 +195,13 @@ pub enum Nav {
     Push(SubView),
     /// One level back: a sub-view closes, or the nav takes focus again.
     Pop,
+    /// Leave the working area for the nav with the sub-view stack untouched.
+    ///
+    /// What `Esc` does inside the Run workflow: a scan or a run keeps going
+    /// on its worker, and coming back finds the same screen with the same
+    /// state. Only the Run workflow answers this; everywhere else `Esc` is
+    /// still one level back.
+    Park,
     Quit,
     /// Something only the shell can do.
     Effect(Effect),
@@ -212,9 +219,13 @@ pub enum Effect {
     ScanEnded,
     /// The run worker reported; refresh what the ending changed.
     RunEnded,
-    /// Esc during a scan or a run: ask before stopping.
+    /// `c` during a scan or a run: ask before stopping.
     ConfirmCancelScan,
     ConfirmCancelRun,
+    /// `c` over a selection whose ticks have been changed: ask before it goes.
+    ConfirmCancelSelection,
+    /// `c` over a selection that is still at its defaults: just close it.
+    CancelSelection,
     /// The settings panel asked to persist its draft.
     SettingsSave,
     /// The settings panel asked for the provider's folder list.
@@ -240,7 +251,52 @@ pub enum SubView {
     SenderHistory(Box<DetailScreen>),
 }
 
+/// What the Run section has going on, as the nav advertises it.
+///
+/// A pure reading of the sub-view stack, so the marker can be tested without
+/// a frame: the nav has to say that something is waiting behind it, or
+/// parking a scan would look exactly like having nothing to come back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunActivity {
+    /// Nothing stacked under Run.
+    Idle,
+    Scanning,
+    Unsubscribing,
+    /// A sub-view is waiting, with no worker of its own.
+    Parked,
+}
+
+impl RunActivity {
+    /// What the nav appends to the Run row.
+    #[must_use]
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Idle => "",
+            Self::Scanning => " (scanning\u{2026})",
+            Self::Unsubscribing => " (unsubscribing\u{2026})",
+            Self::Parked => " \u{25cf}",
+        }
+    }
+
+    /// Whether a worker is still out there for this activity.
+    #[must_use]
+    pub fn is_working(self) -> bool {
+        matches!(self, Self::Scanning | Self::Unsubscribing)
+    }
+}
+
 impl SubView {
+    /// What this view counts as while it sits under Run.
+    fn activity(&self) -> RunActivity {
+        match self {
+            Self::Scan(screen) if screen.is_working() => RunActivity::Scanning,
+            Self::Running(screen) if screen.is_working() => RunActivity::Unsubscribing,
+            Self::Scan(_) | Self::Running(_) | Self::Select { .. } => RunActivity::Parked,
+            // A timeline belongs to the Unsubscribe List, not to Run.
+            Self::SenderHistory(_) => RunActivity::Idle,
+        }
+    }
+
     /// The name the working area is titled with while this is on top.
     fn title(&self) -> String {
         match self {
@@ -275,7 +331,9 @@ impl SubView {
             Self::Select { app, .. } => match app.on_action(action) {
                 SelectAction::None => Nav::Stay,
                 SelectAction::Confirm => Nav::Effect(Effect::ConfirmRun),
-                SelectAction::Cancel => Nav::Pop,
+                SelectAction::Park => Nav::Park,
+                SelectAction::Cancel => Nav::Effect(Effect::CancelSelection),
+                SelectAction::ConfirmCancel => Nav::Effect(Effect::ConfirmCancelSelection),
             },
             Self::SenderHistory(screen) => screen.on_action(action),
         }
@@ -313,6 +371,37 @@ struct Panels {
     settings: Option<(Box<SettingsApp>, Box<ConfigIo>)>,
 }
 
+/// One sub-view stack per section that can have them.
+///
+/// Not one shared stack: a parked Run workflow has to survive the user
+/// opening a sender timeline over in the Unsubscribe List, and a worker that
+/// is still going must still be polled while they are there.
+#[derive(Default)]
+struct Stacks {
+    run: Vec<SubView>,
+    list: Vec<SubView>,
+}
+
+impl Stacks {
+    fn of(&self, section: Section) -> &[SubView] {
+        match section {
+            Section::Run => &self.run,
+            Section::List => &self.list,
+            _ => &[],
+        }
+    }
+
+    /// `None` for a section that has no sub-views of its own, which is every
+    /// section [`SubView::section`] never names.
+    fn of_mut(&mut self, section: Section) -> Option<&mut Vec<SubView>> {
+        match section {
+            Section::Run => Some(&mut self.run),
+            Section::List => Some(&mut self.list),
+            _ => None,
+        }
+    }
+}
+
 /// What the shell is waiting for an answer to.
 enum Pending {
     /// Confirm before a run actually sends anything.
@@ -326,6 +415,10 @@ enum Pending {
     },
     CancelScan,
     CancelRun,
+    /// Discard a selection whose ticks have been changed.
+    CancelSelection,
+    /// Leave the app while a worker is still going.
+    Quit,
 }
 
 // ---------------------------------------------------------------------------
@@ -336,15 +429,18 @@ pub struct Shell {
     ctx: Context,
     nav: Navigator,
     panels: Panels,
-    /// Views stacked on the panel of [`Self::stack_section`]. A scan or a run
-    /// keeps running while the user looks at another section, so the stack
-    /// remembers which section it belongs to rather than being thrown away.
-    stack: Vec<SubView>,
-    stack_section: Section,
+    /// Views stacked on each section's panel. A scan or a run keeps running
+    /// while the user looks at another section, so a stack is parked rather
+    /// than thrown away.
+    stacks: Stacks,
     dialog: Option<Dialog>,
     pending: Option<Pending>,
     status: Option<StatusMessage>,
     quit: bool,
+    /// Quit was confirmed while a worker was still going: the loop tears the
+    /// terminal down only once that worker has actually stopped, so a run is
+    /// never killed part-way through an attempt.
+    quit_when_idle: bool,
 }
 
 impl Shell {
@@ -357,12 +453,12 @@ impl Shell {
                 run,
                 ..Panels::default()
             },
-            stack: Vec::new(),
-            stack_section: Section::Run,
+            stacks: Stacks::default(),
             dialog: None,
             pending: None,
             status: None,
             quit: false,
+            quit_when_idle: false,
         }
     }
 
@@ -370,24 +466,41 @@ impl Shell {
 
     /// The sub-view on top of the section the nav is highlighting, if any.
     fn active_sub_view(&self) -> Option<&SubView> {
-        (self.nav.section() == self.stack_section)
-            .then(|| self.stack.last())
-            .flatten()
+        self.stacks.of(self.nav.section()).last()
     }
 
     fn active_sub_view_mut(&mut self) -> Option<&mut SubView> {
-        (self.nav.section() == self.stack_section)
-            .then(|| self.stack.last_mut())
-            .flatten()
+        let section = self.nav.section();
+        self.stacks
+            .of_mut(section)
+            .and_then(|stack| stack.last_mut())
     }
 
     /// How many levels `Esc` has to climb before it reaches the nav.
     fn depth(&self) -> usize {
-        if self.nav.section() == self.stack_section {
-            self.stack.len()
-        } else {
-            0
-        }
+        self.stacks.of(self.nav.section()).len()
+    }
+
+    /// What Run has going on, whichever section the user is looking at.
+    ///
+    /// Pure, and read by the nav: the whole point of parking a scan is that
+    /// the user can see from anywhere that there is something to come back to.
+    #[must_use]
+    fn run_activity(&self) -> RunActivity {
+        self.stacks
+            .run
+            .last()
+            .map(SubView::activity)
+            .unwrap_or(RunActivity::Idle)
+    }
+
+    /// Whether a worker is still out there. Only the Run workflow has any.
+    #[must_use]
+    fn work_in_flight(&self) -> bool {
+        self.stacks
+            .run
+            .iter()
+            .any(|view| view.activity().is_working())
     }
 
     /// Whether whatever has focus is taking free text right now, so the
@@ -554,12 +667,23 @@ impl Shell {
             // Workers report between frames, so the screen is never more than
             // one tick behind what the pipeline has done -- and they report
             // even while the user is looking at another section.
+            // Only the Run workflow has workers, and only its top view owns
+            // one -- polled whichever section the user happens to be in.
             let nav = self
-                .stack
+                .stacks
+                .run
                 .last_mut()
                 .map(SubView::tick)
                 .unwrap_or(Nav::Stay);
             self.dispatch(nav, terminal)?;
+
+            // A confirmed quit waits here rather than at the keypress: the
+            // worker was asked to stop cooperatively and is allowed to finish
+            // whatever attempt it was making before the terminal goes away.
+            if self.quit_when_idle && !self.work_in_flight() {
+                self.quit = true;
+                continue;
+            }
 
             terminal.draw(|f| self.render(f))?;
 
@@ -579,9 +703,15 @@ impl Shell {
 
     fn on_key(&mut self, key: KeyEvent, terminal: &mut Tui) -> Result<()> {
         // Ctrl-C always leaves, whatever is on screen. Answered before the
-        // key map so that no panel and no text field can swallow it.
+        // key map so that no panel and no text field can swallow it. With a
+        // worker running it asks first, exactly as `q` does; a second Ctrl-C
+        // after that is taken as meaning it, and goes immediately.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
+            if self.quit_when_idle || matches!(self.pending, Some(Pending::Quit)) {
+                self.quit = true;
+            } else {
+                self.request_quit();
+            }
             return Ok(());
         }
 
@@ -704,8 +834,12 @@ impl Shell {
                 self.back();
                 None
             }
+            Nav::Park => {
+                self.park();
+                None
+            }
             Nav::Quit => {
-                self.quit = true;
+                self.request_quit();
                 None
             }
             Nav::Effect(effect) => Some(effect),
@@ -715,21 +849,23 @@ impl Shell {
     /// Open a sub-view inside its section's working area.
     fn push(&mut self, view: SubView) {
         let section = view.section();
-        if self.stack_section != section {
-            // A stack belongs to one section; opening a view under another
-            // replaces it rather than interleaving two stories.
-            self.stack.clear();
-            self.stack_section = section;
+        if let Some(stack) = self.stacks.of_mut(section) {
+            stack.push(view);
         }
-        self.stack.push(view);
-        self.nav.enter_panel(section);
+        // Focus is deliberately not moved: a worker that finishes while the
+        // user is reading another section must advance the workflow without
+        // yanking them out of what they are looking at. A view the user
+        // opened themselves is already in the section they are focused on.
     }
 
     /// One level back, and never past the nav.
     fn back(&mut self) {
         match self.nav.back(self.depth()) {
             Back::PopSubView => {
-                self.stack.pop();
+                let section = self.nav.section();
+                if let Some(stack) = self.stacks.of_mut(section) {
+                    stack.pop();
+                }
                 self.dismiss_dialog();
                 self.refresh();
             }
@@ -739,6 +875,45 @@ impl Shell {
             }
             Back::Nothing => {}
         }
+    }
+
+    /// Hand focus to the nav with the stack left exactly as it is.
+    fn park(&mut self) {
+        self.nav.focus_nav();
+        // Nothing is being asked about the parked view any more; the question
+        // would otherwise float over a section it has nothing to do with.
+        self.dismiss_dialog();
+    }
+
+    /// Leave the app -- asking first if a worker would have to be abandoned.
+    fn request_quit(&mut self) {
+        if !self.work_in_flight() {
+            self.quit = true;
+            return;
+        }
+        self.pending = Some(Pending::Quit);
+        self.dialog = Some(Dialog::confirm(
+            "Quit",
+            [
+                "There is still work running. Stop it and leave?".to_string(),
+                String::new(),
+                "The app waits for the worker to stop cleanly \u{2014} an \
+                 attempt in flight is always finished first."
+                    .to_string(),
+            ],
+        ));
+    }
+
+    /// Ask every worker to stop, and leave once they have.
+    fn quit_after_cancelling(&mut self) {
+        for view in &mut self.stacks.run {
+            match view {
+                SubView::Scan(screen) => screen.request_cancel(),
+                SubView::Running(screen) => screen.request_cancel(),
+                _ => {}
+            }
+        }
+        self.quit_when_idle = true;
     }
 
     /// Close whatever was being asked, because what it was about has gone.
@@ -759,7 +934,7 @@ impl Shell {
                 self.refresh();
                 // The screen keeps its summary; a failure also gets a modal,
                 // because an archive that did not happen is not a detail.
-                let failure = match self.stack.last() {
+                let failure = match self.stacks.run.last() {
                     Some(SubView::Running(screen)) => screen.failure().map(str::to_string),
                     _ => None,
                 };
@@ -791,6 +966,20 @@ impl Shell {
                     ],
                 ));
             }
+            Effect::CancelSelection => self.cancel_selection(),
+            Effect::ConfirmCancelSelection => {
+                self.pending = Some(Pending::CancelSelection);
+                self.dialog = Some(Dialog::confirm(
+                    "Discard the selection",
+                    [
+                        "Throw away the senders you have ticked?".to_string(),
+                        String::new(),
+                        "The scan itself stays in the cache, so the same \
+                         senders can be selected again."
+                            .to_string(),
+                    ],
+                ));
+            }
             Effect::RunFromHistory => self.run_from_history(),
             Effect::SettingsSave => self.settings_save(),
             Effect::SettingsFolders => self.settings_folders(terminal)?,
@@ -805,15 +994,17 @@ impl Shell {
             Pending::Run { plan, counts } => self.start_run(*plan, *counts, toggled),
             Pending::UseCachedScan { cached } => self.open_selection(*cached),
             Pending::CancelScan => {
-                if let Some(SubView::Scan(screen)) = self.stack.last_mut() {
+                if let Some(SubView::Scan(screen)) = self.stacks.run.last_mut() {
                     screen.request_cancel();
                 }
             }
             Pending::CancelRun => {
-                if let Some(SubView::Running(screen)) = self.stack.last_mut() {
+                if let Some(SubView::Running(screen)) = self.stacks.run.last_mut() {
                     screen.request_cancel();
                 }
             }
+            Pending::CancelSelection => self.cancel_selection(),
+            Pending::Quit => self.quit_after_cancelling(),
         }
         Ok(())
     }
@@ -890,7 +1081,7 @@ impl Shell {
 
     /// Act on how a scan ended.
     fn scan_ended(&mut self) {
-        let Some(SubView::Scan(screen)) = self.stack.pop() else {
+        let Some(SubView::Scan(screen)) = self.stacks.run.pop() else {
             return;
         };
         self.dismiss_dialog();
@@ -962,7 +1153,7 @@ impl Shell {
     /// The selection view stays up: the question is asked over it, so
     /// declining leaves every tick where the user put it.
     fn confirm_run(&mut self) {
-        let Some(SubView::Select { app, history }) = self.stack.last() else {
+        let Some(SubView::Select { app, history }) = self.stacks.run.last() else {
             return;
         };
         let selected: Vec<SenderInfo> = app.selected_senders();
@@ -989,8 +1180,8 @@ impl Shell {
     /// senders are in the plan, and coming back to it would offer a second run
     /// over mail that has just been archived.
     fn start_run(&mut self, plan: RunPlan, counts: PlanCounts, dry_run: bool) {
-        if matches!(self.stack.last(), Some(SubView::Select { .. })) {
-            self.stack.pop();
+        if matches!(self.stacks.run.last(), Some(SubView::Select { .. })) {
+            self.stacks.run.pop();
         }
         let policy = worker::policy(&self.ctx.preferences, dry_run);
         let shared = RunShared::new();
@@ -1006,12 +1197,20 @@ impl Shell {
         ))));
     }
 
+    /// Throw the selection away and go back to the Run panel's top level.
+    fn cancel_selection(&mut self) {
+        if matches!(self.stacks.run.last(), Some(SubView::Select { .. })) {
+            self.stacks.run.pop();
+            self.refresh();
+        }
+    }
+
     /// Send one sender from its timeline straight to the run confirmation.
     ///
     /// Only reachable for a resumed sender that is in the current scan, which
     /// is the only case where there is mail to act on and a rung to climb to.
     fn run_from_history(&mut self) {
-        let Some(SubView::SenderHistory(detail)) = self.stack.last() else {
+        let Some(SubView::SenderHistory(detail)) = self.stacks.list.last() else {
             return;
         };
         let (email, list_id) = detail.sender();
@@ -1196,6 +1395,7 @@ impl Shell {
     fn render_nav(&self, f: &mut Frame, area: Rect) {
         let focused = self.nav.nav_has_focus();
         let warnings = self.panels.run.stats.warnings;
+        let activity = self.run_activity();
 
         let rows: Vec<Line> = Section::ALL
             .iter()
@@ -1204,6 +1404,9 @@ impl Shell {
                 let badge = match (section, warnings) {
                     (Section::Warnings, 0) => String::new(),
                     (Section::Warnings, n) => format!(" ({n})"),
+                    // Run says what it has waiting, so a parked scan is
+                    // visible from wherever the user walked off to.
+                    (Section::Run, _) => activity.badge().to_string(),
                     _ => String::new(),
                 };
                 let marker = if index == self.nav.cursor() { ">" } else { " " };
@@ -1408,6 +1611,7 @@ mod tests {
             Nav::Stay => "stay",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
+            Nav::Park => "park",
             Nav::Quit => "quit",
             Nav::Effect(Effect::ConfirmRun) => "confirm run",
             Nav::Effect(_) => "other effect",

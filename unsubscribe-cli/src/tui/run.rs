@@ -100,6 +100,13 @@ impl RunScreen {
         }
     }
 
+    /// Whether a worker is still out there, for the shell's "there is work in
+    /// flight" questions (the nav marker, and quitting).
+    #[must_use]
+    pub fn is_working(&self) -> bool {
+        self.state != RunState::Finished
+    }
+
     /// Ask the worker to stop before the next sender.
     pub fn request_cancel(&mut self) {
         self.shared.cancel();
@@ -151,13 +158,16 @@ impl RunScreen {
                 self.detail = Some(self.cursor);
                 Nav::Stay
             }
-            Action::Back => match self.state {
-                // Finishing goes back to the Run panel; its counts are
-                // already refreshed by the time the user gets there.
-                RunState::Finished => Nav::Pop,
+            // Esc parks the run rather than ending it: the worker carries on
+            // and the nav becomes reachable while it does.
+            Action::Back => Nav::Park,
+            Action::Mnemonic('c') => match self.state {
                 RunState::Running => Nav::Effect(Effect::ConfirmCancelRun),
                 // Already stopping: asking again would change nothing.
                 RunState::Cancelling => Nav::Stay,
+                // Nothing left to stop; the results close back to the panel,
+                // whose counts are already refreshed by then.
+                RunState::Finished => Nav::Pop,
             },
             _ => Nav::Stay,
         }
@@ -170,9 +180,11 @@ impl RunScreen {
             return vec![Action::Back];
         }
         match self.state {
-            RunState::Cancelling => vec![Action::Help],
-            RunState::Running => keys::list_actions(&[]),
-            RunState::Finished => keys::list_actions(&[Action::Activate]),
+            RunState::Cancelling => vec![Action::Help, Action::Back],
+            RunState::Running => keys::list_actions(&[Action::Mnemonic('c')]),
+            RunState::Finished => {
+                keys::list_actions(&[Action::Activate, Action::Mnemonic('c')])
+            }
         }
     }
 
@@ -493,6 +505,7 @@ mod tests {
             Nav::Stay => "stay",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
+            Nav::Park => "park",
             Nav::Quit => "quit",
             Nav::Effect(Effect::RunEnded) => "run ended",
             Nav::Effect(Effect::ConfirmCancelRun) => "confirm cancel",

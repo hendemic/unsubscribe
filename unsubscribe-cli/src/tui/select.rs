@@ -58,6 +58,9 @@ pub(crate) struct App {
     pub(crate) scan_timestamp: Option<String>,
     /// User preferences driving the stale split and the scan-age warning.
     preferences: Preferences,
+    /// The ticks the screen opened with, so discarding a selection the user
+    /// never touched needs no confirmation.
+    defaults: Vec<bool>,
 }
 
 impl App {
@@ -91,6 +94,12 @@ impl App {
             .map(|verdict| verdict.outcome.is_resumed())
             .collect();
 
+        let defaults: Vec<bool> = previous_selected
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(false, active.len() + stale.len()))
+            .collect();
+
         Self {
             previous_selected,
             active_selected: vec![false; active.len()],
@@ -105,7 +114,19 @@ impl App {
             cancelled: false,
             scan_timestamp: None,
             preferences,
+            defaults,
         }
+    }
+
+    /// Whether any tick differs from the ones the screen opened with.
+    #[must_use]
+    pub(crate) fn is_dirty(&self) -> bool {
+        !self
+            .previous_selected
+            .iter()
+            .chain(&self.active_selected)
+            .chain(&self.stale_selected)
+            .eq(self.defaults.iter())
     }
 
     /// Total number of senders across all sections.
@@ -320,6 +341,10 @@ pub(crate) enum SelectAction {
     Confirm,
     /// The user backed out without choosing.
     Cancel,
+    /// Leave the screen standing and hand focus to the nav.
+    Park,
+    /// Discard the selection, but ask first: ticks have been changed.
+    ConfirmCancel,
 }
 
 impl App {
@@ -327,7 +352,16 @@ impl App {
     /// be driven from a test.
     pub(crate) fn on_action(&mut self, action: Action) -> SelectAction {
         match action {
-            Action::Back => return SelectAction::Cancel,
+            // Esc parks the selection: every tick is kept and the nav becomes
+            // reachable. Discarding it is `c`, which is never an accident.
+            Action::Back => return SelectAction::Park,
+            Action::Mnemonic('c') => {
+                return if self.is_dirty() {
+                    SelectAction::ConfirmCancel
+                } else {
+                    SelectAction::Cancel
+                }
+            }
             Action::Activate => return SelectAction::Confirm,
             Action::JumpUp => self.move_up_by(JUMP_ROWS),
             Action::JumpDown => self.move_down_by(JUMP_ROWS),
@@ -362,6 +396,7 @@ impl App {
             Action::Toggle,
             Action::Mnemonic('a'),
             Action::Mnemonic('n'),
+            Action::Mnemonic('c'),
             Action::Activate,
         ])
     }
@@ -395,7 +430,9 @@ pub fn select_senders(
         match app.on_key(key) {
             SelectAction::None => {}
             SelectAction::Confirm => break,
-            SelectAction::Cancel => {
+            // Standalone there is no nav to park at, so backing out is what
+            // it has always been: leaving without choosing.
+            SelectAction::Cancel | SelectAction::Park | SelectAction::ConfirmCancel => {
                 app.cancelled = true;
                 break;
             }

@@ -550,6 +550,7 @@ mod tests {
             Nav::Push(SubView::SenderHistory(_)) => "push detail",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
+            Nav::Park => "park",
             Nav::Quit => "quit",
             Nav::Effect(Effect::RunFromHistory) => "run from history",
             Nav::Effect(_) => "other effect",

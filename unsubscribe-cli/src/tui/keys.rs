@@ -33,7 +33,8 @@ pub enum Action {
     Last,
     /// Open, confirm, or act on whatever is under the cursor.
     Activate,
-    /// Exactly one level back. Never quits.
+    /// Exactly one level back, or -- in the Run workflow -- out to the nav
+    /// with the sub-view left standing. Never quits.
     Back,
     /// Leave the app. Only the nav answers this.
     Quit,
@@ -63,8 +64,11 @@ pub struct Hint {
 ///
 /// Nothing here may collide with a reserved key (`j k g G q`, `/`, `?`), and a
 /// panel that offers one of these concepts uses this letter for it.
-pub const MNEMONICS: [(&str, &str); 10] = [
+pub const MNEMONICS: [(&str, &str); 11] = [
     ("a", "select all"),
+    // `c` cancels the work in front of the user. `Ctrl-C` is a different key
+    // and keeps its own meaning: the shell answers it before the key map.
+    ("c", "cancel"),
     // `n` is also the "no" of a confirmation, which is the same convention in
     // every panel that asks one.
     ("n", "select none"),
@@ -125,7 +129,9 @@ pub fn action(key: KeyEvent, text_field: bool) -> Option<Action> {
         KeyCode::Char('?') => Some(Action::Help),
         KeyCode::Char('/') => Some(Action::Search),
         KeyCode::Char(' ') => Some(Action::Toggle),
-        KeyCode::Char(c) if is_mnemonic(c) => Some(Action::Mnemonic(c)),
+        // A modified letter is never a panel action, so `Ctrl-C` cannot be
+        // read as the cancel letter if it ever reaches the key map.
+        KeyCode::Char(c) if !ctrl && is_mnemonic(c) => Some(Action::Mnemonic(c)),
         _ => None,
     }
 }

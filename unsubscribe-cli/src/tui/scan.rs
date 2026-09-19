@@ -86,13 +86,26 @@ impl ScanScreen {
         Nav::Effect(Effect::ScanEnded)
     }
 
+    /// Whether a worker is still out there, for the shell's "there is work in
+    /// flight" questions (the nav marker, and quitting).
+    #[must_use]
+    pub fn is_working(&self) -> bool {
+        self.state != ScanState::Ended
+    }
+
     pub fn on_action(&mut self, action: Action) -> Nav {
         match action {
-            // Esc asks before throwing the work away; already stopping,
-            // asking again would change nothing.
-            Action::Back if self.state == ScanState::Running => {
-                Nav::Effect(Effect::ConfirmCancelScan)
-            }
+            // Esc parks the scan rather than ending it: the worker keeps
+            // going and the nav becomes reachable while it does.
+            Action::Back => Nav::Park,
+            // Stopping is its own key now, and it asks first. Already
+            // stopping, asking again would change nothing.
+            Action::Mnemonic('c') => match self.state {
+                ScanState::Running => Nav::Effect(Effect::ConfirmCancelScan),
+                ScanState::Cancelling => Nav::Stay,
+                // Nothing left to stop: the only thing left is to close it.
+                ScanState::Ended => Nav::Pop,
+            },
             _ => Nav::Stay,
         }
     }
@@ -101,8 +114,8 @@ impl ScanScreen {
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
         match self.state {
-            ScanState::Running => vec![Action::Help, Action::Back],
-            _ => vec![Action::Help],
+            ScanState::Cancelling => vec![Action::Help, Action::Back],
+            _ => vec![Action::Help, Action::Mnemonic('c'), Action::Back],
         }
     }
 
@@ -232,6 +245,7 @@ mod tests {
             Nav::Stay => "stay",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
+            Nav::Park => "park",
             Nav::Quit => "quit",
             Nav::Effect(Effect::ScanEnded) => "scan ended",
             Nav::Effect(Effect::ConfirmCancelScan) => "confirm cancel",
