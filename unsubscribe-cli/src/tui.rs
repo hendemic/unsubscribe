@@ -49,9 +49,8 @@ impl Drop for TerminalGuard {
 /// Senders are split into up to three sections, in the order they matter:
 /// previously unsubscribed (a prior unsubscribe succeeded and they are mailing
 /// again), active, then stale (no message within the `stale_after_months`
-/// preference). Each section has
-/// its own header and select-all toggle row, and an empty section contributes
-/// no rows at all.
+/// preference). Each section has its own header and select-all toggle row, and
+/// an empty section contributes no rows at all.
 ///
 /// The row layout is fixed once the app is built -- only selection changes
 /// afterwards -- so it is computed once into `rows` and indexed from there.
@@ -99,8 +98,7 @@ impl App {
 
         // A previously unsubscribed sender stays in that section even when it
         // is also stale: that it came back at all is the interesting part.
-        let (stale, active): (Vec<_>, Vec<_>) =
-            sections
+        let (stale, active): (Vec<_>, Vec<_>) = sections
             .remaining
             .into_iter()
             .partition(|s| is_stale(s, preferences.stale_after_months));
