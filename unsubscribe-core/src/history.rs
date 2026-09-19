@@ -460,32 +460,48 @@ impl PreviouslyUnsubscribed {
     pub fn unsubscribed_at(&self) -> i64 {
         self.verdict.unsubscribed_at
     }
+}
 
-    /// The observation to record when this sender ignored its unsubscribe and
-    /// that has not been recorded yet.
-    #[must_use]
-    pub fn new_resumption(&self, account: &str, known: &[Resumption], observed_at: i64) -> Option<Resumption> {
-        let UnsubscribeOutcome::Resumed { .. } = self.verdict.outcome else {
-            return None;
-        };
-        // At most one per ignored attempt: seeing the same one on a later scan
-        // records nothing new.
-        if known
-            .iter()
-            .any(|r| r.attempt_id == self.verdict.attempt_id)
-        {
-            return None;
-        }
-        Some(Resumption::new(
-            account.to_string(),
-            self.sender.email.clone(),
-            self.sender.list_id.clone(),
-            self.verdict.attempt_id.clone(),
-            observed_at,
-            self.sender.last_seen.unwrap_or(observed_at),
-            self.sender.email_count,
-        ))
-    }
+/// Every resumption this scan reveals that the history does not hold yet.
+///
+/// Worked out before any sender is judged in full, because a resumption
+/// observed now is what makes the ignored rung spent -- the run that catches a
+/// sender must escalate on that same run, not on the next one. At most one per
+/// ignored attempt: seeing the same one again records nothing new.
+#[must_use]
+pub fn observed_resumptions(
+    account: &str,
+    senders: &[SenderInfo],
+    attempts: &[UnsubscribeAttempt],
+    known: &[Resumption],
+    now: i64,
+    grace_period_days: u32,
+) -> Vec<Resumption> {
+    let latest = LatestAttempts::from_history(attempts);
+    senders
+        .iter()
+        .filter_map(|sender| {
+            let attempt = latest.for_sender(sender)?;
+            let outcome = classify_outcome(
+                attempt.attempted_at,
+                sender.last_seen,
+                now,
+                grace_period_days,
+            );
+            if !outcome.is_resumed() || known.iter().any(|r| r.attempt_id == attempt.id) {
+                return None;
+            }
+            Some(Resumption::new(
+                account.to_string(),
+                sender.email.clone(),
+                sender.list_id.clone(),
+                attempt.id.clone(),
+                now,
+                sender.last_seen.unwrap_or(now),
+                sender.email_count,
+            ))
+        })
+        .collect()
 }
 
 /// Scanned senders split by whether they have been unsubscribed from before.

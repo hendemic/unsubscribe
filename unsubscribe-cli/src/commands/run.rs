@@ -76,17 +76,21 @@ pub fn cmd_run(
     // already unsubscribed from get their own section, so a sender that ignored
     // an unsubscribe is the first thing seen.
     let history_view = load_history(history, &account.account_id);
+    let mut resumptions = history_view.resumptions;
     let annotated = annotate_senders(
         &account.account_id,
         senders,
         &history_view.attempts,
-        &history_view.resumptions,
+        &resumptions,
         &policy,
         now_unix_secs(),
     );
     // Seeing a sender ignore an unsubscribe is evidence in its own right, so it
     // is written before the user gets a chance to cancel out of the screen.
     record_resumptions(&annotated, history, &policy, &CliWarningsOnly);
+    // Planning happens after the selection screen, by which point these are
+    // part of the record -- and they are what makes the ignored rung spent.
+    resumptions.extend(annotated.new_resumptions.iter().cloned());
 
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
     let Some(selections) = tui::select_senders(annotated, Some(&resolved.scanned_at), preferences)?
@@ -111,7 +115,7 @@ pub fn cmd_run(
     let plan = plan_run(
         selected,
         &history_view.attempts,
-        &history_view.resumptions,
+        &resumptions,
         &policy,
         now_unix_secs(),
     );

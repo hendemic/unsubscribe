@@ -5,10 +5,10 @@ use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
-    decide_scan_action, judge_sender, load_cached_senders, scan_senders, AccountConfig,
-    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, LatestAttempts,
-    ObtainedSenders, Preferences, PreviouslyUnsubscribed, Resumption, RunObserver, RunPolicy,
-    RunWarning, ScanAction, ScanCacheStore, SenderInfo, SenderVerdict, UnsubscribeOutcome,
+    decide_scan_action, judge_sender, load_cached_senders, observed_resumptions, scan_senders,
+    AccountConfig, CachedScanSummary, Credential, DataStore, Folder, HistoryStore, LatestAttempts,
+    ObtainedSenders, Preferences, Resumption, RunObserver, RunPolicy, RunWarning, ScanAction,
+    ScanCacheStore, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
 use crate::commands::load_history;
@@ -179,6 +179,21 @@ pub fn cmd_scan(
     let history_view = load_history(history, &account.account_id);
     let policy = run_policy(preferences);
     let now = now_unix_secs();
+
+    // Observe first, judge second: a sender caught ignoring an unsubscribe on
+    // this very scan has already spent that rung.
+    let mut resumptions = history_view.resumptions;
+    let observed = observed_resumptions(
+        &account.account_id,
+        &senders,
+        &history_view.attempts,
+        &resumptions,
+        now,
+        policy.grace_period_days,
+    );
+    record_scan_resumptions(&observed, history);
+    resumptions.extend(observed);
+
     let latest = LatestAttempts::from_history(&history_view.attempts);
     let verdicts: Vec<Option<SenderVerdict>> = senders
         .iter()
@@ -187,20 +202,12 @@ pub fn cmd_scan(
                 sender,
                 &latest,
                 &history_view.attempts,
-                &history_view.resumptions,
+                &resumptions,
                 now,
                 policy.grace_period_days,
             )
         })
         .collect();
-    record_scan_resumptions(
-        &account.account_id,
-        &senders,
-        &verdicts,
-        &history_view.resumptions,
-        history,
-        now,
-    );
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -357,37 +364,19 @@ fn run_policy(preferences: &Preferences) -> RunPolicy {
     }
 }
 
-/// Write every resumption this listing turned up that is not on record yet.
+/// Write every resumption this listing turned up.
 ///
 /// `scan` changes nothing about the mailbox, but observing a sender ignore an
 /// unsubscribe is an observation either way, and it cannot be made again later.
-fn record_scan_resumptions(
-    account: &str,
-    senders: &[SenderInfo],
-    verdicts: &[Option<SenderVerdict>],
-    known: &[Resumption],
-    history: Option<&dyn HistoryStore>,
-    now: i64,
-) {
+fn record_scan_resumptions(observed: &[Resumption], history: Option<&dyn HistoryStore>) {
     let Some(history) = history else {
         return;
     };
-    senders
-        .iter()
-        .zip(verdicts)
-        .filter_map(|(sender, verdict)| {
-            let verdict = verdict.as_ref()?;
-            PreviouslyUnsubscribed {
-                sender: sender.clone(),
-                verdict: verdict.clone(),
-            }
-            .new_resumption(account, known, now)
-        })
-        .for_each(|resumption| {
-            if let Err(e) = history.record_resumption(&resumption) {
-                CliWarningsOnly.on_warning(&RunWarning::ResumptionNotRecorded(e.to_string()));
-            }
-        });
+    for resumption in observed {
+        if let Err(e) = history.record_resumption(resumption) {
+            CliWarningsOnly.on_warning(&RunWarning::ResumptionNotRecorded(e.to_string()));
+        }
+    }
 }
 
 /// The short marker a listing row carries for a previously unsubscribed sender.

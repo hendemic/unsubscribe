@@ -18,7 +18,8 @@ use anyhow::Result;
 
 use crate::escalation::{next_step, Escalation, NextStep};
 use crate::history::{
-    split_previously_unsubscribed, PreviouslyUnsubscribed, Resumption, UnsubscribeAttempt,
+    observed_resumptions, split_previously_unsubscribed, PreviouslyUnsubscribed, Resumption,
+    UnsubscribeAttempt,
 };
 use crate::ports::{
     CacheMeta, CachedScan, DataStore, EmailProvider, EmailSender, HistoryStore, HttpClient,
@@ -253,7 +254,9 @@ pub struct AnnotatedSenders {
     /// Senders whose most recent message predates the staleness threshold.
     pub stale: Vec<SenderInfo>,
     /// Senders caught ignoring an unsubscribe that the history does not
-    /// already record. Hand these to [`record_resumptions`].
+    /// already record. Hand these to [`record_resumptions`], and to
+    /// [`plan_run`] alongside the history's own -- the run that catches a
+    /// sender is the run that should escalate past the rung it ignored.
     pub new_resumptions: Vec<Resumption>,
 }
 
@@ -288,10 +291,21 @@ pub fn annotate_senders(
     policy: &RunPolicy,
     now: i64,
 ) -> AnnotatedSenders {
+    // What this scan reveals has to be known before anything is judged: a
+    // sender caught ignoring an unsubscribe right now has a spent rung right
+    // now, and the verdict on screen must already say so.
+    let new_resumptions =
+        observed_resumptions(account, &senders, attempts, resumptions, now, policy.grace_period_days);
+    let effective: Vec<Resumption> = resumptions
+        .iter()
+        .chain(new_resumptions.iter())
+        .cloned()
+        .collect();
+
     let sections = split_previously_unsubscribed(
         senders,
         attempts,
-        resumptions,
+        &effective,
         now,
         policy.grace_period_days,
     );
@@ -299,12 +313,6 @@ pub fn annotate_senders(
         .remaining
         .into_iter()
         .partition(|s| is_stale(s, policy.stale_after_months, now));
-
-    let new_resumptions = sections
-        .previously_unsubscribed
-        .iter()
-        .filter_map(|previous| previous.new_resumption(account, resumptions, now))
-        .collect();
 
     AnnotatedSenders {
         previously_unsubscribed: sections.previously_unsubscribed,
