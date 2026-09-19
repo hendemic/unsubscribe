@@ -6,7 +6,8 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
     decide_scan_action, latest_successful_attempts, AccountConfig, CacheMeta, CachedScan,
-    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, ScanAction, ScanCacheStore,
+    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, Preferences, ScanAction,
+    ScanCacheStore,
     ScanWatermark, SenderInfo,
 };
 
@@ -14,7 +15,7 @@ use crate::commands::load_history;
 use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{
     age_secs_since, format_relative_age, is_stale, now_iso8601, utc_to_local_date,
-    SCAN_MAX_AGE_SECS,
+    scan_max_age_secs,
 };
 use crate::{make_provider, progress};
 
@@ -23,7 +24,7 @@ pub fn do_scan(
     credential: &Credential,
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(account, credential)?;
@@ -79,7 +80,7 @@ pub fn do_scan(
     let senders: Vec<_> = scan_result
         .senders
         .into_iter()
-        .filter(|s| s.email_count >= min_emails)
+        .filter(|s| s.email_count >= preferences.min_emails)
         .collect();
 
     Ok((senders, scan_result.warnings))
@@ -107,9 +108,9 @@ pub fn resolve_scan(
     cache_store: &dyn ScanCacheStore,
     cached: bool,
     rescan: bool,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<ResolvedScan> {
-    let usable = usable_cache(cache_store, &account.account_id, min_emails);
+    let usable = usable_cache(cache_store, &account.account_id, preferences.min_emails);
     let summary = usable.as_ref().map(|(scanned_at, senders)| CachedScanSummary {
         sender_count: senders.len(),
         age_secs: age_secs_since(scanned_at),
@@ -120,7 +121,7 @@ pub fn resolve_scan(
         cached,
         rescan,
         std::io::stdin().is_terminal(),
-        SCAN_MAX_AGE_SECS,
+        scan_max_age_secs(preferences.cache_max_age_days),
     );
 
     let use_cache = match action {
@@ -145,7 +146,7 @@ pub fn resolve_scan(
         });
     }
 
-    let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
+    let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
     Ok(ResolvedScan {
         senders,
         warnings,
@@ -238,9 +239,9 @@ pub fn cmd_scan(
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
     history: Option<&dyn HistoryStore>,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<()> {
-    let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
+    let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
     let previously_unsubscribed =
         latest_successful_attempts(&load_history(history, &account.account_id));
 
@@ -271,7 +272,7 @@ pub fn cmd_scan(
         let (marker, marker_color) =
             if previously_unsubscribed.contains_key(&s.email.to_lowercase()) {
                 (" [unsubscribed]", RED)
-            } else if is_stale(s) {
+            } else if is_stale(s, preferences.stale_after_months) {
                 (" [stale]", DIM)
             } else {
                 ("", DIM)
@@ -293,7 +294,10 @@ pub fn cmd_scan(
     }
 
     let total_emails: u32 = senders.iter().map(|s| s.email_count).sum();
-    let stale_count = senders.iter().filter(|s| is_stale(s)).count();
+    let stale_count = senders
+        .iter()
+        .filter(|s| is_stale(s, preferences.stale_after_months))
+        .count();
     let previous_count = senders
         .iter()
         .filter(|s| previously_unsubscribed.contains_key(&s.email.to_lowercase()))
@@ -327,8 +331,8 @@ pub fn cmd_export(
     credential: &Credential,
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
+    preferences: &Preferences,
     output: &Path,
-    min_emails: u32,
     cached: bool,
     rescan: bool,
 ) -> Result<()> {
@@ -339,7 +343,7 @@ pub fn cmd_export(
         cache_store,
         cached,
         rescan,
-        min_emails,
+        preferences,
     )?;
     if resolved.from_cache {
         eprintln!("{DIM}Using cached scan from {}{RESET}", resolved.scanned_at);
@@ -365,7 +369,7 @@ pub fn cmd_export(
             .best_unsubscribe_url()
             .unwrap_or_default()
             .to_string();
-        let stale = is_stale(s).to_string();
+        let stale = is_stale(s, preferences.stale_after_months).to_string();
 
         wtr.write_record([
             s.display_name.as_str(),

@@ -13,7 +13,7 @@ use clap_complete::Shell;
 use std::path::{Path, PathBuf};
 use unsubscribe_core::{
     AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, HistoryStore,
-    ProviderType,
+    Preferences, ProviderType,
 };
 use unsubscribe_persistence::{
     FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
@@ -38,8 +38,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         /// Only include senders with at least this many emails
-        #[arg(short, long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(short, long)]
+        min_emails: Option<u32>,
         /// Use cached scan results without asking
         #[arg(long)]
         cached: bool,
@@ -50,8 +51,9 @@ enum Commands {
     /// Only scan and list senders with unsubscribe links
     Scan {
         /// Only include senders with at least this many emails
-        #[arg(short, long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(short, long)]
+        min_emails: Option<u32>,
     },
     /// Export scan results to CSV
     Export {
@@ -59,8 +61,9 @@ enum Commands {
         #[arg(short, long, default_value = "unsubscribe_senders.csv")]
         output: PathBuf,
         /// Only include senders with at least this many emails
-        #[arg(long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(long)]
+        min_emails: Option<u32>,
         /// Use cached scan results without asking
         #[arg(long)]
         cached: bool,
@@ -82,6 +85,8 @@ enum Commands {
     },
     /// Create config file with interactive setup
     Init,
+    /// Edit settings in a terminal UI
+    Config,
     /// Update credentials (re-authenticate with your email provider)
     Reauth,
     /// Remove config, data, keychain entry, and binary
@@ -108,6 +113,9 @@ fn main() -> Result<()> {
         Commands::Warnings => return commands::misc::cmd_warnings(),
         Commands::Update { pre } => return commands::update::cmd_update(*pre),
         Commands::Init => return commands::setup::cmd_init(&config_dir),
+        // Routed before the config-file check below so it can give its own
+        // pointer to `init` rather than the generic one.
+        Commands::Config => return commands::config::cmd_config(&config_dir),
         Commands::Reauth => return commands::setup::cmd_reauth(&config_dir),
         Commands::Uninstall => return commands::setup::cmd_uninstall(&config_dir),
         Commands::Completions { shell } => return commands::misc::cmd_completions(*shell),
@@ -122,6 +130,7 @@ fn main() -> Result<()> {
     }
 
     let (account, credential) = load_account(&config_dir)?;
+    let preferences = TomlConfigStore::new(&config_dir).read_preferences()?;
     let store = FileDataStore::new();
     // A corrupt cache should be reported, not worked around silently -- but it
     // costs the user nothing to fix, so say so.
@@ -158,21 +167,19 @@ fn main() -> Result<()> {
             &store,
             &cache_store,
             history,
+            &with_min_emails(preferences, min_emails),
             dry_run,
-            min_emails,
             cached,
             rescan,
         ),
-        Commands::Scan { min_emails } => {
-            commands::scan::cmd_scan(
-                &account,
-                &credential,
-                &store,
-                &cache_store,
-                history,
-                min_emails,
-            )
-        }
+        Commands::Scan { min_emails } => commands::scan::cmd_scan(
+            &account,
+            &credential,
+            &store,
+            &cache_store,
+            history,
+            &with_min_emails(preferences, min_emails),
+        ),
         Commands::Export {
             output,
             min_emails,
@@ -183,8 +190,8 @@ fn main() -> Result<()> {
             &credential,
             &store,
             &cache_store,
+            &with_min_emails(preferences, min_emails),
             &output,
-            min_emails,
             cached,
             rescan,
         ),
@@ -192,9 +199,24 @@ fn main() -> Result<()> {
         Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
+        | Commands::Config
         | Commands::Reauth
         | Commands::Uninstall
         | Commands::Completions { .. } => unreachable!(),
+    }
+}
+
+/// Apply a `--min-emails` flag on top of the configured preferences.
+///
+/// The flag wins when given; otherwise the `[preferences]` value (or its
+/// default) stands.
+fn with_min_emails(preferences: Preferences, flag: Option<u32>) -> Preferences {
+    match flag {
+        Some(min_emails) => Preferences {
+            min_emails,
+            ..preferences
+        },
+        None => preferences,
     }
 }
 

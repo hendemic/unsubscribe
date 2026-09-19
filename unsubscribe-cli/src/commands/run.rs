@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use unsubscribe_core::{
-    AccountConfig, Credential, DataStore, Folder, HistoryStore, ScanCacheStore, SenderInfo,
-    UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
+    AccountConfig, Credential, DataStore, Folder, HistoryStore, Preferences, ScanCacheStore,
+    SenderInfo, UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
 };
 
 use crate::action_log::append_log_entry;
@@ -20,8 +20,8 @@ pub fn cmd_run(
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
     history: Option<&dyn HistoryStore>,
+    preferences: &Preferences,
     dry_run: bool,
-    min_emails: u32,
     cached: bool,
     rescan: bool,
 ) -> Result<()> {
@@ -37,7 +37,7 @@ pub fn cmd_run(
         cache_store,
         cached,
         rescan,
-        min_emails,
+        preferences,
     )?;
     let from_cache = resolved.from_cache;
     let warnings = resolved.warnings;
@@ -70,7 +70,7 @@ pub fn cmd_run(
     let attempts = load_history(history, &account.account_id);
 
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders, &attempts, scan_timestamp.as_deref())? {
+    let selections = match tui::select_senders(senders, &attempts, scan_timestamp.as_deref(), preferences)? {
         Some(s) => s,
         None => {
             eprintln!("{YELLOW}Cancelled.{RESET}");
@@ -79,7 +79,7 @@ pub fn cmd_run(
     };
 
     // Partition selected senders: active ones get HTTP unsubscribe + archive,
-    // stale ones (last message >12 months ago) get archive-only.
+    // stale ones (no message within `stale_after_months`) get archive-only.
     let selected: Vec<&SenderInfo> = selections
         .iter()
         .filter(|(_, selected)| *selected)
@@ -92,7 +92,9 @@ pub fn cmd_run(
     }
 
     let (to_unsub, to_archive_only): (Vec<&SenderInfo>, Vec<&SenderInfo>) =
-        selected.iter().partition(|s| !is_stale(s));
+        selected
+            .iter()
+            .partition(|s| !is_stale(s, preferences.stale_after_months));
 
     let total_emails: u32 = selected.iter().map(|s| s.email_count).sum();
     if !to_unsub.is_empty() {

@@ -4,14 +4,9 @@
 
 use unsubscribe_core::SenderInfo;
 
-/// A sender is considered stale if their most recent message is older than 12 months.
-const STALE_THRESHOLD_SECS: i64 = 365 * 24 * 60 * 60;
-
-/// How old a cached scan may be before we stop treating it as current.
-///
-/// One value, two uses: the TUI paints the scan timestamp red past it, and the
-/// run/export prompt flips its default from "use cached" to "rescan".
-pub const SCAN_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Seconds in a month, taken as a twelfth of a 365-day year so that the
+/// default threshold of 12 months is exactly one year.
+const SECS_PER_MONTH: i64 = 365 * 24 * 60 * 60 / 12;
 
 /// Month abbreviations for the hand-rolled date formatting below.
 pub const MONTH_NAMES: [&str; 12] = [
@@ -26,22 +21,37 @@ pub fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn is_stale(sender: &SenderInfo) -> bool {
+/// A sender is stale when their most recent message predates the configured
+/// threshold. Senders whose adapter gave no date are never stale.
+pub fn is_stale(sender: &SenderInfo, stale_after_months: u32) -> bool {
     let now = now_unix_secs();
     match sender.last_seen {
-        Some(ts) => now - ts > STALE_THRESHOLD_SECS,
+        Some(ts) => now - ts > i64::from(stale_after_months) * SECS_PER_MONTH,
         None => false,
     }
 }
 
-pub fn now_iso8601() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+/// The configured cached-scan freshness window, in seconds.
+///
+/// One value, two uses: the TUI paints the scan timestamp red past it, and the
+/// run/export prompt flips its default from "use cached" to "rescan".
+pub fn scan_max_age_secs(cache_max_age_days: u32) -> u64 {
+    u64::from(cache_max_age_days) * 24 * 3600
+}
 
-    let days = secs as i64 / 86400;
-    let time_of_day = secs as i64 % 86400;
+/// Whether a cached scan has aged past the configured freshness window.
+///
+/// An unparseable timestamp is treated as fresh: a display quirk is preferable
+/// to nagging the user about a scan we cannot date.
+pub fn is_scan_stale(timestamp: &str, cache_max_age_days: u32) -> bool {
+    age_secs_since(timestamp).is_some_and(|age| age > scan_max_age_secs(cache_max_age_days))
+}
+
+pub fn now_iso8601() -> String {
+    let secs = now_unix_secs();
+
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;

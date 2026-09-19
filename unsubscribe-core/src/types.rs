@@ -393,3 +393,113 @@ pub enum Credential {
         refresh_token: Option<String>,
     },
 }
+
+/// A single tunable preference, used for validation and by settings UIs that
+/// need a stable key and an inclusive range per field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferenceField {
+    MinEmails,
+    StaleAfterMonths,
+    CacheMaxAgeDays,
+}
+
+impl PreferenceField {
+    /// Every field, in the order a settings UI should present them.
+    pub const ALL: [PreferenceField; 3] = [
+        PreferenceField::MinEmails,
+        PreferenceField::StaleAfterMonths,
+        PreferenceField::CacheMaxAgeDays,
+    ];
+
+    /// The TOML key for this field inside `[preferences]`.
+    pub const fn key(self) -> &'static str {
+        match self {
+            PreferenceField::MinEmails => "min_emails",
+            PreferenceField::StaleAfterMonths => "stale_after_months",
+            PreferenceField::CacheMaxAgeDays => "cache_max_age_days",
+        }
+    }
+
+    /// Inclusive `(min, max)` range of accepted values.
+    ///
+    /// Upper bounds are generous but finite so that a typo (a pasted timestamp,
+    /// say) is reported rather than silently disabling a feature.
+    pub const fn bounds(self) -> (u32, u32) {
+        match self {
+            // 0 is meaningful here: it disables the minimum-count filter.
+            PreferenceField::MinEmails => (0, 1_000_000),
+            PreferenceField::StaleAfterMonths => (1, 1200),
+            PreferenceField::CacheMaxAgeDays => (1, 3650),
+        }
+    }
+
+    /// Check a value against this field's range, returning a message suitable
+    /// for both a config-load error and an inline UI error.
+    pub fn validate(self, value: u32) -> Result<(), String> {
+        let (min, max) = self.bounds();
+        if value < min || value > max {
+            return Err(format!(
+                "`{}` must be between {min} and {max} (got {value})",
+                self.key()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// User-tunable behavior settings, read from the optional `[preferences]`
+/// section of the config file.
+///
+/// These are a consumer concern -- core reads none of them. The CLI uses them
+/// to decide which senders to show, what counts as stale, and how long a
+/// cached scan stays fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preferences {
+    /// Minimum number of emails a sender must have to appear in results.
+    pub min_emails: u32,
+    /// Months without a message before a sender is treated as stale.
+    pub stale_after_months: u32,
+    /// Days a cached scan is considered fresh.
+    pub cache_max_age_days: u32,
+}
+
+impl Preferences {
+    pub const DEFAULT_MIN_EMAILS: u32 = 3;
+    pub const DEFAULT_STALE_AFTER_MONTHS: u32 = 12;
+    pub const DEFAULT_CACHE_MAX_AGE_DAYS: u32 = 7;
+
+    /// Read the value of one field.
+    pub fn get(&self, field: PreferenceField) -> u32 {
+        match field {
+            PreferenceField::MinEmails => self.min_emails,
+            PreferenceField::StaleAfterMonths => self.stale_after_months,
+            PreferenceField::CacheMaxAgeDays => self.cache_max_age_days,
+        }
+    }
+
+    /// Overwrite the value of one field, without validating it.
+    pub fn set(&mut self, field: PreferenceField, value: u32) {
+        match field {
+            PreferenceField::MinEmails => self.min_emails = value,
+            PreferenceField::StaleAfterMonths => self.stale_after_months = value,
+            PreferenceField::CacheMaxAgeDays => self.cache_max_age_days = value,
+        }
+    }
+
+    /// Validate every field, returning the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        PreferenceField::ALL
+            .into_iter()
+            .try_for_each(|field| field.validate(self.get(field)))
+    }
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            min_emails: Self::DEFAULT_MIN_EMAILS,
+            stale_after_months: Self::DEFAULT_STALE_AFTER_MONTHS,
+            cache_max_age_days: Self::DEFAULT_CACHE_MAX_AGE_DAYS,
+        }
+    }
+}

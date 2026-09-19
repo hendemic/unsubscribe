@@ -238,17 +238,20 @@ fn reauth_imap(config_dir: &Path, account: &AccountConfig) -> Result<()> {
     }
 
     new_credential_store.store_credential(&username, &Credential::Password(password))?;
-    config_store.write_init(
-        Some(&host),
-        Some(port),
-        &username,
-        &ProviderType::Imap,
-        &AuthType::Password,
-        folders,
-        &archive,
-        account.smtp_host.as_deref(),
-        account.smtp_port,
-    )?;
+    // write_config rather than write_init: this is an update to an existing
+    // file, so comments, preferences, and unknown keys must survive.
+    config_store.write_config(&AccountConfig {
+        account_id: username.clone(),
+        provider_type: ProviderType::Imap,
+        host: Some(host),
+        port: Some(port),
+        username,
+        auth_type: AuthType::Password,
+        scan_folders: folders,
+        archive_folder: archive,
+        smtp_host: account.smtp_host.clone(),
+        smtp_port: account.smtp_port,
+    })?;
 
     eprintln!("\n{GREEN}Credentials updated.{RESET}");
     Ok(())

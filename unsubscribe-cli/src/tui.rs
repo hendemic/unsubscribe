@@ -4,19 +4,38 @@ use crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use unsubscribe_core::{split_previously_unsubscribed, SenderInfo, UnsubscribeAttempt};
-
-use crate::time::{
-    is_stale, parse_iso8601_age_secs, utc_to_local_display, MONTH_NAMES, SCAN_MAX_AGE_SECS,
+use unsubscribe_core::{
+    split_previously_unsubscribed, Preferences, SenderInfo, UnsubscribeAttempt,
 };
+
+use crate::time::{is_scan_stale, is_stale, utc_to_local_display, MONTH_NAMES};
+
+pub mod config;
+
+/// Terminal handle shared by every screen in this module.
+pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// Number of selectable rows Ctrl+Up/Ctrl+Down jumps at a time.
 const JUMP_ROWS: usize = 5;
 
 /// Guard that restores the terminal on drop, even if we panic or return early
-struct TerminalGuard;
+pub(crate) struct TerminalGuard;
+
+impl TerminalGuard {
+    /// Enter the alternate screen in raw mode.
+    ///
+    /// The guard is created before the alternate screen is entered so that a
+    /// failure part-way through still leaves raw mode behind.
+    pub(crate) fn enter() -> anyhow::Result<(Self, Tui)> {
+        enable_raw_mode()?;
+        let guard = Self;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        Ok((guard, terminal))
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -29,7 +48,8 @@ impl Drop for TerminalGuard {
 ///
 /// Senders are split into up to three sections, in the order they matter:
 /// previously unsubscribed (a prior unsubscribe succeeded and they are mailing
-/// again), active, then stale (last message >12 months ago). Each section has
+/// again), active, then stale (no message within the `stale_after_months`
+/// preference). Each section has
 /// its own header and select-all toggle row, and an empty section contributes
 /// no rows at all.
 ///
@@ -40,9 +60,9 @@ struct App {
     previous: Vec<SenderInfo>,
     /// When each previously unsubscribed sender was last unsubscribed (Unix seconds).
     previous_unsubscribed_at: Vec<i64>,
-    /// Active senders (last_seen within 12 months, or unknown).
+    /// Active senders (seen within the staleness threshold, or date unknown).
     active: Vec<SenderInfo>,
-    /// Stale senders (last_seen older than 12 months).
+    /// Stale senders (last seen before the staleness threshold).
     stale: Vec<SenderInfo>,
     /// Selection state for previously unsubscribed senders. Defaults to false.
     previous_selected: Vec<bool>,
@@ -57,12 +77,18 @@ struct App {
     cancelled: bool,
     /// Optional scan timestamp (ISO 8601) for display.
     scan_timestamp: Option<String>,
+    /// User preferences driving the stale split and the scan-age warning.
+    preferences: Preferences,
 }
 
 impl App {
     /// Build the selection screen, promoting senders with a prior successful
     /// unsubscribe into their own section.
-    fn with_history(senders: Vec<SenderInfo>, history: &[UnsubscribeAttempt]) -> Self {
+    fn with_history(
+        senders: Vec<SenderInfo>,
+        history: &[UnsubscribeAttempt],
+        preferences: Preferences,
+    ) -> Self {
         let sections = split_previously_unsubscribed(senders, history);
 
         let (previous, previous_unsubscribed_at): (Vec<_>, Vec<_>) = sections
@@ -74,7 +100,10 @@ impl App {
         // A previously unsubscribed sender stays in that section even when it
         // is also stale: that it came back at all is the interesting part.
         let (stale, active): (Vec<_>, Vec<_>) =
-            sections.remaining.into_iter().partition(is_stale);
+            sections
+            .remaining
+            .into_iter()
+            .partition(|s| is_stale(s, preferences.stale_after_months));
 
         let rows = build_rows(previous.len(), active.len(), stale.len());
         let cursor = first_selectable_row(&rows);
@@ -92,6 +121,7 @@ impl App {
             scroll_offset: 0,
             cancelled: false,
             scan_timestamp: None,
+            preferences,
         }
     }
 
@@ -286,15 +316,11 @@ pub fn select_senders(
     senders: Vec<SenderInfo>,
     history: &[UnsubscribeAttempt],
     scan_timestamp: Option<&str>,
+    preferences: &Preferences,
 ) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
-    enable_raw_mode()?;
-    let _guard = TerminalGuard; // restores terminal on drop, even on error/panic
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let (_guard, mut terminal) = TerminalGuard::enter()?;
 
-    let mut app = App::with_history(senders, history);
+    let mut app = App::with_history(senders, history, *preferences);
     app.scan_timestamp = scan_timestamp.map(String::from);
 
     loop {
@@ -347,7 +373,7 @@ pub fn select_senders(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use unsubscribe_core::SenderInfo;
+    use unsubscribe_core::{Preferences, SenderInfo};
 
     /// Builds a minimal active (non-stale) SenderInfo.
     fn make_sender(email: &str, email_count: u32) -> SenderInfo {
@@ -401,21 +427,21 @@ mod tests {
 
     #[test]
     fn cursor_starts_on_select_all_active() {
-        let app = App::with_history(three_active_senders(), &[]);
+        let app = App::with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.cursor, 1);
         assert!(matches!(app.row_kind(1), RowKind::SelectAllActive));
     }
 
     #[test]
     fn move_up_stops_at_select_all_active() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.move_up();
         assert_eq!(app.cursor, 1, "should not move above SelectAllActive");
     }
 
     #[test]
     fn move_down_stops_at_last_row() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         // Rows: ActiveHeader(0), SelectAllActive(1), Active(2,3,4) = 5 rows
         for _ in 0..10 {
             app.move_down();
@@ -425,7 +451,7 @@ mod tests {
 
     #[test]
     fn move_up_and_down_traverse_selectable_rows() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         // Start at 1 (SelectAllActive), down to 2, 3, 4
         let mut visited = vec![app.cursor];
         for _ in 0..3 {
@@ -441,7 +467,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_any_unselected() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected.iter().all(|&s| s));
@@ -449,7 +475,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_deselects_when_all_selected() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.active_selected.fill(true);
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -457,7 +483,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_partially_selected() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.active_selected[0] = true;
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| s));
@@ -465,7 +491,7 @@ mod tests {
 
     #[test]
     fn toggle_on_sender_row_toggles_individual() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.cursor = 2; // first active sender (row 2)
         assert!(!app.active_selected[0]);
         app.toggle();
@@ -482,14 +508,14 @@ mod tests {
 
     #[test]
     fn select_all_sets_all_flags() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.select_all();
         assert!(app.active_selected.iter().all(|&s| s));
     }
 
     #[test]
     fn deselect_all_clears_all_flags() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         app.select_all();
         app.deselect_all();
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -501,7 +527,7 @@ mod tests {
 
     #[test]
     fn count_selected_correct() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.count_selected(), 0);
         app.active_selected[0] = true;
         app.active_selected[2] = true;
@@ -510,7 +536,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_sums_only_selected() {
-        let mut app = App::with_history(three_active_senders(), &[]);
+        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
         // a=10, b=20, c=5
         app.active_selected[1] = true; // b=20
         app.active_selected[2] = true; // c=5
@@ -519,7 +545,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_none_selected_is_zero() {
-        let app = App::with_history(three_active_senders(), &[]);
+        let app = App::with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.total_emails_selected(), 0);
     }
 
@@ -533,7 +559,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let app = App::with_history(senders, &[]);
+        let app = App::with_history(senders, &[], Preferences::default());
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert!(!app.stale_selected[0]);
@@ -545,7 +571,7 @@ mod tests {
             make_stale_sender("old@test.com", 2),
             make_sender("new@test.com", 5),
         ];
-        let app = App::with_history(senders, &[]);
+        let app = App::with_history(senders, &[], Preferences::default());
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert_eq!(app.active[0].email, "new@test.com");
@@ -561,7 +587,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[]);
+        let mut app = App::with_history(senders, &[], Preferences::default());
         app.move_down(); // 2 (active sender)
         app.move_down(); // 5 (select all stale — skips Spacer+StaleHeader)
         assert_eq!(app.cursor, 5);
@@ -577,7 +603,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[]);
+        let mut app = App::with_history(senders, &[], Preferences::default());
         app.cursor = 5; // SelectAllStale
         app.toggle();
         assert!(app.stale_selected[0], "stale sender should be selected");
@@ -590,7 +616,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[]);
+        let mut app = App::with_history(senders, &[], Preferences::default());
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected[0], "active sender should be selected");
@@ -603,7 +629,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[]);
+        let mut app = App::with_history(senders, &[], Preferences::default());
         app.active_selected[0] = true;
         let results = app.into_results();
         assert_eq!(results.len(), 2);
@@ -621,7 +647,7 @@ mod tests {
 
     #[test]
     fn empty_senders_no_panic() {
-        let mut app = App::with_history(vec![], &[]);
+        let mut app = App::with_history(vec![], &[], Preferences::default());
         assert_eq!(app.cursor, 1);
         assert_eq!(app.count_selected(), 0);
         assert_eq!(app.total_emails_selected(), 0);
@@ -661,14 +687,11 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Scan timestamp
     if let Some(ts) = &app.scan_timestamp {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let is_stale_scan = parse_iso8601_age_secs(ts)
-            .map(|scan_secs| now_secs.saturating_sub(scan_secs) > SCAN_MAX_AGE_SECS)
-            .unwrap_or(false);
-        let color = if is_stale_scan { Color::Red } else { Color::DarkGray };
+        let color = if is_scan_stale(ts, app.preferences.cache_max_age_days) {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
         let display_ts = utc_to_local_display(ts).unwrap_or_else(|| ts.clone());
         let label = format!(" Last scanned: {display_ts}");
         f.render_widget(

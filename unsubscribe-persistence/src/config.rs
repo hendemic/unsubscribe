@@ -1,8 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 
-use unsubscribe_core::{AccountConfig, AuthType, ConfigStore, ProviderType};
+use unsubscribe_core::{
+    AccountConfig, AuthType, ConfigStore, PreferenceField, Preferences, ProviderType,
+};
 
 use crate::KEYRING_SERVICE;
 
@@ -16,6 +19,10 @@ struct FileConfig {
     account: FileAccountConfig,
     #[serde(default)]
     scan: FileScanConfig,
+    /// Optional user preferences. Absent section and absent keys both fall back
+    /// to `Preferences::default()`; present-but-invalid values are an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferences: Option<FilePreferences>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,6 +81,34 @@ impl Default for FileScanConfig {
             folders: default_folders(),
             archive_folder: default_archive_folder(),
         }
+    }
+}
+
+/// On-disk shape of `[preferences]`. Each key is optional so a partially
+/// written section still gets defaults for the keys it omits.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct FilePreferences {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_emails: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_after_months: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_max_age_days: Option<u32>,
+}
+
+impl FilePreferences {
+    /// Fill in defaults for omitted keys, then range-check the result.
+    fn resolve(&self) -> Result<Preferences> {
+        let defaults = Preferences::default();
+        let prefs = Preferences {
+            min_emails: self.min_emails.unwrap_or(defaults.min_emails),
+            stale_after_months: self.stale_after_months.unwrap_or(defaults.stale_after_months),
+            cache_max_age_days: self.cache_max_age_days.unwrap_or(defaults.cache_max_age_days),
+        };
+        prefs
+            .validate()
+            .map_err(|e| anyhow!("Invalid [preferences] in config: {e}"))?;
+        Ok(prefs)
     }
 }
 
@@ -177,6 +212,9 @@ impl TomlConfigStore {
                 folders,
                 archive_folder: archive_folder.to_string(),
             },
+            // `init` writes no [preferences]; defaults apply until the user
+            // sets one, either by hand or through `unsubscribe config`.
+            preferences: None,
         };
 
         let toml_str = toml::to_string_pretty(&file).context("Failed to serialize config")?;
@@ -568,60 +606,186 @@ impl ConfigStore for TomlConfigStore {
     }
 
     fn write_config(&self, config: &AccountConfig) -> Result<()> {
-        // Preserve existing password/password_command fields if they exist
-        let path = self.config_path(&config.account_id);
-        let (existing_password, existing_command) = if path.exists() {
-            let contents = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("Failed to read existing config: {}", path.display())))
-                }
-            };
-            if let Ok(file) = toml::from_str::<FileConfig>(&contents) {
-                (file.account.password, file.account.password_command)
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
         let auth_type_str = match config.auth_type {
-            AuthType::OAuth => "oauth".to_string(),
-            AuthType::Password => "password".to_string(),
+            AuthType::OAuth => "oauth",
+            AuthType::Password => "password",
         };
-
         let provider_str = match config.provider_type {
-            ProviderType::Gmail => "gmail".to_string(),
-            ProviderType::Imap => "imap".to_string(),
+            ProviderType::Gmail => "gmail",
+            ProviderType::Imap => "imap",
         };
 
-        let file = FileConfig {
-            account: FileAccountConfig {
-                host: config.host.clone(),
-                port: config.port,
-                username: config.username.clone(),
-                password: existing_password,
-                password_command: existing_command,
-                auth_type: auth_type_str,
-                provider: provider_str,
-                smtp_host: config.smtp_host.clone(),
-                smtp_port: config.smtp_port,
-            },
-            scan: FileScanConfig {
-                folders: config.scan_folders.clone(),
-                archive_folder: config.archive_folder.clone(),
-            },
-        };
+        // Edited in place rather than re-serialized, so comments, key order,
+        // and keys this struct does not model (password, password_command,
+        // anything a future version adds) all survive the write.
+        edit_document(&self.config_path(&config.account_id), |doc| {
+            let section = account_section_name(doc);
+            let account = table_mut(doc, section)?;
+            set_opt_str(account, "host", config.host.as_deref());
+            set_opt_int(account, "port", config.port);
+            set_str(account, "username", &config.username);
+            set_str(account, "auth_type", auth_type_str);
+            set_str(account, "provider", provider_str);
+            set_opt_str(account, "smtp_host", config.smtp_host.as_deref());
+            set_opt_int(account, "smtp_port", config.smtp_port);
 
-        let toml_str = toml::to_string_pretty(&file).context("Failed to serialize config")?;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, toml_str)?;
-        Ok(())
+            let scan = table_mut(doc, SCAN_SECTION)?;
+            set_str_array(scan, "folders", &config.scan_folders);
+            set_str(scan, "archive_folder", &config.archive_folder);
+            Ok(())
+        })
     }
+
+    fn read_preferences(&self) -> Result<Preferences> {
+        let path = self.config_path("");
+        if !path.exists() {
+            return Ok(Preferences::default());
+        }
+
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config: {}", path.display()))?;
+        let file: FileConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+
+        file.preferences.unwrap_or_default().resolve()
+    }
+
+    fn write_preferences(&self, preferences: &Preferences) -> Result<()> {
+        preferences
+            .validate()
+            .map_err(|e| anyhow!("Refusing to write invalid preferences: {e}"))?;
+
+        edit_document(&self.config_path(""), |doc| {
+            let created = !doc.contains_key(PREFERENCES_SECTION);
+            let table = table_mut(doc, PREFERENCES_SECTION)?;
+            if created {
+                table.decor_mut().set_prefix(PREFERENCES_HEADER_COMMENT);
+            }
+            for field in PreferenceField::ALL {
+                set_int(table, field.key(), preferences.get(field));
+            }
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comment-preserving TOML editing
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_SECTION: &str = "account";
+/// Section name used by configs written before the `[account]` rename.
+const LEGACY_ACCOUNT_SECTION: &str = "imap";
+const SCAN_SECTION: &str = "scan";
+const PREFERENCES_SECTION: &str = "preferences";
+
+/// Written above a `[preferences]` section the first time one is created, so a
+/// hand-edited config explains itself.
+const PREFERENCES_HEADER_COMMENT: &str = "\n# Behavior settings. Edit here or run `unsubscribe config`.\n";
+
+/// Read `path`, hand the parsed document to `apply`, and write it back.
+///
+/// A missing file starts from an empty document. The file is left untouched --
+/// mtime included -- when `apply` produces no textual change, which is what
+/// keeps an unchanged save byte-identical.
+fn edit_document(path: &Path, apply: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("Failed to read existing config: {}", path.display())))
+        }
+    };
+
+    let mut doc: DocumentMut = existing
+        .parse()
+        .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+    apply(&mut doc)?;
+
+    let updated = doc.to_string();
+    if updated == existing && path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)
+        .with_context(|| format!("Failed to write config: {}", path.display()))?;
+    Ok(())
+}
+
+/// Which section holds account settings in this document: the legacy `[imap]`
+/// name when that is what the file already uses, `[account]` otherwise.
+fn account_section_name(doc: &DocumentMut) -> &'static str {
+    if !doc.contains_key(ACCOUNT_SECTION) && doc.contains_key(LEGACY_ACCOUNT_SECTION) {
+        LEGACY_ACCOUNT_SECTION
+    } else {
+        ACCOUNT_SECTION
+    }
+}
+
+/// Borrow a top-level table, creating it if absent.
+fn table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table> {
+    if !doc.contains_key(name) {
+        let mut table = Table::new();
+        // Without this, an empty table is elided from the rendered document.
+        table.set_implicit(false);
+        doc.insert(name, Item::Table(table));
+    }
+    doc[name]
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("`{name}` in config is not a table"))
+}
+
+/// Each setter is a no-op when the stored value already matches, so that keys
+/// the user never changed keep their original formatting and comments.
+fn set_str(table: &mut Table, key: &str, new: &str) {
+    if table.get(key).and_then(Item::as_str) == Some(new) {
+        return;
+    }
+    table[key] = value(new);
+}
+
+fn set_opt_str(table: &mut Table, key: &str, new: Option<&str>) {
+    match new {
+        Some(v) => set_str(table, key, v),
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_int(table: &mut Table, key: &str, new: u32) {
+    if table.get(key).and_then(Item::as_integer) == Some(i64::from(new)) {
+        return;
+    }
+    table[key] = value(i64::from(new));
+}
+
+fn set_opt_int(table: &mut Table, key: &str, new: Option<u16>) {
+    match new {
+        Some(v) => set_int(table, key, u32::from(v)),
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
+fn set_str_array(table: &mut Table, key: &str, items: &[String]) {
+    let unchanged = table
+        .get(key)
+        .and_then(Item::as_array)
+        .is_some_and(|existing| {
+            existing.len() == items.len()
+                && existing
+                    .iter()
+                    .zip(items)
+                    .all(|(a, b)| a.as_str() == Some(b.as_str()))
+        });
+    if unchanged {
+        return;
+    }
+    table[key] = value(items.iter().collect::<Array>());
 }

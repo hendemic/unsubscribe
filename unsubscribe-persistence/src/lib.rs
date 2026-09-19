@@ -12,7 +12,10 @@ pub use data::FileDataStore;
 pub use history::{SqliteHistoryStore, HISTORY_DB_FILE};
 
 /// Keyring service name used across all credential and config operations.
-pub(crate) const KEYRING_SERVICE: &str = "unsubscribe";
+///
+/// Public so consumers can tell the user where their credentials live without
+/// duplicating the literal.
+pub const KEYRING_SERVICE: &str = "unsubscribe";
 
 /// The XDG data directory this app stores its files in.
 ///

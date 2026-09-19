@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use crate::history::UnsubscribeAttempt;
 use crate::types::{
-    AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult, SenderInfo,
+    AccountConfig, Credential, Folder, FolderMessage, HttpResponse, Preferences, ScanResult,
+    SenderInfo,
 };
 
 /// Port for scan progress reporting.
@@ -106,6 +107,16 @@ pub trait ConfigStore {
 
     /// Write (create or update) the configuration for an account.
     fn write_config(&self, config: &AccountConfig) -> Result<()>;
+
+    /// Read the user's behavior preferences.
+    ///
+    /// Implementations return `Preferences::default()` when nothing is stored,
+    /// and an error when stored values are present but unusable -- a bad value
+    /// should never degrade silently into a default.
+    fn read_preferences(&self) -> Result<Preferences>;
+
+    /// Write (create or update) the user's behavior preferences.
+    fn write_preferences(&self, preferences: &Preferences) -> Result<()>;
 }
 
 /// Port for storing, retrieving, and deleting credentials.
