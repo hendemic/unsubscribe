@@ -871,6 +871,16 @@ fn draw_folder_picker(f: &mut Frame, area: Rect, picker: &mut FolderPicker) {
     );
 }
 
+/// The unsaved-changes hint, built from the real save key rather than a
+/// literal letter -- the two drifted apart once already (the status line
+/// said `s` while the footer, generated from [`keys::MNEMONICS`], said `w`).
+fn unsaved_hint() -> String {
+    let key = keys::describe(Key::Mnemonic('w'))
+        .map(|hint| hint.keys)
+        .unwrap_or("w");
+    format!(" Unsaved changes. Press {key} to save.")
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
     let (style, text) = match &app.mode {
         Mode::ConfirmQuit => (
@@ -893,7 +903,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
             ),
             None if app.is_dirty() => (
                 Style::default().fg(Color::Yellow),
-                " Unsaved changes. Press s to save.".to_string(),
+                unsaved_hint(),
             ),
             None => (
                 Style::default().fg(Color::DarkGray),
@@ -1489,6 +1499,25 @@ mod tests {
     fn w_asks_the_event_loop_to_save() {
         let mut app = app();
         assert_eq!(press(&mut app, KeyCode::Char('w')), Action::Save);
+    }
+
+    #[test]
+    fn s_does_not_save_here_it_belongs_to_the_sort_order_elsewhere() {
+        // `s` is spoken for in the shared letter budget (History's sort
+        // order); Settings never offers it, so it must be a no-op rather
+        // than something that looks like it half-works.
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::None);
+        assert!(app.is_dirty(), "s must not have saved or discarded anything");
+    }
+
+    #[test]
+    fn the_unsaved_hint_names_the_key_that_actually_saves() {
+        // Regression: this hint once said "Press s to save" while the real
+        // binding -- and the footer built from it -- was `w`.
+        assert_eq!(unsaved_hint(), " Unsaved changes. Press w to save.");
+        assert_eq!(press(&mut app(), KeyCode::Char('w')), Action::Save);
     }
 
     #[test]

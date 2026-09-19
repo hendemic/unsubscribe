@@ -702,6 +702,21 @@ impl Shell {
     }
 
     fn on_key(&mut self, key: KeyEvent, terminal: &mut Tui) -> Result<()> {
+        let nav = self.handle_key(key);
+        self.dispatch(nav, terminal)
+    }
+
+    /// The whole key map, decided without a terminal: translating the raw
+    /// key, answering the reserved ones inline, and handing everything else
+    /// to whatever has focus.
+    ///
+    /// Split out of [`Self::on_key`] so this -- Ctrl-C, the help overlay, a
+    /// dialog's own y/n, and [`keys::action`]'s text-field gating together --
+    /// is exactly what a test drives, rather than only the already-translated
+    /// [`Action`] `dispatch_action` takes. `on_key` cannot be driven from a
+    /// test on its own (it takes `&mut Tui`), which is exactly the gap that
+    /// let a routing bug in this chain go unnoticed before.
+    fn handle_key(&mut self, key: KeyEvent) -> Nav {
         // Ctrl-C always leaves, whatever is on screen. Answered before the
         // key map so that no panel and no text field can swallow it. With a
         // worker running it asks first, exactly as `q` does; a second Ctrl-C
@@ -712,12 +727,12 @@ impl Shell {
             } else {
                 self.request_quit();
             }
-            return Ok(());
+            return Nav::Stay;
         }
 
         if self.nav.help {
             self.nav.help = false;
-            return Ok(());
+            return Nav::Stay;
         }
 
         if let Some(dialog) = self.dialog.as_mut() {
@@ -735,19 +750,18 @@ impl Shell {
                     self.pending = None;
                 }
             }
-            return Ok(());
+            return Nav::Stay;
         }
 
         let Some(action) = keys::action(key, self.captures_text()) else {
-            return Ok(());
+            return Nav::Stay;
         };
         if action == Action::Help {
             self.nav.help = true;
-            return Ok(());
+            return Nav::Stay;
         }
 
-        let nav = self.dispatch_action(action);
-        self.dispatch(nav, terminal)
+        self.dispatch_action(action)
     }
 
     /// Hand one action to whatever has focus.
@@ -1933,12 +1947,16 @@ mod tests {
     // The shell's navigation state machine
     // =======================================================================
     //
-    // `Shell::on_key` cannot be driven from a test: it takes `&mut Tui`
+    // `Shell::on_key` itself cannot be driven from a test: it takes `&mut Tui`
     // (= `Terminal<CrosstermBackend<Stdout>>`) purely so it can forward two
     // settings effects, and `Terminal::new` asks the backend for a size, which
-    // fails when the test harness's stdout is a pipe. Everything below the
-    // preamble is reachable, so these tests drive `dispatch_action` (which
-    // picks the focus and hands it the action) and `apply` (the pure half of
+    // fails when the test harness's stdout is a pipe. `Shell::handle_key`
+    // holds everything on-key actually decides -- Ctrl-C, the help overlay, a
+    // dialog's own y/n, and the raw-key-to-`Action` translation `keys::action`
+    // does -- without touching the terminal, so the `real_keys` tests below
+    // drive that directly. Everything else here drives `dispatch_action`
+    // (which picks the focus and hands it the action, the way `handle_key`
+    // does once a key is already translated) and `apply` (the pure half of
     // carrying the answer out) -- between them, every transition the user can
     // make with a key that is not `Ctrl-C` or `?`.
 
@@ -3280,4 +3298,108 @@ mod tests {
         }
     }
 
+    // =======================================================================
+    // Real keys, end to end
+    // =======================================================================
+    //
+    // The tests above drive `dispatch_action` with an already-translated
+    // `Action`, which skips `keys::action`'s text-field gating and the
+    // Ctrl-C/help/dialog handling `handle_key` does first. These drive raw
+    // `KeyEvent`s through `handle_key` itself -- the actual path a keypress
+    // takes -- to pin the two bugs seen in Settings: `s` was advertised as
+    // save but never wired to it, and `y`/`n` at the "unsaved changes" prompt
+    // must actually resolve it rather than only working when the test hands
+    // `dispatch_action` the `Action` directly.
+
+    mod real_keys {
+        use super::state_machine::{open, shell};
+        use super::*;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        fn key(code: KeyCode) -> KeyEvent {
+            KeyEvent::new(code, KeyModifiers::NONE)
+        }
+
+        /// Dirty the settings screen the same way a user does: open the
+        /// first field's editor and change it.
+        fn dirty_settings(shell: &mut Shell) {
+            open(shell, Section::Settings);
+            for step in [
+                KeyCode::Enter,
+                KeyCode::Char('-'),
+                KeyCode::Char('x'),
+                KeyCode::Enter,
+            ] {
+                let nav = shell.handle_key(key(step));
+                shell.apply(nav);
+            }
+            assert!(
+                shell.panels.settings.as_ref().unwrap().0.is_dirty(),
+                "the fixture did not dirty the screen"
+            );
+        }
+
+        #[test]
+        fn w_saves_settings_through_the_real_key_path() {
+            let mut shell = shell();
+            dirty_settings(&mut shell);
+
+            let nav = shell.handle_key(key(KeyCode::Char('w')));
+
+            assert!(
+                matches!(nav, Nav::Effect(Effect::SettingsSave)),
+                "w should ask the shell to save, got {}",
+                nav_name(&nav)
+            );
+        }
+
+        #[test]
+        fn s_does_nothing_to_settings_through_the_real_key_path() {
+            // `s` is the sort-order letter elsewhere in the app; Settings
+            // never answers it, so it must be inert rather than half-saving.
+            let mut shell = shell();
+            dirty_settings(&mut shell);
+
+            let nav = shell.handle_key(key(KeyCode::Char('s')));
+
+            assert_eq!(nav_name(&nav), "stay");
+            assert!(shell.panels.settings.as_ref().unwrap().0.is_dirty());
+        }
+
+        #[test]
+        fn y_discards_and_leaves_the_unsaved_changes_prompt_through_the_real_key_path() {
+            let mut shell = shell();
+            dirty_settings(&mut shell);
+
+            let nav = shell.handle_key(key(KeyCode::Esc));
+            shell.apply(nav);
+            assert!(
+                !shell.nav.nav_has_focus(),
+                "Esc should raise the prompt, not leave yet"
+            );
+
+            let nav = shell.handle_key(key(KeyCode::Char('y')));
+            shell.apply(nav);
+
+            assert!(shell.nav.nav_has_focus(), "y should have left settings");
+        }
+
+        #[test]
+        fn n_keeps_the_unsaved_changes_and_stays_through_the_real_key_path() {
+            let mut shell = shell();
+            dirty_settings(&mut shell);
+
+            let nav = shell.handle_key(key(KeyCode::Esc));
+            shell.apply(nav);
+
+            let nav = shell.handle_key(key(KeyCode::Char('n')));
+            shell.apply(nav);
+
+            assert!(!shell.nav.nav_has_focus(), "n should not have left settings");
+            assert!(
+                shell.panels.settings.as_ref().unwrap().0.is_dirty(),
+                "n must not discard the edit"
+            );
+        }
+    }
 }
