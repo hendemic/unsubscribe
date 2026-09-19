@@ -82,9 +82,6 @@ pub struct Dialog {
     /// An extra yes/no the dialog carries, shown as a checkbox and toggled
     /// with `d`. Used for the run confirmation's dry-run switch.
     pub toggle: Option<DialogToggle>,
-    /// Footer hints, when the default wording would misdescribe the choice
-    /// (a two-way question where "no" is an action of its own).
-    pub hints: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +118,6 @@ impl Dialog {
             title: title.into(),
             body: body.into_iter().collect(),
             toggle: None,
-            hints: None,
         }
     }
 
@@ -133,7 +129,6 @@ impl Dialog {
             title: title.into(),
             body: wrapped_lines(&message.into()),
             toggle: None,
-            hints: None,
         }
     }
 
@@ -144,13 +139,6 @@ impl Dialog {
             label: label.into(),
             on,
         });
-        self
-    }
-
-    /// Replace the footer wording.
-    #[must_use]
-    pub fn with_hints(mut self, hints: impl Into<String>) -> Self {
-        self.hints = Some(hints.into());
         self
     }
 
@@ -184,9 +172,6 @@ impl Dialog {
 
     /// The footer hint while this dialog is up.
     pub fn hints(&self) -> &str {
-        if let Some(hints) = &self.hints {
-            return hints;
-        }
         match self.kind {
             DialogKind::Confirm if self.toggle.is_some() => {
                 " Enter/y: confirm | d: toggle dry run | Esc/n: cancel"
@@ -504,13 +489,6 @@ mod tests {
     fn a_question_with_a_switch_says_so_in_the_footer() {
         assert!(confirm().with_toggle("Dry run", false).hints().contains("dry run"));
         assert!(!confirm().hints().contains("dry run"));
-    }
-
-    #[test]
-    fn replacement_hints_win_over_the_default_wording() {
-        let dialog = confirm().with_hints(" y: use the cached scan | n/Esc: scan again");
-
-        assert_eq!(dialog.hints(), " y: use the cached scan | n/Esc: scan again");
     }
 
     // -- transient status ----------------------------------------------------

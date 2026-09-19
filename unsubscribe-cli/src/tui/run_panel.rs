@@ -30,8 +30,8 @@ pub struct RunStats {
     /// Warnings the last scan recorded.
     pub warnings: usize,
     /// What core says about reusing the cached scan, asked as the "unsubscribe
-    /// from the last scan" action asks it: demand the cache, and see whether
-    /// there is one.
+    /// from cached" action asks it: demand the cache, and see whether there
+    /// is one.
     pub cache: ScanAction,
 }
 
@@ -111,8 +111,8 @@ impl RunChoice {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::ScanAndUnsubscribe => "Scan and unsubscribe",
-            Self::FromLastScan => "Unsubscribe from last scan",
+            Self::ScanAndUnsubscribe => "Unsubscribe from new scan",
+            Self::FromLastScan => "Unsubscribe from cached",
         }
     }
 

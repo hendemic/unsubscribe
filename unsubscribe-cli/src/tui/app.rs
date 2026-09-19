@@ -49,8 +49,7 @@ use super::{
 use crate::commands::config::ConfigIo;
 use crate::commands::load_history;
 use crate::progress::CliWarningsOnly;
-use crate::time::{age_secs_since, format_relative_age, now_unix_secs, scan_max_age_secs,
-    utc_to_local_display};
+use crate::time::{age_secs_since, now_unix_secs, scan_max_age_secs};
 
 /// How long the loop waits for a key before redrawing anyway.
 ///
@@ -150,8 +149,8 @@ impl Context {
     /// What core says about the cached scan when a caller demands it.
     ///
     /// The same [`decide_scan_action`] the `run` command asks, so "unsubscribe
-    /// from the last scan" is offered exactly when a scripted run would have
-    /// found a cache to work from.
+    /// from cached" is offered exactly when a scripted run would have found a
+    /// cache to work from.
     fn cache_action(&self, cached: Option<&ObtainedSenders>) -> ScanAction {
         let summary = cached.map(|cache| CachedScanSummary {
             sender_count: cache.senders.len(),
@@ -408,10 +407,6 @@ enum Pending {
     Run {
         plan: Box<RunPlan>,
         counts: Box<PlanCounts>,
-    },
-    /// The cache-or-rescan question: yes reuses the cached scan, no rescans.
-    UseCachedScan {
-        cached: Box<ObtainedSenders>,
     },
     CancelScan,
     CancelRun,
@@ -1008,7 +1003,6 @@ impl Shell {
     fn resolve(&mut self, pending: Pending, toggled: bool) {
         match pending {
             Pending::Run { plan, counts } => self.start_run(*plan, *counts, toggled),
-            Pending::UseCachedScan { cached } => self.open_selection(*cached),
             Pending::CancelScan => {
                 if let Some(SubView::Scan(screen)) = self.stacks.run.last_mut() {
                     screen.request_cancel();
@@ -1024,60 +1018,23 @@ impl Shell {
         }
     }
 
-    /// Decide between the cached scan and a fresh one, then act on it.
+    /// Go straight to selecting from the cached scan.
     ///
-    /// The decision is [`decide_scan_action`] in core -- the same function the
-    /// `run` command asks -- so the app and a scripted run never disagree
-    /// about when a cache is too old to trust.
+    /// The user already saw the cache's age on the Run panel and chose
+    /// "Unsubscribe from cached" deliberately, so there is nothing left to
+    /// confirm here -- only whether a usable cache actually exists, which is
+    /// [`Context::cache_action`], the same demand-the-cache question the
+    /// `run` command asks.
     fn review(&mut self) {
         let usable = self.ctx.cached_senders();
-        let summary = usable.as_ref().map(|cache| CachedScanSummary {
-            sender_count: cache.senders.len(),
-            age_secs: age_secs_since(&cache.scanned_at),
-        });
-        let action = decide_scan_action(
-            summary,
-            false,
-            false,
-            true,
-            scan_max_age_secs(self.ctx.preferences.cache_max_age_days),
-        );
-
-        match action {
+        match self.ctx.cache_action(usable.as_ref()) {
             ScanAction::UseCache => {
                 self.open_selection(usable.expect("UseCache implies a usable cache"));
             }
-            // Nothing cached, or the caller demanded a cache that is not
-            // there; either way the mailbox is the only source left.
-            ScanAction::Rescan | ScanAction::CacheUnavailable => self.start_scan(),
-            ScanAction::Ask { default_cached } => {
-                let cached = usable.expect("Ask implies a usable cache");
-                let age = age_secs_since(&cached.scanned_at)
-                    .map(format_relative_age)
-                    .map(|age| format!(" ({age})"))
-                    .unwrap_or_default();
-                let when = utc_to_local_display(&cached.scanned_at)
-                    .unwrap_or_else(|| cached.scanned_at.clone());
-                self.dialog = Some(
-                    Dialog::confirm(
-                        "Use the cached scan?",
-                        [
-                            format!("Last scan {when}{age}."),
-                            format!("{} senders with unsubscribe links.", cached.senders.len()),
-                            String::new(),
-                            if default_cached {
-                                "Recent enough to reuse.".to_string()
-                            } else {
-                                "Older than your cache_max_age_days \u{2014} a rescan is suggested."
-                                    .to_string()
-                            },
-                        ],
-                    )
-                    .with_hints(" y: use the cached scan | n/Esc: scan the mailbox again"),
-                );
-                self.pending = Some(Pending::UseCachedScan {
-                    cached: Box::new(cached),
-                });
+            // Nothing cached, or the cache is not usable; either way the
+            // mailbox is the only source left.
+            ScanAction::Rescan | ScanAction::CacheUnavailable | ScanAction::Ask { .. } => {
+                self.start_scan()
             }
         }
     }

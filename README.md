@@ -43,8 +43,8 @@ highlighted.
 │ > Run              │ Last scan: 2h ago · 214 senders   │
 │   Unsubscribe List │ 3 resumed · 12 unsubscribed       │
 │   Warnings (2)     │                                   │
-│   Logs             │ > Scan and unsubscribe            │
-│   Settings         │   Unsubscribe from last scan      │
+│   Logs             │ > Unsubscribe from new scan       │
+│   Settings         │   Unsubscribe from cached         │
 │                    │                                   │
 │   Quit             │                                   │
 ├────────────────────┴───────────────────────────────────┤
