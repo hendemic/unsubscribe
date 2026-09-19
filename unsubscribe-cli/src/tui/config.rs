@@ -389,6 +389,7 @@ impl SettingsApp {
             Mode::ConfirmQuit => vec![Key::Mnemonic('y'), Key::Mnemonic('n')],
             Mode::Browse => keys::list_actions(&[
                 Key::Activate,
+                Key::Toggle,
                 Key::Mnemonic('w'),
                 Key::Mnemonic('x'),
             ]),
@@ -1954,7 +1955,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Browse answers Space but advertises only Enter -- see the report"]
     fn the_browse_screen_advertises_the_space_it_answers() {
         let mut screen = app();
         focus(&mut screen, Field::Host);

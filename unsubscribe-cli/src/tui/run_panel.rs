@@ -186,13 +186,7 @@ impl RunPanel {
     /// The actions this panel answers, for the footer and the `?` overlay.
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
-        vec![
-            Action::MoveUp,
-            Action::MoveDown,
-            Action::Activate,
-            Action::Help,
-            Action::Back,
-        ]
+        keys::list_actions(&[Action::Activate])
     }
 }
 
@@ -571,7 +565,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "the panel answers the page and jump keys but advertises only the arrows"]
     fn every_movement_the_panel_answers_is_one_it_advertises() {
         let advertised = panel(with_cache()).actions();
 
