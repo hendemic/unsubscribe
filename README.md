@@ -47,6 +47,7 @@ unsubscribe <command> [options]
 | `update` | Self-update to the latest GitHub release. |
 | `reauth` | Update IMAP credentials (server, username, password). |
 | `init` | Create config file with interactive setup. |
+| `config` | Edit settings in a terminal UI. |
 
 Global option: `-c <path>` to specify a config file.
 
@@ -67,6 +68,33 @@ unsubscribe scan -m 1
 ## Config
 
 Config file location: `~/.config/email-unsubscribe/config.toml`
+
+`unsubscribe config` opens a settings screen for everything in that file — account, SMTP, scan
+folders, and preferences. The file stays the source of truth and stays hand-editable: saving
+edits it in place, so your comments and any keys the screen does not show are left alone.
+
+```
+unsubscribe config
+```
+
+| Key | Action |
+|-----|--------|
+| `j` / `k`, arrows | Move between settings |
+| `Enter` | Edit the setting (or cycle provider / auth type, or open the folder picker) |
+| `s` | Save |
+| `r` | Discard unsaved changes |
+| `q` | Quit (asks first if anything is unsaved) |
+
+Scan folders are picked from the list your provider reports, the same list `list-folders` prints.
+Folders in your config that the server does not report stay selected and visible so a save never
+drops them. If the folder list cannot be fetched — or the provider has none, as with Gmail —
+the picker falls back to typing folder names separated by commas.
+
+Credentials are never shown or edited here. The Account section says where they are stored and
+offers a **Re-authenticate** action that runs the same flow as `unsubscribe reauth`. Changing the
+provider, username, or auth type warns you that re-authentication is needed.
+
+Run `unsubscribe init` first if you have no config file yet.
 
 Passwords are stored in the OS keychain by default. Alternatives:
 

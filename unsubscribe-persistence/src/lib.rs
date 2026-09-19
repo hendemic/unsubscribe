@@ -7,4 +7,7 @@ pub use credential::KeyringCredentialStore;
 pub use data::FileDataStore;
 
 /// Keyring service name used across all credential and config operations.
-pub(crate) const KEYRING_SERVICE: &str = "unsubscribe";
+///
+/// Public so consumers can tell the user where their credentials live without
+/// duplicating the literal.
+pub const KEYRING_SERVICE: &str = "unsubscribe";

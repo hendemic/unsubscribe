@@ -80,6 +80,8 @@ enum Commands {
     },
     /// Create config file with interactive setup
     Init,
+    /// Edit settings in a terminal UI
+    Config,
     /// Update credentials (re-authenticate with your email provider)
     Reauth,
     /// Remove config, data, keychain entry, and binary
@@ -106,6 +108,9 @@ fn main() -> Result<()> {
         Commands::Warnings => return commands::misc::cmd_warnings(),
         Commands::Update { pre } => return commands::update::cmd_update(*pre),
         Commands::Init => return commands::setup::cmd_init(&config_dir),
+        // Routed before the config-file check below so it can give its own
+        // pointer to `init` rather than the generic one.
+        Commands::Config => return commands::config::cmd_config(&config_dir),
         Commands::Reauth => return commands::setup::cmd_reauth(&config_dir),
         Commands::Uninstall => return commands::setup::cmd_uninstall(&config_dir),
         Commands::Completions { shell } => return commands::misc::cmd_completions(*shell),
@@ -160,6 +165,7 @@ fn main() -> Result<()> {
         Commands::Warnings
         | Commands::Update { .. }
         | Commands::Init
+        | Commands::Config
         | Commands::Reauth
         | Commands::Uninstall
         | Commands::Completions { .. } => unreachable!(),

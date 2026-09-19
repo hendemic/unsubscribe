@@ -9,8 +9,28 @@ use unsubscribe_core::{Preferences, SenderInfo};
 
 use crate::time::{is_scan_stale, is_stale, parse_iso8601_age_secs};
 
+pub mod config;
+
+/// Terminal handle shared by every screen in this module.
+pub(crate) type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+
 /// Guard that restores the terminal on drop, even if we panic or return early
-struct TerminalGuard;
+pub(crate) struct TerminalGuard;
+
+impl TerminalGuard {
+    /// Enter the alternate screen in raw mode.
+    ///
+    /// The guard is created before the alternate screen is entered so that a
+    /// failure part-way through still leaves raw mode behind.
+    pub(crate) fn enter() -> anyhow::Result<(Self, Tui)> {
+        enable_raw_mode()?;
+        let guard = Self;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        Ok((guard, terminal))
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -210,12 +230,7 @@ pub fn select_senders(
     scan_timestamp: Option<&str>,
     preferences: &Preferences,
 ) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
-    enable_raw_mode()?;
-    let _guard = TerminalGuard; // restores terminal on drop, even on error/panic
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let (_guard, mut terminal) = TerminalGuard::enter()?;
 
     let mut app = App::new(senders, *preferences);
     app.scan_timestamp = scan_timestamp.map(String::from);
