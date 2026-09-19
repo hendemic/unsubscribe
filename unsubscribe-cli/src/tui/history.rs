@@ -545,3 +545,533 @@ fn truncate(s: &str, max: usize) -> String {
         None => s.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use unsubscribe_core::{Resumption, UnsubscribeAttempt};
+
+    const DAY: i64 = 24 * 60 * 60;
+    const T0: i64 = 1_700_000_000;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn typed(screen: &mut HistoryScreen, text: &str) {
+        for c in text.chars() {
+            screen.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// What a `Nav` is, for asserting on without a shell.
+    fn nav_name(nav: &Nav) -> &'static str {
+        match nav {
+            Nav::Stay => "stay",
+            Nav::Push(Screen::SenderHistory(_)) => "push detail",
+            Nav::Push(_) => "push",
+            Nav::Pop => "pop",
+            Nav::Quit => "quit",
+            Nav::Effect(Effect::RunFromHistory) => "run from history",
+            Nav::Effect(_) => "other effect",
+        }
+    }
+
+    fn attempt(id: &str, email: &str, at: i64, follows: Option<&str>) -> UnsubscribeAttempt {
+        UnsubscribeAttempt {
+            id: id.to_string(),
+            account: "user@example.com".to_string(),
+            sender_email: email.to_string(),
+            sender_domain: "acme.example.com".to_string(),
+            list_id: None,
+            attempted_at: at,
+            method: UnsubscribeMethod::OneClickPost.as_id().to_string(),
+            success: true,
+            http_status: Some(200),
+            url: "https://acme.example.com/unsub".to_string(),
+            final_url: None,
+            list_unsubscribe_raw: None,
+            follows_attempt_id: follows.map(str::to_string),
+            detail: "HTTP 200".to_string(),
+        }
+    }
+
+    fn view(email: &str, list_id: Option<&str>, violations: usize) -> SenderHistoryView {
+        SenderHistoryView {
+            sender_email: email.to_string(),
+            sender_domain: email.split('@').nth(1).unwrap_or("").to_string(),
+            list_id: list_id.map(str::to_string),
+            last_attempt_at: T0 - 30 * DAY,
+            last_method: UnsubscribeMethod::OneClickPost.as_id().to_string(),
+            outcome: None,
+            violation_count: violations,
+            next_step: None,
+            timeline: vec![TimelineEvent::Attempt(attempt("a1", email, T0 - 30 * DAY, None))],
+        }
+    }
+
+    /// A view for a sender that is mailing again and is in the current scan:
+    /// the only case the `u` key is offered for.
+    fn resumed_and_scanned(email: &str) -> SenderHistoryView {
+        SenderHistoryView {
+            outcome: Some(UnsubscribeOutcome::Resumed { days_after: 20 }),
+            next_step: Some(NextStep::FirstAttempt),
+            violation_count: 1,
+            ..view(email, Some("news.acme"), 1)
+        }
+    }
+
+    fn listing() -> HistoryScreen {
+        HistoryScreen::new(vec![
+            resumed_and_scanned("bad@acme.example.com"),
+            view("quiet@beta.example.org", None, 0),
+            view("gone@gamma.example.net", Some("deals.gamma"), 0),
+        ])
+    }
+
+    fn visible_addresses(screen: &HistoryScreen) -> Vec<&str> {
+        screen
+            .visible
+            .iter()
+            .map(|index| screen.views[*index].sender_email.as_str())
+            .collect()
+    }
+
+    // -- the listing ---------------------------------------------------------
+
+    #[test]
+    fn every_sender_is_listed_before_any_filter_is_applied() {
+        let screen = listing();
+
+        assert_eq!(screen.visible.len(), 3);
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends() {
+        let mut screen = listing();
+
+        for _ in 0..10 {
+            screen.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(screen.cursor, 2);
+
+        for _ in 0..10 {
+            screen.on_key(key(KeyCode::Char('k')));
+        }
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn a_page_moves_ten_rows_and_clamps() {
+        let mut screen = HistoryScreen::new(
+            (0..25)
+                .map(|i| view(&format!("s{i:02}@acme.example.com"), None, 0))
+                .collect(),
+        );
+
+        screen.on_key(key(KeyCode::PageDown));
+        assert_eq!(screen.cursor, 10);
+        screen.on_key(key(KeyCode::PageDown));
+        screen.on_key(key(KeyCode::PageDown));
+        assert_eq!(screen.cursor, 24);
+        screen.on_key(key(KeyCode::PageUp));
+        assert_eq!(screen.cursor, 14);
+    }
+
+    #[test]
+    fn esc_and_q_go_back_to_the_screen_underneath() {
+        assert_eq!(nav_name(&listing().on_key(key(KeyCode::Esc))), "pop");
+        assert_eq!(nav_name(&listing().on_key(key(KeyCode::Char('q')))), "pop");
+    }
+
+    #[test]
+    fn enter_opens_the_timeline_of_the_highlighted_sender() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Down));
+
+        let nav = screen.on_key(key(KeyCode::Enter));
+
+        assert_eq!(nav_name(&nav), "push detail");
+        match nav {
+            Nav::Push(Screen::SenderHistory(detail)) => {
+                assert_eq!(detail.sender().0, visible_addresses(&screen)[1]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn an_empty_history_offers_nothing_to_open_and_still_goes_back() {
+        let mut screen = HistoryScreen::new(Vec::new());
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Enter))), "stay");
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Down))), "stay");
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+    }
+
+    // -- sorting and filtering -----------------------------------------------
+
+    #[test]
+    fn s_cycles_the_sort_through_every_order_and_back() {
+        let mut screen = listing();
+        let start = screen.filter.sort;
+
+        let mut seen = vec![start];
+        for _ in 0..HistorySort::ALL.len() - 1 {
+            screen.on_key(key(KeyCode::Char('s')));
+            seen.push(screen.filter.sort);
+        }
+        screen.on_key(key(KeyCode::Char('s')));
+
+        assert_eq!(screen.filter.sort, start, "the cycle closes");
+        for order in HistorySort::ALL {
+            assert!(seen.contains(&order), "{order:?} is reachable");
+        }
+    }
+
+    #[test]
+    fn r_shows_only_the_senders_that_ignored_an_unsubscribe() {
+        let mut screen = listing();
+
+        screen.on_key(key(KeyCode::Char('r')));
+        assert!(screen.filter.resumed_only);
+        assert_eq!(visible_addresses(&screen), ["bad@acme.example.com"]);
+
+        screen.on_key(key(KeyCode::Char('r')));
+        assert_eq!(visible_addresses(&screen).len(), 3);
+    }
+
+    #[test]
+    fn a_filter_that_shrinks_the_list_pulls_the_cursor_back_into_it() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('G')));
+        assert_eq!(screen.cursor, 2);
+
+        screen.on_key(key(KeyCode::Char('r')));
+
+        assert_eq!(screen.cursor, 0, "one row left, so the cursor is on it");
+        assert!(screen.selected().is_some());
+    }
+
+    // -- search --------------------------------------------------------------
+
+    #[test]
+    fn slash_starts_a_search_and_the_keys_typed_become_the_needle() {
+        let mut screen = listing();
+
+        screen.on_key(key(KeyCode::Char('/')));
+        assert!(screen.searching);
+        typed(&mut screen, "beta");
+
+        assert_eq!(screen.filter.search, "beta");
+        assert_eq!(visible_addresses(&screen), ["quiet@beta.example.org"]);
+    }
+
+    #[test]
+    fn while_searching_the_list_keys_are_taken_as_text() {
+        // `r`, `s` and `q` are filter keys outside the field and letters in it.
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+
+        typed(&mut screen, "rsq");
+
+        assert_eq!(screen.filter.search, "rsq");
+        assert!(!screen.filter.resumed_only, "r did not toggle the filter");
+        assert_eq!(screen.filter.sort, HistorySort::default(), "s did not sort");
+    }
+
+    #[test]
+    fn backspace_takes_back_one_character_and_widens_the_list_again() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "beta");
+
+        screen.on_key(key(KeyCode::Backspace));
+
+        assert_eq!(screen.filter.search, "bet");
+        screen.on_key(key(KeyCode::Backspace));
+        screen.on_key(key(KeyCode::Backspace));
+        screen.on_key(key(KeyCode::Backspace));
+        assert_eq!(screen.filter.search, "");
+        assert_eq!(visible_addresses(&screen).len(), 3);
+    }
+
+    #[test]
+    fn backspace_on_an_empty_needle_does_nothing() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+
+        screen.on_key(key(KeyCode::Backspace));
+
+        assert_eq!(screen.filter.search, "");
+        assert!(screen.searching);
+    }
+
+    #[test]
+    fn enter_leaves_the_search_field_and_keeps_what_was_typed() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "beta");
+
+        screen.on_key(key(KeyCode::Enter));
+
+        assert!(!screen.searching);
+        assert_eq!(screen.filter.search, "beta");
+        assert_eq!(visible_addresses(&screen), ["quiet@beta.example.org"]);
+    }
+
+    #[test]
+    fn esc_in_the_search_field_clears_the_needle_rather_than_leaving_the_screen() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "beta");
+
+        let nav = screen.on_key(key(KeyCode::Esc));
+
+        assert_eq!(nav_name(&nav), "stay", "the screen stays open");
+        assert!(!screen.searching);
+        assert_eq!(screen.filter.search, "");
+        assert_eq!(visible_addresses(&screen).len(), 3);
+    }
+
+    #[test]
+    fn a_search_matches_the_list_id_as_well_as_the_address() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "deals.gamma");
+
+        assert_eq!(visible_addresses(&screen), ["gone@gamma.example.net"]);
+    }
+
+    #[test]
+    fn a_needle_that_matches_nothing_leaves_no_row_selected() {
+        let mut screen = listing();
+        screen.on_key(key(KeyCode::Char('/')));
+        typed(&mut screen, "nobody");
+
+        assert!(screen.visible.is_empty());
+        assert!(screen.selected().is_none(), "and nothing can be opened");
+    }
+
+    // -- the timeline --------------------------------------------------------
+
+    fn resumption(id: &str, attempt_id: &str, at: i64) -> Resumption {
+        Resumption {
+            id: id.to_string(),
+            account: "user@example.com".to_string(),
+            sender_email: "bad@acme.example.com".to_string(),
+            list_id: None,
+            attempt_id: attempt_id.to_string(),
+            observed_at: at,
+            last_seen: at - DAY,
+            email_count: 3,
+        }
+    }
+
+    fn detail_of(timeline: Vec<TimelineEvent>) -> DetailScreen {
+        DetailScreen::new(SenderHistoryView {
+            timeline,
+            ..view("bad@acme.example.com", None, 0)
+        })
+    }
+
+    fn rows_of(detail: &DetailScreen) -> Vec<&str> {
+        detail.rows.iter().map(|row| row.text.as_str()).collect()
+    }
+
+    #[test]
+    fn an_attempt_contributes_its_summary_and_the_url_it_aimed_at() {
+        let detail = detail_of(vec![TimelineEvent::Attempt(attempt(
+            "a1",
+            "bad@acme.example.com",
+            T0 - 30 * DAY,
+            None,
+        ))]);
+
+        assert_eq!(detail.rows.len(), 2);
+        assert!(rows_of(&detail)[1].contains("https://acme.example.com/unsub"));
+    }
+
+    #[test]
+    fn an_escalation_names_the_attempt_it_answers() {
+        let detail = detail_of(vec![
+            TimelineEvent::Attempt(attempt("a1", "bad@acme.example.com", T0 - 100 * DAY, None)),
+            TimelineEvent::Attempt(attempt(
+                "a2",
+                "bad@acme.example.com",
+                T0 - 30 * DAY,
+                Some("a1"),
+            )),
+        ]);
+
+        let follows: Vec<&str> = rows_of(&detail)
+            .into_iter()
+            .filter(|row| row.contains("follows the"))
+            .collect();
+        assert_eq!(follows.len(), 1, "one link, on the escalated attempt");
+        assert!(
+            follows[0].contains(UnsubscribeMethod::OneClickPost.label()),
+            "{}",
+            follows[0]
+        );
+    }
+
+    #[test]
+    fn an_escalation_pointing_at_an_attempt_outside_the_timeline_adds_no_link() {
+        // The referenced attempt belongs to another sender's group, so there
+        // is nothing to name and a dangling line would be worse than none.
+        let detail = detail_of(vec![TimelineEvent::Attempt(attempt(
+            "a2",
+            "bad@acme.example.com",
+            T0 - 30 * DAY,
+            Some("somewhere-else"),
+        ))]);
+
+        assert!(!rows_of(&detail).iter().any(|row| row.contains("follows the")));
+    }
+
+    #[test]
+    fn a_resumption_contributes_exactly_one_row() {
+        let detail = detail_of(vec![TimelineEvent::Resumption(resumption(
+            "r1",
+            "a1",
+            T0 - 20 * DAY,
+        ))]);
+
+        assert_eq!(detail.rows.len(), 1);
+        assert!(rows_of(&detail)[0].contains("kept mailing"));
+    }
+
+    #[test]
+    fn the_timeline_cursor_stops_at_both_ends() {
+        let mut detail = detail_of(vec![
+            TimelineEvent::Attempt(attempt("a1", "bad@acme.example.com", T0 - 100 * DAY, None)),
+            TimelineEvent::Resumption(resumption("r1", "a1", T0 - 60 * DAY)),
+        ]);
+        let last = detail.rows.len() - 1;
+
+        for _ in 0..10 {
+            detail.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(detail.cursor, last);
+
+        for _ in 0..10 {
+            detail.on_key(key(KeyCode::Up));
+        }
+        assert_eq!(detail.cursor, 0);
+    }
+
+    #[test]
+    fn an_empty_timeline_does_not_panic() {
+        let mut detail = detail_of(Vec::new());
+
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('G'), KeyCode::PageDown] {
+            detail.on_key(key(code));
+            assert_eq!(detail.cursor, 0);
+        }
+    }
+
+    // -- acting from the timeline -------------------------------------------
+
+    #[test]
+    fn a_resumed_sender_in_the_current_scan_can_be_escalated_from_its_timeline() {
+        let mut detail = DetailScreen::new(resumed_and_scanned("bad@acme.example.com"));
+
+        assert!(detail.is_actionable());
+        assert_eq!(
+            nav_name(&detail.on_key(key(KeyCode::Char('u')))),
+            "run from history"
+        );
+        assert!(detail.hints().contains("unsubscribe again"));
+    }
+
+    #[test]
+    fn a_sender_that_never_resumed_offers_no_second_attempt() {
+        let mut detail = DetailScreen::new(SenderHistoryView {
+            outcome: Some(UnsubscribeOutcome::NoNewMail),
+            next_step: Some(NextStep::FirstAttempt),
+            ..view("quiet@beta.example.org", None, 0)
+        });
+
+        assert!(!detail.is_actionable());
+        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('u')))), "stay");
+        assert!(!detail.hints().contains("unsubscribe again"));
+    }
+
+    #[test]
+    fn a_resumed_sender_absent_from_the_scan_offers_no_second_attempt() {
+        // There is no mail to act on and no rung to climb to.
+        let mut detail = DetailScreen::new(SenderHistoryView {
+            outcome: Some(UnsubscribeOutcome::Resumed { days_after: 20 }),
+            next_step: None,
+            ..view("bad@acme.example.com", None, 1)
+        });
+
+        assert!(!detail.is_actionable());
+        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('u')))), "stay");
+    }
+
+    #[test]
+    fn a_timeline_names_the_sender_the_way_the_cache_would() {
+        let detail = DetailScreen::new(view("bad@acme.example.com", Some("news.acme"), 0));
+
+        assert_eq!(detail.sender(), ("bad@acme.example.com", Some("news.acme")));
+    }
+
+    #[test]
+    fn esc_and_q_leave_a_timeline() {
+        let mut detail = DetailScreen::new(view("bad@acme.example.com", None, 0));
+
+        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Esc))), "pop");
+        assert_eq!(nav_name(&detail.on_key(key(KeyCode::Char('q')))), "pop");
+    }
+
+    // -- wording -------------------------------------------------------------
+
+    #[test]
+    fn a_sender_absent_from_the_scan_is_not_called_honoured() {
+        let label = outcome_label(&view("gone@acme.example.com", None, 0));
+
+        assert_eq!(label, "not in the last scan");
+    }
+
+    #[test]
+    fn a_resumed_sender_is_labelled_with_what_would_be_tried_next() {
+        let label = outcome_label(&resumed_and_scanned("bad@acme.example.com"));
+
+        assert!(label.contains("resumed 20d after"), "{label}");
+        assert!(label.contains(&NextStep::FirstAttempt.label()), "{label}");
+    }
+
+    #[test]
+    fn a_resumed_sender_with_nothing_left_to_try_says_exhausted() {
+        let label = outcome_label(&SenderHistoryView {
+            next_step: Some(NextStep::Exhausted),
+            ..resumed_and_scanned("bad@acme.example.com")
+        });
+
+        assert!(label.contains("exhausted"), "{label}");
+    }
+
+    #[test]
+    fn a_sender_that_stopped_mailing_is_labelled_without_a_next_step() {
+        let label = outcome_label(&SenderHistoryView {
+            outcome: Some(UnsubscribeOutcome::NoNewMail),
+            next_step: Some(NextStep::FirstAttempt),
+            ..view("quiet@beta.example.org", None, 0)
+        });
+
+        assert_eq!(label, "no new mail", "nothing is owed, so nothing is offered");
+    }
+
+    #[test]
+    fn a_method_id_this_build_does_not_know_is_shown_as_itself() {
+        assert_eq!(method_label("some_future_method"), "some_future_method");
+        assert_eq!(
+            method_label(UnsubscribeMethod::OneClickPost.as_id()),
+            UnsubscribeMethod::OneClickPost.label()
+        );
+    }
+}

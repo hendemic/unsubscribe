@@ -470,3 +470,315 @@ fn truncate(s: &str, max: usize) -> String {
         None => s.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc;
+    use unsubscribe_core::{
+        Folder, FolderMessage, MessageId, NextStep, PlannedSender, RunOutcome, SenderInfo,
+    };
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// What a `Nav` is, for asserting on without a shell.
+    fn nav_name(nav: &Nav) -> &'static str {
+        match nav {
+            Nav::Stay => "stay",
+            Nav::Push(_) => "push",
+            Nav::Pop => "pop",
+            Nav::Quit => "quit",
+            Nav::Effect(Effect::RunEnded) => "run ended",
+            Nav::Effect(Effect::ConfirmCancelRun) => "confirm cancel",
+            Nav::Effect(_) => "other effect",
+        }
+    }
+
+    fn sender(email: &str, messages: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/unsub".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: true,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: messages,
+            messages: (0..messages)
+                .map(|i| FolderMessage {
+                    folder: Folder::new("INBOX"),
+                    message_id: MessageId::new(format!("INBOX:{email}:{i}")),
+                })
+                .collect(),
+            last_seen: None,
+        }
+    }
+
+    /// A screen with `attempts` sender rows already in its shared log.
+    fn screen_with(attempts: usize) -> (RunScreen, Arc<RunShared>, mpsc::Sender<RunResult>) {
+        let shared = RunShared::new();
+        for i in 0..attempts {
+            shared.push(RunEvent::Sender {
+                email: format!("s{i}@acme.example.com"),
+                success: true,
+                method: "one-click POST".to_string(),
+                detail: "HTTP 200".to_string(),
+                escalation: None,
+            });
+        }
+        // Rows the cursor must not be able to land on.
+        shared.push(RunEvent::Archiving {
+            messages: 6,
+            emails: 2,
+        });
+        let (tx, rx) = mpsc::channel();
+        let screen = RunScreen::new(Arc::clone(&shared), rx, PlanCounts::default(), false);
+        (screen, shared, tx)
+    }
+
+    fn finished(result: RunResult) -> RunScreen {
+        let (mut screen, _shared, tx) = screen_with(2);
+        tx.send(result).expect("the screen is listening");
+        screen.tick();
+        screen
+    }
+
+    // -- ending --------------------------------------------------------------
+
+    #[test]
+    fn a_run_that_has_not_reported_yet_asks_the_shell_for_nothing() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+
+        assert_eq!(nav_name(&screen.tick()), "stay");
+        assert_eq!(screen.state, RunState::Running);
+    }
+
+    #[test]
+    fn a_finished_run_tells_the_shell_to_refresh_what_changed() {
+        let (mut screen, _shared, tx) = screen_with(2);
+        tx.send(RunResult::Done(Box::default()))
+            .expect("listening");
+
+        assert_eq!(nav_name(&screen.tick()), "run ended");
+        assert_eq!(screen.state, RunState::Finished);
+        assert_eq!(screen.failure(), None, "a clean finish is not a failure");
+    }
+
+    #[test]
+    fn the_ending_is_announced_once_however_many_frames_are_drawn() {
+        let (mut screen, _shared, tx) = screen_with(1);
+        tx.send(RunResult::Done(Box::default()))
+            .expect("listening");
+
+        assert_eq!(nav_name(&screen.tick()), "run ended");
+        assert_eq!(nav_name(&screen.tick()), "stay");
+    }
+
+    #[test]
+    fn an_archive_that_failed_is_surfaced_as_a_failure_the_shell_can_show() {
+        let screen = finished(RunResult::Failed("mailbox refused the move".to_string()));
+
+        assert_eq!(screen.failure(), Some("mailbox refused the move"));
+    }
+
+    #[test]
+    fn a_worker_that_dies_without_reporting_becomes_a_failure_rather_than_a_hang() {
+        let (mut screen, _shared, tx) = screen_with(1);
+        drop(tx);
+
+        assert_eq!(nav_name(&screen.tick()), "run ended");
+        assert!(screen.failure().is_some());
+    }
+
+    // -- cancelling ----------------------------------------------------------
+
+    #[test]
+    fn esc_while_running_asks_before_stopping() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "confirm cancel");
+        assert_eq!(
+            nav_name(&screen.on_key(key(KeyCode::Char('q')))),
+            "confirm cancel"
+        );
+    }
+
+    #[test]
+    fn cancelling_raises_the_flag_the_pipeline_polls_between_senders() {
+        let (mut screen, shared, _tx) = screen_with(1);
+
+        screen.request_cancel();
+
+        assert!(shared.cancel_requested());
+        assert_eq!(screen.state, RunState::Cancelling);
+    }
+
+    #[test]
+    fn asking_to_stop_a_second_time_changes_nothing() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        screen.request_cancel();
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "stay");
+        assert_eq!(screen.state, RunState::Cancelling);
+    }
+
+    #[test]
+    fn the_footer_says_the_run_is_stopping_after_the_current_sender() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        assert!(screen.hints().contains("cancel"));
+
+        screen.request_cancel();
+
+        assert!(
+            screen.hints().contains("stopping after the current sender"),
+            "got {:?}",
+            screen.hints()
+        );
+    }
+
+    #[test]
+    fn the_attempts_already_made_are_still_on_screen_after_cancelling() {
+        let (mut screen, _shared, tx) = screen_with(2);
+        screen.request_cancel();
+        tx.send(RunResult::Done(Box::new(RunOutcome {
+            results: Vec::new(),
+            archived: 4,
+            cancelled: true,
+        })))
+        .expect("listening");
+        screen.tick();
+
+        assert_eq!(
+            screen.attempts().len(),
+            2,
+            "a cancelled run keeps the senders it did attempt"
+        );
+    }
+
+    // -- leaving -------------------------------------------------------------
+
+    #[test]
+    fn esc_after_the_run_finished_goes_back_to_home() {
+        let mut screen = finished(RunResult::Done(Box::default()));
+
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+    }
+
+    // -- the attempt list ----------------------------------------------------
+
+    #[test]
+    fn the_cursor_moves_only_over_the_sender_rows() {
+        // The log also holds archive rows; they are not attempts and the
+        // cursor must not reach them.
+        let (mut screen, _shared, _tx) = screen_with(3);
+
+        for _ in 0..10 {
+            screen.on_key(key(KeyCode::Down));
+        }
+
+        assert_eq!(screen.cursor, 2, "three attempts, so the last index is 2");
+    }
+
+    #[test]
+    fn moving_up_stops_at_the_first_attempt() {
+        let (mut screen, _shared, _tx) = screen_with(3);
+        screen.on_key(key(KeyCode::Char('G')));
+
+        for _ in 0..10 {
+            screen.on_key(key(KeyCode::Char('k')));
+        }
+
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_to_the_first_and_last_attempt() {
+        let (mut screen, _shared, _tx) = screen_with(4);
+
+        screen.on_key(key(KeyCode::End));
+        assert_eq!(screen.cursor, 3);
+        screen.on_key(key(KeyCode::Home));
+        assert_eq!(screen.cursor, 0);
+    }
+
+    #[test]
+    fn navigating_a_run_with_no_attempts_yet_does_not_panic() {
+        let shared = RunShared::new();
+        let (_tx, rx) = mpsc::channel();
+        let mut screen = RunScreen::new(shared, rx, PlanCounts::default(), false);
+
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('G'), KeyCode::Char('g')] {
+            screen.on_key(key(code));
+            assert_eq!(screen.cursor, 0);
+        }
+    }
+
+    // -- the detail overlay --------------------------------------------------
+
+    #[test]
+    fn an_attempt_can_only_be_inspected_once_the_run_has_finished() {
+        let (mut screen, _shared, _tx) = screen_with(2);
+
+        screen.on_key(key(KeyCode::Enter));
+
+        assert_eq!(screen.detail, None, "the list is still moving");
+    }
+
+    #[test]
+    fn enter_inspects_the_highlighted_attempt_and_any_key_closes_it() {
+        let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_key(key(KeyCode::Down));
+
+        screen.on_key(key(KeyCode::Enter));
+        assert_eq!(screen.detail, Some(1));
+
+        screen.on_key(key(KeyCode::Char('z')));
+        assert_eq!(screen.detail, None);
+    }
+
+    #[test]
+    fn a_key_that_closes_the_detail_does_not_also_leave_the_screen() {
+        let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            nav_name(&screen.on_key(key(KeyCode::Esc))),
+            "stay",
+            "Esc closes the overlay; leaving takes a second press"
+        );
+        assert_eq!(nav_name(&screen.on_key(key(KeyCode::Esc))), "pop");
+    }
+
+    // -- plan counts ---------------------------------------------------------
+
+    #[test]
+    fn the_counts_the_screen_keeps_are_the_plans_own() {
+        let plan = RunPlan {
+            to_unsubscribe: vec![PlannedSender {
+                sender: sender("one@acme.example.com", 2),
+                step: NextStep::FirstAttempt,
+            }],
+            archive_only: vec![sender("stale@acme.example.com", 4)],
+            exhausted: vec![sender("spent@acme.example.com", 1)],
+        };
+
+        let counts = PlanCounts::of(&plan);
+
+        assert_eq!(counts.to_unsubscribe, 1);
+        assert_eq!(counts.archive_only, 1);
+        assert_eq!(counts.exhausted, 1);
+        assert_eq!(counts.exhausted_senders, ["spent@acme.example.com"]);
+    }
+
+    #[test]
+    fn an_empty_plan_names_no_exhausted_senders() {
+        let counts = PlanCounts::of(&RunPlan::default());
+
+        assert_eq!(counts.to_unsubscribe, 0);
+        assert!(counts.exhausted_senders.is_empty());
+    }
+}
