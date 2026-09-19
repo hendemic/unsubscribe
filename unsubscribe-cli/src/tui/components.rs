@@ -19,26 +19,58 @@ const KEY_COLUMN: usize = 15;
 /// How long a transient status message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(4);
 
-/// An action row the cursor can land on, drawn the way Settings draws its
-/// `[ Re-authenticate ]` row so a button looks the same everywhere.
+/// An action row in the working area: a label, and whether pressing it would
+/// do anything.
 ///
-/// Whether it has the cursor is the screen's business, not this function's:
-/// the row is part of the screen's state so `Enter` can act on it.
+/// Part of a screen's state rather than something the renderer invents --
+/// `Enter` acts on it, so the key handler has to be able to see it. A
+/// disabled button still shows: a scan that is stopping says so where the
+/// button was, rather than leaving a hole the eye has to account for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Button {
+    pub label: &'static str,
+    pub enabled: bool,
+}
+
+impl Button {
+    #[must_use]
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            enabled: true,
+        }
+    }
+
+    /// A row that says what is happening and answers nothing.
+    #[must_use]
+    pub fn inert(label: &'static str) -> Self {
+        Self {
+            label,
+            enabled: false,
+        }
+    }
+}
+
+/// One action row, drawn the way Settings draws its `[ Re-authenticate ]`
+/// row so a button looks the same everywhere.
+///
+/// A disabled row is never drawn as focused, whatever the cursor is doing:
+/// highlighting something that will not answer `Enter` is a lie.
 #[must_use]
-pub fn button_line(label: &str, focused: bool) -> Line<'static> {
-    let style = if focused {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    } else {
-        Style::default().fg(Color::Cyan)
+pub fn button_line(button: Button, focused: bool) -> Line<'static> {
+    let style = match (button.enabled, focused) {
+        (false, _) => Style::default().fg(Color::DarkGray),
+        (true, true) => Style::default().bg(Color::DarkGray).fg(Color::White),
+        (true, false) => Style::default().fg(Color::Cyan),
     };
-    Line::styled(format!("   [ {label} ]"), style)
+    Line::styled(format!("   [ {} ]", button.label), style)
 }
 
 /// The same row as its own widget, for a screen that gives it a line of the
 /// layout rather than a row of a list.
 #[must_use]
-pub fn button(label: &str, focused: bool) -> Paragraph<'static> {
-    Paragraph::new(button_line(label, focused))
+pub fn button(button: Button, focused: bool) -> Paragraph<'static> {
+    Paragraph::new(button_line(button, focused))
 }
 
 /// A modal question or notice, drawn over whatever screen is beneath it.
@@ -327,6 +359,51 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // -- action rows ---------------------------------------------------------
+
+    fn rendered(button: Button, focused: bool) -> String {
+        button_line(button, focused)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn every_button_is_written_the_way_settings_writes_its_own() {
+        assert_eq!(
+            rendered(Button::new("Cancel scan"), false),
+            "   [ Cancel scan ]"
+        );
+        assert_eq!(
+            rendered(Button::inert("Cancelling\u{2026}"), false),
+            "   [ Cancelling\u{2026} ]"
+        );
+    }
+
+    #[test]
+    fn a_button_with_the_cursor_is_highlighted_and_one_without_is_not() {
+        let focused = button_line(Button::new("Close"), true);
+        let idle = button_line(Button::new("Close"), false);
+
+        assert_ne!(focused.style, idle.style);
+        assert_eq!(focused.style.bg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn an_inert_button_is_never_drawn_as_focused_however_it_is_asked_for() {
+        // Highlighting a row that will not answer Enter would promise
+        // something the screen cannot deliver.
+        let button = Button::inert("Stopping\u{2026}");
+
+        assert_eq!(
+            button_line(button, true).style,
+            button_line(button, false).style
+        );
+        assert_eq!(button_line(button, true).style.bg, None);
+        assert!(!button.enabled);
     }
 
     fn confirm() -> Dialog {

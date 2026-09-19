@@ -81,7 +81,9 @@ selection ]`, `[ Close ]` — so the hotkey is a shortcut, never the only way.
 On the scan and the run it already has the cursor; on the sender selection it
 sits below the last sender, reached with `End`/`G` or by pressing down past
 the bottom, and `Enter` on a sender row still means "go with what I have
-ticked". Quitting
+ticked". While a scan or run is stopping the row stays where it is and reads
+as inert — `[ Cancelling… ]`, `[ Stopping… ]` — rather than disappearing.
+Quitting
 while a scan or a run is going asks too, then stops the worker cleanly — an
 attempt in flight is always finished first.
 
