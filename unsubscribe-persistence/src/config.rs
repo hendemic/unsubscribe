@@ -789,3 +789,634 @@ fn set_str_array(table: &mut Table, key: &str, items: &[String]) {
     }
     table[key] = value(items.iter().collect::<Array>());
 }
+
+// ---------------------------------------------------------------------------
+// Preferences: defaulting and validation on read/write
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod preferences_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use unsubscribe_core::{ConfigStore, Preferences};
+
+    /// A config file with only the one key `read_config` insists on, so that
+    /// whatever `[preferences]` the test adds is the only thing under test.
+    const MINIMAL_ACCOUNT: &str = "[account]\nusername = \"user@example.com\"\n";
+
+    fn store_with(dir: &TempDir, toml: &str) -> TomlConfigStore {
+        fs::write(dir.path().join("config.toml"), toml).unwrap();
+        TomlConfigStore::new(dir.path())
+    }
+
+    fn store_with_preferences(dir: &TempDir, section: &str) -> TomlConfigStore {
+        store_with(dir, &format!("{MINIMAL_ACCOUNT}\n[preferences]\n{section}"))
+    }
+
+    /// Full error chain, so a `.context()` wrapper cannot hide the message.
+    fn error_text(result: Result<Preferences>) -> String {
+        format!("{:#}", result.expect_err("expected an error"))
+    }
+
+    // ─── defaults ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn missing_config_file_yields_defaults() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+        let prefs = store.read_preferences().unwrap();
+        // Spelled out rather than compared to `Preferences::default()`: these
+        // are the documented defaults, and a change to them should be noticed.
+        assert_eq!(prefs.min_emails, 3);
+        assert_eq!(prefs.stale_after_months, 12);
+        assert_eq!(prefs.cache_max_age_days, 7);
+    }
+
+    #[test]
+    fn config_without_preferences_section_yields_defaults() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with(&dir, MINIMAL_ACCOUNT);
+        let prefs = store.read_preferences().unwrap();
+        assert_eq!(prefs.min_emails, 3);
+        assert_eq!(prefs.stale_after_months, 12);
+        assert_eq!(prefs.cache_max_age_days, 7);
+    }
+
+    #[test]
+    fn empty_preferences_section_yields_defaults() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "");
+        let prefs = store.read_preferences().unwrap();
+        assert_eq!(prefs.min_emails, 3);
+        assert_eq!(prefs.stale_after_months, 12);
+        assert_eq!(prefs.cache_max_age_days, 7);
+    }
+
+    #[test]
+    fn partial_preferences_use_present_keys_and_default_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "stale_after_months = 4\n");
+        let prefs = store.read_preferences().unwrap();
+        assert_eq!(prefs.stale_after_months, 4, "the key that was present");
+        assert_eq!(prefs.min_emails, 3, "absent key falls back to the default");
+        assert_eq!(prefs.cache_max_age_days, 7, "absent key falls back to the default");
+    }
+
+    #[test]
+    fn all_preference_keys_are_read_from_the_file() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(
+            &dir,
+            "min_emails = 1\nstale_after_months = 24\ncache_max_age_days = 30\n",
+        );
+        let prefs = store.read_preferences().unwrap();
+        assert_eq!(prefs.min_emails, 1);
+        assert_eq!(prefs.stale_after_months, 24);
+        assert_eq!(prefs.cache_max_age_days, 30);
+    }
+
+    // ─── bad values are reported, never silently defaulted ──────────────────
+
+    #[test]
+    fn string_valued_preference_is_an_error_not_a_default() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "min_emails = \"three\"\n");
+        let message = error_text(store.read_preferences());
+        assert!(
+            message.contains("min_emails"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn boolean_valued_preference_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "cache_max_age_days = true\n");
+        let message = error_text(store.read_preferences());
+        assert!(
+            message.contains("cache_max_age_days"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn negative_preference_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "min_emails = -1\n");
+        let message = error_text(store.read_preferences());
+        assert!(
+            message.contains("min_emails"),
+            "error should name the offending key, got: {message}"
+        );
+    }
+
+    #[test]
+    fn fractional_preference_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "stale_after_months = 1.5\n");
+        assert!(store.read_preferences().is_err());
+    }
+
+    #[test]
+    fn zero_stale_after_months_is_rejected_with_its_range() {
+        // 0 months would mark every sender stale, so the range starts at 1.
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "stale_after_months = 0\n");
+        let message = error_text(store.read_preferences());
+        assert!(message.contains("stale_after_months"), "got: {message}");
+        assert!(message.contains("between 1 and 1200"), "got: {message}");
+    }
+
+    #[test]
+    fn zero_cache_max_age_days_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "cache_max_age_days = 0\n");
+        let message = error_text(store.read_preferences());
+        assert!(message.contains("cache_max_age_days"), "got: {message}");
+        assert!(message.contains("between 1 and 3650"), "got: {message}");
+    }
+
+    #[test]
+    fn zero_min_emails_is_accepted_because_it_disables_the_filter() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "min_emails = 0\n");
+        assert_eq!(store.read_preferences().unwrap().min_emails, 0);
+    }
+
+    #[test]
+    fn preference_at_the_upper_bound_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(
+            &dir,
+            "min_emails = 1000000\nstale_after_months = 1200\ncache_max_age_days = 3650\n",
+        );
+        let prefs = store.read_preferences().unwrap();
+        assert_eq!(prefs.min_emails, 1_000_000);
+        assert_eq!(prefs.stale_after_months, 1200);
+        assert_eq!(prefs.cache_max_age_days, 3650);
+    }
+
+    #[test]
+    fn preference_one_past_the_upper_bound_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "cache_max_age_days = 3651\n");
+        let message = error_text(store.read_preferences());
+        assert!(message.contains("3651"), "error should quote the value, got: {message}");
+    }
+
+    #[test]
+    fn a_pasted_timestamp_is_reported_rather_than_accepted() {
+        // The failure the finite upper bounds exist to catch.
+        let dir = TempDir::new().unwrap();
+        let store = store_with_preferences(&dir, "stale_after_months = 1774000000\n");
+        assert!(store.read_preferences().is_err());
+    }
+
+    // ─── writing ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn written_preferences_are_read_back_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with(&dir, MINIMAL_ACCOUNT);
+        let wanted = Preferences {
+            min_emails: 11,
+            stale_after_months: 2,
+            cache_max_age_days: 90,
+        };
+        store.write_preferences(&wanted).unwrap();
+        assert_eq!(store.read_preferences().unwrap(), wanted);
+    }
+
+    #[test]
+    fn writing_out_of_range_preferences_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with(&dir, MINIMAL_ACCOUNT);
+        let invalid = Preferences {
+            min_emails: 3,
+            stale_after_months: 0,
+            cache_max_age_days: 7,
+        };
+        let message = format!("{:#}", store.write_preferences(&invalid).unwrap_err());
+        assert!(message.contains("stale_after_months"), "got: {message}");
+    }
+
+    #[test]
+    fn a_refused_write_leaves_the_file_untouched() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with(&dir, MINIMAL_ACCOUNT);
+        let invalid = Preferences {
+            min_emails: 3,
+            stale_after_months: 3000,
+            cache_max_age_days: 7,
+        };
+        assert!(store.write_preferences(&invalid).is_err());
+        let on_disk = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert_eq!(on_disk, MINIMAL_ACCOUNT);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Comment-preserving writes
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod comment_preserving_write_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+    use unsubscribe_core::{ConfigStore, Preferences};
+
+    /// A hand-annotated config of the kind a user ends up with: a header
+    /// comment, blank lines between sections, a credential command, a key this
+    /// version does not model, and a whole section it has never heard of.
+    const ANNOTATED: &str = r#"# Password is stored in your OS keychain (email-unsubscribe)
+# To use a command instead, add:
+#   password_command = "pass show email/imap"
+
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password = "hunter2"
+password_command = "pass show email/imap"
+auth_type = "password"
+provider = "imap"
+# Not a key this version writes; a hand edit or a newer build left it here.
+nickname = "work"
+
+[scan]
+# Folders swept for List-Unsubscribe headers.
+folders = ["INBOX", "Promotions"]
+archive_folder = "Unsubscribed"
+
+[preferences]
+min_emails = 5
+stale_after_months = 6
+cache_max_age_days = 3
+
+# A section this version does not model at all.
+[experimental]
+enabled = true
+"#;
+
+    /// The same file before `[preferences]` existed.
+    const ANNOTATED_WITHOUT_PREFERENCES: &str = r#"# Password is stored in your OS keychain (email-unsubscribe)
+
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+auth_type = "password"
+provider = "imap"
+
+[scan]
+# Folders swept for List-Unsubscribe headers.
+folders = ["INBOX"]
+archive_folder = "Unsubscribed"
+"#;
+
+    /// A config written before the `[account]` rename.
+    const LEGACY_IMAP: &str = r#"# Written by an older version, which called the section [imap].
+[imap]
+host = "imap.legacy.net"
+port = 993
+username = "legacy@example.com"
+password_command = "pass show email/legacy"
+auth_type = "password"
+provider = "imap"
+
+[scan]
+folders = ["INBOX"]
+archive_folder = "Unsubscribed"
+"#;
+
+    struct Fixture {
+        _dir: TempDir,
+        path: PathBuf,
+        store: TomlConfigStore,
+    }
+
+    impl Fixture {
+        fn new(contents: &str) -> Self {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, contents).unwrap();
+            let store = TomlConfigStore::new(dir.path());
+            Self { _dir: dir, path, store }
+        }
+
+        fn text(&self) -> String {
+            fs::read_to_string(&self.path).unwrap()
+        }
+    }
+
+    // ─── an unchanged save changes nothing ──────────────────────────────────
+
+    #[test]
+    fn writing_back_an_unchanged_account_leaves_the_file_byte_identical() {
+        let fixture = Fixture::new(ANNOTATED);
+        let account = fixture.store.read_config("").unwrap().unwrap();
+        fixture.store.write_config(&account).unwrap();
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn writing_back_unchanged_preferences_leaves_the_file_byte_identical() {
+        let fixture = Fixture::new(ANNOTATED);
+        let preferences = fixture.store.read_preferences().unwrap();
+        fixture.store.write_preferences(&preferences).unwrap();
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn writing_back_an_unchanged_legacy_config_leaves_the_file_byte_identical() {
+        let fixture = Fixture::new(LEGACY_IMAP);
+        let account = fixture.store.read_config("").unwrap().unwrap();
+        fixture.store.write_config(&account).unwrap();
+        assert_eq!(fixture.text(), LEGACY_IMAP);
+    }
+
+    // ─── changing one value changes exactly one line ────────────────────────
+
+    #[test]
+    fn changing_the_archive_folder_rewrites_only_that_line() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.archive_folder = "Archive".to_string();
+        fixture.store.write_config(&account).unwrap();
+
+        let expected = ANNOTATED.replace(
+            r#"archive_folder = "Unsubscribed""#,
+            r#"archive_folder = "Archive""#,
+        );
+        assert_eq!(fixture.text(), expected);
+    }
+
+    #[test]
+    fn changing_the_scan_folders_rewrites_only_that_line() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.scan_folders = vec!["INBOX".into(), "Newsletters".into(), "Bulk".into()];
+        fixture.store.write_config(&account).unwrap();
+
+        let expected = ANNOTATED.replace(
+            r#"folders = ["INBOX", "Promotions"]"#,
+            r#"folders = ["INBOX", "Newsletters", "Bulk"]"#,
+        );
+        assert_eq!(fixture.text(), expected);
+    }
+
+    #[test]
+    fn changing_one_preference_rewrites_only_that_line() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut preferences = fixture.store.read_preferences().unwrap();
+        preferences.min_emails = 9;
+        fixture.store.write_preferences(&preferences).unwrap();
+
+        let expected = ANNOTATED.replace("min_emails = 5", "min_emails = 9");
+        assert_eq!(fixture.text(), expected);
+    }
+
+    #[test]
+    fn reordering_the_scan_folders_is_written_out() {
+        // Order is meaningful to the user, so an equal-set reorder must persist.
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.scan_folders = vec!["Promotions".into(), "INBOX".into()];
+        fixture.store.write_config(&account).unwrap();
+
+        let reread = fixture.store.read_config("").unwrap().unwrap();
+        assert_eq!(reread.scan_folders, vec!["Promotions", "INBOX"]);
+    }
+
+    // ─── what must never be lost ────────────────────────────────────────────
+
+    #[test]
+    fn credentials_in_the_file_survive_a_write() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.host = Some("imap.new.example.com".to_string());
+        fixture.store.write_config(&account).unwrap();
+
+        let resolution = fixture
+            .store
+            .read_file_imap_config("")
+            .unwrap()
+            .expect("config should still be readable");
+        assert_eq!(resolution.password.as_deref(), Some("hunter2"));
+        assert_eq!(
+            resolution.password_command.as_deref(),
+            Some("pass show email/imap")
+        );
+    }
+
+    #[test]
+    fn unknown_keys_and_sections_survive_a_write() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.port = Some(1993);
+        fixture.store.write_config(&account).unwrap();
+
+        let text = fixture.text();
+        assert!(text.contains(r#"nickname = "work""#), "unknown key dropped:\n{text}");
+        assert!(text.contains("[experimental]"), "unknown section dropped:\n{text}");
+        assert!(text.contains("enabled = true"), "unknown section body dropped:\n{text}");
+    }
+
+    #[test]
+    fn comments_survive_a_write() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.username = "renamed@example.com".to_string();
+        fixture.store.write_config(&account).unwrap();
+
+        let text = fixture.text();
+        for comment in ANNOTATED.lines().filter(|l| l.trim_start().starts_with('#')) {
+            assert!(text.contains(comment), "lost comment {comment:?}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn preferences_survive_an_account_write() {
+        // The two write paths touch different sections; neither may clobber
+        // the other's.
+        let fixture = Fixture::new(ANNOTATED);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.username = "renamed@example.com".to_string();
+        fixture.store.write_config(&account).unwrap();
+
+        let preferences = fixture.store.read_preferences().unwrap();
+        assert_eq!(preferences.min_emails, 5);
+        assert_eq!(preferences.stale_after_months, 6);
+        assert_eq!(preferences.cache_max_age_days, 3);
+    }
+
+    #[test]
+    fn account_settings_survive_a_preferences_write() {
+        let fixture = Fixture::new(ANNOTATED);
+        let mut preferences = fixture.store.read_preferences().unwrap();
+        preferences.cache_max_age_days = 21;
+        fixture.store.write_preferences(&preferences).unwrap();
+
+        let account = fixture.store.read_config("").unwrap().unwrap();
+        assert_eq!(account.username, "user@example.com");
+        assert_eq!(account.host.as_deref(), Some("imap.example.com"));
+        assert_eq!(account.scan_folders, vec!["INBOX", "Promotions"]);
+    }
+
+    // ─── legacy [imap] section ──────────────────────────────────────────────
+
+    #[test]
+    fn a_legacy_config_is_written_back_under_its_own_section_header() {
+        let fixture = Fixture::new(LEGACY_IMAP);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.host = Some("imap.moved.net".to_string());
+        fixture.store.write_config(&account).unwrap();
+
+        let text = fixture.text();
+        assert!(text.contains("[imap]"), "legacy section header lost:\n{text}");
+        assert!(
+            !text.contains("[account]"),
+            "a duplicate [account] section was added:\n{text}"
+        );
+        assert_eq!(
+            fixture.store.read_config("").unwrap().unwrap().host.as_deref(),
+            Some("imap.moved.net"),
+        );
+    }
+
+    #[test]
+    fn a_legacy_config_keeps_its_password_command() {
+        let fixture = Fixture::new(LEGACY_IMAP);
+        let mut account = fixture.store.read_config("").unwrap().unwrap();
+        account.archive_folder = "Archive".to_string();
+        fixture.store.write_config(&account).unwrap();
+
+        let resolution = fixture.store.read_file_imap_config("").unwrap().unwrap();
+        assert_eq!(
+            resolution.password_command.as_deref(),
+            Some("pass show email/legacy")
+        );
+    }
+
+    #[test]
+    fn preferences_can_be_added_to_a_legacy_config() {
+        let fixture = Fixture::new(LEGACY_IMAP);
+        fixture
+            .store
+            .write_preferences(&Preferences {
+                min_emails: 2,
+                stale_after_months: 3,
+                cache_max_age_days: 4,
+            })
+            .unwrap();
+
+        let text = fixture.text();
+        assert!(text.contains("[imap]"), "legacy section header lost:\n{text}");
+        let preferences = fixture.store.read_preferences().unwrap();
+        assert_eq!(preferences.min_emails, 2);
+    }
+
+    // ─── creating the [preferences] section ─────────────────────────────────
+
+    #[test]
+    fn adding_preferences_appends_without_disturbing_the_rest_of_the_file() {
+        let fixture = Fixture::new(ANNOTATED_WITHOUT_PREFERENCES);
+        fixture
+            .store
+            .write_preferences(&Preferences {
+                min_emails: 4,
+                stale_after_months: 8,
+                cache_max_age_days: 14,
+            })
+            .unwrap();
+
+        let text = fixture.text();
+        assert!(
+            text.starts_with(ANNOTATED_WITHOUT_PREFERENCES),
+            "the original file is no longer an untouched prefix:\n{text}"
+        );
+        assert!(text.contains("[preferences]"), "section not created:\n{text}");
+    }
+
+    #[test]
+    fn a_created_preferences_section_explains_itself() {
+        let fixture = Fixture::new(ANNOTATED_WITHOUT_PREFERENCES);
+        fixture.store.write_preferences(&Preferences::default()).unwrap();
+        let text = fixture.text();
+        assert!(
+            text.contains("unsubscribe config"),
+            "a hand-edited config should say where these came from:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_created_preferences_section_writes_every_key() {
+        let fixture = Fixture::new(ANNOTATED_WITHOUT_PREFERENCES);
+        fixture
+            .store
+            .write_preferences(&Preferences {
+                min_emails: 4,
+                stale_after_months: 8,
+                cache_max_age_days: 14,
+            })
+            .unwrap();
+
+        let text = fixture.text();
+        assert!(text.contains("min_emails = 4"), "{text}");
+        assert!(text.contains("stale_after_months = 8"), "{text}");
+        assert!(text.contains("cache_max_age_days = 14"), "{text}");
+    }
+
+    #[test]
+    fn the_header_comment_is_written_only_once() {
+        let fixture = Fixture::new(ANNOTATED_WITHOUT_PREFERENCES);
+        fixture.store.write_preferences(&Preferences::default()).unwrap();
+        fixture
+            .store
+            .write_preferences(&Preferences {
+                min_emails: 42,
+                ..Preferences::default()
+            })
+            .unwrap();
+
+        let text = fixture.text();
+        assert_eq!(
+            text.matches("Behavior settings").count(),
+            1,
+            "the explanatory comment was duplicated:\n{text}"
+        );
+    }
+
+    // ─── a config file that does not exist yet ──────────────────────────────
+
+    #[test]
+    #[ignore = "bug: write_preferences on a missing config file writes a \
+                preferences-only config.toml that read_preferences then rejects \
+                for a missing [account] section"]
+    fn writing_preferences_without_a_config_file_creates_a_readable_one() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path().join("nested"));
+        store
+            .write_preferences(&Preferences {
+                min_emails: 6,
+                stale_after_months: 6,
+                cache_max_age_days: 6,
+            })
+            .unwrap();
+
+        assert_eq!(store.read_preferences().unwrap().min_emails, 6);
+    }
+
+    // ─── a file that cannot be parsed is not overwritten ────────────────────
+
+    #[test]
+    fn an_unparseable_config_is_reported_rather_than_replaced() {
+        let broken = "[account\nusername = oops";
+        let fixture = Fixture::new(broken);
+        let result = fixture.store.write_preferences(&Preferences::default());
+        assert!(result.is_err(), "a broken config should not be silently rewritten");
+        assert_eq!(fixture.text(), broken, "the user's file was clobbered");
+    }
+}

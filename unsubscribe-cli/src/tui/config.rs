@@ -1147,3 +1147,955 @@ fn draw_status(f: &mut Frame, area: Rect, app: &SettingsApp) {
         area,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use std::cell::RefCell;
+
+    // ─── fixtures ───────────────────────────────────────────────────────────
+
+    fn imap_account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@example.com".to_string(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.example.com".to_string()),
+            port: Some(993),
+            username: "user@example.com".to_string(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".to_string(), "Promotions".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    fn gmail_account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@gmail.com".to_string(),
+            provider_type: ProviderType::Gmail,
+            host: None,
+            port: None,
+            username: "user@gmail.com".to_string(),
+            auth_type: AuthType::OAuth,
+            scan_folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    /// Deliberately not the defaults, so a field mix-up is visible.
+    fn preferences() -> Preferences {
+        Preferences {
+            min_emails: 5,
+            stale_after_months: 6,
+            cache_max_age_days: 21,
+        }
+    }
+
+    fn app() -> SettingsApp {
+        SettingsApp::new(&imap_account(), &preferences(), "OS keychain".to_string())
+    }
+
+    /// Records what the screen asked to have saved, and can be told to fail.
+    struct FakeIo {
+        saved: RefCell<Vec<(AccountConfig, Preferences)>>,
+        fails: bool,
+        folders: Vec<String>,
+    }
+
+    impl FakeIo {
+        fn new() -> Self {
+            Self {
+                saved: RefCell::new(Vec::new()),
+                fails: false,
+                folders: Vec::new(),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fails: true,
+                ..Self::new()
+            }
+        }
+    }
+
+    impl SettingsIo for FakeIo {
+        fn save(&self, account: &AccountConfig, preferences: &Preferences) -> Result<()> {
+            if self.fails {
+                return Err(anyhow::anyhow!("the disk is full"));
+            }
+            self.saved.borrow_mut().push((account.clone(), *preferences));
+            Ok(())
+        }
+
+        fn list_folders(&self) -> Result<Vec<String>> {
+            Ok(self.folders.clone())
+        }
+
+        fn reauthenticate(&self) -> Result<(AccountConfig, Preferences)> {
+            Ok((imap_account(), preferences()))
+        }
+
+        fn credential_location(&self) -> String {
+            "OS keychain".to_string()
+        }
+    }
+
+    // ─── driving the screen ─────────────────────────────────────────────────
+
+    fn press(app: &mut SettingsApp, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_chars(app: &mut SettingsApp, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn row_index(app: &SettingsApp, row: Row) -> usize {
+        app.rows
+            .iter()
+            .position(|r| *r == row)
+            .unwrap_or_else(|| panic!("{row:?} is not on the screen"))
+    }
+
+    /// Put the cursor on a row directly, so a navigation bug cannot make an
+    /// editing or validation test fail for the wrong reason.
+    fn focus(app: &mut SettingsApp, field: Field) {
+        app.cursor = row_index(app, Row::Setting(field));
+    }
+
+    /// Open a text field's editor, replace its contents, and accept.
+    fn edit(app: &mut SettingsApp, field: Field, text: &str) {
+        focus(app, field);
+        press(app, KeyCode::Enter);
+        assert!(is_editing(app), "{field:?} did not open an editor");
+        for _ in 0..app.draft.get(field).chars().count() {
+            press(app, KeyCode::Backspace);
+        }
+        type_chars(app, text);
+        press(app, KeyCode::Enter);
+    }
+
+    fn is_editing(app: &SettingsApp) -> bool {
+        matches!(app.mode, Mode::Editing { .. })
+    }
+
+    fn is_browsing(app: &SettingsApp) -> bool {
+        matches!(app.mode, Mode::Browse)
+    }
+
+    fn editor_error(app: &SettingsApp) -> Option<String> {
+        match &app.mode {
+            Mode::Editing { error, .. } => error.clone(),
+            _ => None,
+        }
+    }
+
+    fn status_kind(app: &SettingsApp) -> Option<StatusKind> {
+        app.status().map(|(kind, _)| kind)
+    }
+
+    // ─── navigation ─────────────────────────────────────────────────────────
+
+    /// The rows that accept the cursor, in the order the screen presents them.
+    /// Spelled out rather than derived from `rows()`, so a layout change that
+    /// swallows a field is a test failure rather than a silent agreement.
+    const SELECTABLE_ORDER: [Row; 13] = [
+        Row::Setting(Field::Provider),
+        Row::Setting(Field::Host),
+        Row::Setting(Field::Port),
+        Row::Setting(Field::Username),
+        Row::Setting(Field::AuthType),
+        Row::Reauthenticate,
+        Row::Setting(Field::SmtpHost),
+        Row::Setting(Field::SmtpPort),
+        Row::Setting(Field::Folders),
+        Row::Setting(Field::ArchiveFolder),
+        Row::Setting(Field::MinEmails),
+        Row::Setting(Field::StaleAfterMonths),
+        Row::Setting(Field::CacheMaxAgeDays),
+    ];
+
+    #[test]
+    fn the_cursor_opens_on_the_first_setting() {
+        let app = app();
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::Provider));
+    }
+
+    #[test]
+    fn moving_down_visits_every_selectable_row_in_screen_order() {
+        let mut app = app();
+        let mut visited = vec![app.rows[app.cursor]];
+        for _ in 1..SELECTABLE_ORDER.len() {
+            press(&mut app, KeyCode::Down);
+            visited.push(app.rows[app.cursor]);
+        }
+        assert_eq!(visited, SELECTABLE_ORDER);
+    }
+
+    #[test]
+    fn moving_up_retraces_the_same_rows_in_reverse() {
+        let mut app = app();
+        focus(&mut app, Field::CacheMaxAgeDays);
+        let mut visited = vec![app.rows[app.cursor]];
+        for _ in 1..SELECTABLE_ORDER.len() {
+            press(&mut app, KeyCode::Up);
+            visited.push(app.rows[app.cursor]);
+        }
+        visited.reverse();
+        assert_eq!(visited, SELECTABLE_ORDER);
+    }
+
+    #[test]
+    fn moving_up_from_the_first_setting_stays_put() {
+        let mut app = app();
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::Provider));
+    }
+
+    #[test]
+    fn moving_down_from_the_last_setting_stays_put() {
+        let mut app = app();
+        focus(&mut app, Field::CacheMaxAgeDays);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::CacheMaxAgeDays));
+    }
+
+    #[test]
+    fn moving_across_a_section_boundary_skips_the_header_and_the_blank_line() {
+        let mut app = app();
+        focus(&mut app, Field::SmtpPort);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::Folders));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::SmtpPort));
+    }
+
+    #[test]
+    fn the_credentials_line_never_takes_the_cursor() {
+        // It shows where credentials live; there is nothing to edit on it.
+        let mut app = app();
+        for _ in 0..SELECTABLE_ORDER.len() * 2 {
+            assert_ne!(app.rows[app.cursor], Row::Credentials);
+            press(&mut app, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn j_and_k_move_the_cursor_like_the_arrow_keys() {
+        let (mut arrows, mut vim) = (app(), app());
+        for _ in 0..3 {
+            press(&mut arrows, KeyCode::Down);
+            press(&mut vim, KeyCode::Char('j'));
+        }
+        assert_eq!(arrows.cursor, vim.cursor);
+        press(&mut arrows, KeyCode::Up);
+        press(&mut vim, KeyCode::Char('k'));
+        assert_eq!(arrows.cursor, vim.cursor);
+    }
+
+    // ─── validation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_valid_edit_is_accepted_and_closes_the_editor() {
+        let mut app = app();
+        edit(&mut app, Field::Host, "imap.other.example.com");
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.host, "imap.other.example.com");
+    }
+
+    #[test]
+    fn a_port_above_the_valid_range_is_rejected_and_the_old_value_kept() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "70000");
+        assert_eq!(app.draft.port, "993", "the rejected value must not land");
+        assert!(is_editing(&app), "the editor should stay open for a correction");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn port_zero_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "0");
+        assert_eq!(app.draft.port, "993");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn the_highest_valid_port_is_accepted() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "65535");
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.port, "65535");
+    }
+
+    #[test]
+    fn a_non_numeric_port_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "imaps");
+        assert_eq!(app.draft.port, "993");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn an_imap_account_may_not_blank_its_port() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "");
+        assert_eq!(app.draft.port, "993");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn an_empty_host_is_rejected_for_an_imap_account() {
+        let mut app = app();
+        edit(&mut app, Field::Host, "   ");
+        assert_eq!(app.draft.host, "imap.example.com");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn an_empty_username_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::Username, "");
+        assert_eq!(app.draft.username, "user@example.com");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn an_empty_archive_folder_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "");
+        assert_eq!(app.draft.archive_folder, "Unsubscribed");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn a_blank_smtp_host_is_allowed_because_it_is_derived_from_the_imap_host() {
+        let mut app = app();
+        edit(&mut app, Field::SmtpHost, "");
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.smtp_host, "");
+    }
+
+    #[test]
+    fn a_non_numeric_preference_is_rejected_with_a_message_naming_the_key() {
+        let mut app = app();
+        edit(&mut app, Field::MinEmails, "lots");
+        assert_eq!(app.draft.min_emails, "5");
+        let message = editor_error(&app).expect("expected an inline error");
+        assert!(message.contains("min_emails"), "got: {message}");
+        assert!(message.contains("whole number"), "got: {message}");
+    }
+
+    #[test]
+    fn a_negative_preference_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::MinEmails, "-1");
+        assert_eq!(app.draft.min_emails, "5");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn zero_months_is_rejected_with_the_range_it_broke() {
+        let mut app = app();
+        edit(&mut app, Field::StaleAfterMonths, "0");
+        assert_eq!(app.draft.stale_after_months, "6");
+        let message = editor_error(&app).expect("expected an inline error");
+        assert!(message.contains("between 1 and 1200"), "got: {message}");
+    }
+
+    #[test]
+    fn a_cache_age_past_the_upper_bound_is_rejected() {
+        let mut app = app();
+        edit(&mut app, Field::CacheMaxAgeDays, "3651");
+        assert_eq!(app.draft.cache_max_age_days, "21");
+        assert!(editor_error(&app).is_some());
+    }
+
+    #[test]
+    fn zero_minimum_emails_is_accepted_because_it_disables_the_filter() {
+        let mut app = app();
+        edit(&mut app, Field::MinEmails, "0");
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.min_emails, "0");
+    }
+
+    #[test]
+    fn escape_abandons_an_edit_without_touching_the_draft() {
+        let mut app = app();
+        focus(&mut app, Field::Host);
+        press(&mut app, KeyCode::Enter);
+        type_chars(&mut app, "-typo");
+        press(&mut app, KeyCode::Esc);
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.host, "imap.example.com");
+    }
+
+    #[test]
+    fn correcting_a_rejected_value_in_place_is_accepted() {
+        let mut app = app();
+        focus(&mut app, Field::Port);
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_chars(&mut app, "70000");
+        press(&mut app, KeyCode::Enter);
+        assert!(is_editing(&app), "70000 should have been refused");
+
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert!(is_browsing(&app), "7000 should have been accepted");
+        assert_eq!(app.draft.port, "7000");
+    }
+
+    #[test]
+    fn a_fixed_choice_field_cycles_instead_of_opening_an_editor() {
+        let mut app = app();
+        focus(&mut app, Field::Provider);
+        press(&mut app, KeyCode::Enter);
+        assert!(is_browsing(&app), "a choice field has nothing to type into");
+        assert_eq!(app.draft.provider, "gmail");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.draft.provider, "imap", "the choices should wrap");
+    }
+
+    #[test]
+    fn the_auth_type_cycles_between_its_two_values() {
+        let mut app = app();
+        focus(&mut app, Field::AuthType);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.draft.auth_type, "oauth");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.draft.auth_type, "password");
+    }
+
+    #[test]
+    fn switching_to_gmail_makes_a_blank_host_acceptable() {
+        // Gmail talks to an API, so there is no host to require.
+        let mut app = app();
+        focus(&mut app, Field::Provider);
+        press(&mut app, KeyCode::Enter);
+        edit(&mut app, Field::Host, "");
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.host, "");
+    }
+
+    #[test]
+    fn a_gmail_account_converts_without_a_host_or_port() {
+        let app = SettingsApp::new(&gmail_account(), &preferences(), "keychain".to_string());
+        let (account, _) = app.to_config().expect("gmail needs neither host nor port");
+        assert_eq!(account.host, None);
+        assert_eq!(account.port, None);
+        assert_eq!(account.provider_type, ProviderType::Gmail);
+        assert_eq!(account.auth_type, AuthType::OAuth);
+    }
+
+    #[test]
+    fn the_untouched_draft_converts_back_to_the_config_it_came_from() {
+        let app = app();
+        let (account, prefs) = app.to_config().unwrap();
+        assert_eq!(account.host, imap_account().host);
+        assert_eq!(account.port, imap_account().port);
+        assert_eq!(account.username, imap_account().username);
+        assert_eq!(account.scan_folders, imap_account().scan_folders);
+        assert_eq!(account.archive_folder, imap_account().archive_folder);
+        assert_eq!(prefs, preferences());
+    }
+
+    // ─── dirty tracking ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_freshly_opened_screen_has_nothing_unsaved() {
+        let app = app();
+        assert!(!app.is_dirty());
+        assert!(Field::ALL.into_iter().all(|f| !app.is_field_dirty(f)));
+    }
+
+    #[test]
+    fn an_accepted_edit_marks_the_screen_and_the_field_unsaved() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        assert!(app.is_dirty());
+        assert!(app.is_field_dirty(Field::ArchiveFolder));
+        assert!(!app.is_field_dirty(Field::Host), "only the edited field");
+    }
+
+    #[test]
+    fn editing_a_field_back_to_its_original_value_is_not_a_change() {
+        let mut app = app();
+        edit(&mut app, Field::Host, "imap.elsewhere.example.com");
+        assert!(app.is_dirty());
+        edit(&mut app, Field::Host, "imap.example.com");
+        assert!(!app.is_dirty(), "the value matches the file again");
+        assert!(!app.is_field_dirty(Field::Host));
+    }
+
+    #[test]
+    fn cycling_a_choice_field_back_around_is_not_a_change() {
+        let mut app = app();
+        focus(&mut app, Field::Provider);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_dirty());
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.is_dirty(), "back to the stored provider");
+    }
+
+    #[test]
+    fn a_rejected_edit_leaves_the_screen_clean() {
+        let mut app = app();
+        edit(&mut app, Field::Port, "70000");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_dirty(), "a refused value is not an unsaved change");
+    }
+
+    #[test]
+    fn revert_discards_every_pending_change() {
+        let mut app = app();
+        edit(&mut app, Field::Host, "imap.elsewhere.example.com");
+        edit(&mut app, Field::MinEmails, "1");
+        press(&mut app, KeyCode::Char('r'));
+
+        assert!(!app.is_dirty());
+        assert_eq!(app.draft.host, "imap.example.com");
+        assert_eq!(app.draft.min_emails, "5");
+        assert_eq!(status_kind(&app), Some(StatusKind::Info));
+    }
+
+    #[test]
+    fn revert_on_a_clean_screen_says_nothing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.status(), None, "there was nothing to revert");
+    }
+
+    // ─── saving ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn s_asks_the_event_loop_to_save() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('s')), Action::Save);
+    }
+
+    #[test]
+    fn a_successful_save_hands_over_the_edited_values_and_clears_the_unsaved_state() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        edit(&mut app, Field::MinEmails, "1");
+
+        let io = FakeIo::new();
+        save(&mut app, &io);
+
+        let saved = io.saved.borrow();
+        assert_eq!(saved.len(), 1, "exactly one write");
+        assert_eq!(saved[0].0.archive_folder, "Archive");
+        assert_eq!(saved[0].1.min_emails, 1);
+        assert_eq!(
+            saved[0].1.cache_max_age_days, 21,
+            "untouched preferences go along unchanged"
+        );
+        assert!(!app.is_dirty());
+        assert_eq!(status_kind(&app), Some(StatusKind::Info));
+    }
+
+    #[test]
+    fn a_save_refused_by_validation_never_reaches_the_store() {
+        let mut app = app();
+        // Set directly: the editor would have refused this on the way in, and
+        // the point here is that `save` refuses it too.
+        app.draft.username = String::new();
+
+        let io = FakeIo::new();
+        save(&mut app, &io);
+
+        assert!(io.saved.borrow().is_empty(), "an invalid config was written");
+        assert_eq!(app.rows[app.cursor], Row::Setting(Field::Username));
+        assert_eq!(status_kind(&app), Some(StatusKind::Error));
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_changes_and_reports_the_failure() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+
+        save(&mut app, &FakeIo::failing());
+
+        assert!(app.is_dirty(), "the edit must survive a failed write");
+        assert_eq!(app.draft.archive_folder, "Archive");
+        assert_eq!(status_kind(&app), Some(StatusKind::Error));
+    }
+
+    #[test]
+    fn adopting_values_written_elsewhere_clears_the_unsaved_markers() {
+        // The path a reauth takes: the file changed underneath the screen.
+        let mut app = app();
+        edit(&mut app, Field::Host, "imap.stale.example.com");
+
+        let mut account = imap_account();
+        account.host = Some("imap.fresh.example.com".to_string());
+        app.adopt(&account, &preferences());
+
+        assert!(!app.is_dirty());
+        assert_eq!(app.draft.host, "imap.fresh.example.com");
+    }
+
+    // ─── quitting ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn quitting_a_clean_screen_needs_no_confirmation() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn escape_also_quits_a_clean_screen() {
+        let mut app = app();
+        assert_eq!(press(&mut app, KeyCode::Esc), Action::Quit);
+    }
+
+    #[test]
+    fn quitting_with_unsaved_changes_asks_first() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert!(matches!(app.mode, Mode::ConfirmQuit));
+    }
+
+    #[test]
+    fn confirming_the_prompt_quits_and_discards() {
+        for confirm in ['y', 'Y'] {
+            let mut app = app();
+            edit(&mut app, Field::ArchiveFolder, "Archive");
+            press(&mut app, KeyCode::Char('q'));
+            assert_eq!(
+                press(&mut app, KeyCode::Char(confirm)),
+                Action::Quit,
+                "{confirm} should confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_key_at_the_prompt_returns_to_editing_with_the_changes_intact() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(press(&mut app, KeyCode::Char('n')), Action::None);
+        assert!(is_browsing(&app));
+        assert!(app.is_dirty(), "declining must not discard the edit");
+        assert_eq!(app.draft.archive_folder, "Archive");
+    }
+
+    #[test]
+    fn quitting_after_a_save_needs_no_confirmation_again() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        save(&mut app, &FakeIo::new());
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn quitting_after_a_failed_save_still_asks() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Archive");
+        save(&mut app, &FakeIo::failing());
+        assert_eq!(press(&mut app, KeyCode::Char('q')), Action::None);
+        assert!(matches!(app.mode, Mode::ConfirmQuit));
+    }
+
+    // ─── re-authentication warning ──────────────────────────────────────────
+
+    #[test]
+    fn an_unedited_screen_does_not_warn_about_re_authentication() {
+        assert!(!app().needs_reauth());
+    }
+
+    #[test]
+    fn changing_the_username_warns_about_re_authentication() {
+        let mut app = app();
+        edit(&mut app, Field::Username, "someone.else@example.com");
+        assert!(app.needs_reauth());
+    }
+
+    #[test]
+    fn changing_the_provider_warns_about_re_authentication() {
+        let mut app = app();
+        focus(&mut app, Field::Provider);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.needs_reauth());
+    }
+
+    #[test]
+    fn changing_the_auth_type_warns_about_re_authentication() {
+        let mut app = app();
+        focus(&mut app, Field::AuthType);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.needs_reauth());
+    }
+
+    #[test]
+    fn changing_a_field_the_credentials_do_not_depend_on_raises_no_warning() {
+        for (field, value) in [
+            (Field::Host, "imap.elsewhere.example.com"),
+            (Field::Port, "143"),
+            (Field::SmtpHost, "smtp.elsewhere.example.com"),
+            (Field::SmtpPort, "587"),
+            (Field::ArchiveFolder, "Archive"),
+            (Field::MinEmails, "1"),
+            (Field::StaleAfterMonths, "3"),
+            (Field::CacheMaxAgeDays, "1"),
+        ] {
+            let mut app = app();
+            edit(&mut app, field, value);
+            assert!(app.is_dirty(), "{field:?} should have changed");
+            assert!(!app.needs_reauth(), "{field:?} should not need a reauth");
+        }
+    }
+
+    #[test]
+    fn changing_the_scanned_folders_raises_no_warning() {
+        let mut app = app();
+        app.open_folder_picker(&["INBOX".to_string(), "Promotions".to_string()], None);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_dirty());
+        assert!(!app.needs_reauth());
+    }
+
+    #[test]
+    fn putting_a_credential_field_back_withdraws_the_warning() {
+        let mut app = app();
+        edit(&mut app, Field::Username, "someone.else@example.com");
+        assert!(app.needs_reauth());
+        edit(&mut app, Field::Username, "user@example.com");
+        assert!(!app.needs_reauth());
+    }
+
+    #[test]
+    fn the_reauthenticate_row_hands_the_work_to_the_event_loop() {
+        let mut app = app();
+        app.cursor = row_index(&app, Row::Reauthenticate);
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Reauthenticate);
+    }
+
+    // ─── folder picker ──────────────────────────────────────────────────────
+
+    fn names(strings: &[&str]) -> Vec<String> {
+        strings.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn picker(app: &SettingsApp) -> &FolderPicker {
+        match &app.mode {
+            Mode::Folders(picker) => picker,
+            other => panic!("expected the folder picker, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_folders_row_asks_the_event_loop_to_fetch_the_folder_list() {
+        let mut app = app();
+        focus(&mut app, Field::Folders);
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::OpenFolderPicker);
+    }
+
+    #[test]
+    fn the_picker_preselects_exactly_the_configured_folders() {
+        let picker = FolderPicker::new(
+            &names(&["INBOX", "Promotions", "Archive"]),
+            &names(&["INBOX", "Archive"]),
+            None,
+        );
+        assert_eq!(picker.selection(), names(&["INBOX", "Archive"]));
+        assert!(
+            picker.entries.iter().all(|e| e.on_server),
+            "every entry came from the server"
+        );
+    }
+
+    #[test]
+    fn a_configured_folder_the_server_did_not_list_is_kept_and_stays_selected() {
+        // A rename or a permissions blip must not silently drop a folder.
+        let picker = FolderPicker::new(
+            &names(&["INBOX"]),
+            &names(&["INBOX", "Vanished"]),
+            None,
+        );
+        let vanished = picker
+            .entries
+            .iter()
+            .find(|e| e.name == "Vanished")
+            .expect("the configured folder was dropped");
+        assert!(vanished.selected);
+        assert!(!vanished.on_server, "it should be flagged as off-server");
+        assert_eq!(picker.selection(), names(&["INBOX", "Vanished"]));
+    }
+
+    #[test]
+    fn the_selection_follows_the_servers_order_with_missing_folders_last() {
+        let picker = FolderPicker::new(
+            &names(&["Archive", "INBOX"]),
+            &names(&["Ghost", "INBOX", "Archive"]),
+            None,
+        );
+        assert_eq!(picker.selection(), names(&["Archive", "INBOX", "Ghost"]));
+    }
+
+    #[test]
+    fn an_empty_server_list_falls_back_to_free_text_seeded_with_the_configuration() {
+        let picker = FolderPicker::new(&[], &names(&["INBOX", "Promotions"]), None);
+        assert_eq!(picker.free_text.as_deref(), Some("INBOX, Promotions"));
+        assert_eq!(picker.selection(), names(&["INBOX", "Promotions"]));
+        assert!(picker.notice.is_some(), "the fallback should explain itself");
+    }
+
+    #[test]
+    fn a_supplied_notice_survives_the_fallback_to_free_text() {
+        let picker = FolderPicker::new(&[], &names(&["INBOX"]), Some("server said no".into()));
+        assert_eq!(picker.notice.as_deref(), Some("server said no"));
+    }
+
+    #[test]
+    fn toggling_flips_only_the_entry_under_the_cursor() {
+        let mut picker = FolderPicker::new(
+            &names(&["INBOX", "Promotions"]),
+            &names(&["INBOX"]),
+            None,
+        );
+        picker.move_down();
+        picker.toggle();
+        assert_eq!(picker.selection(), names(&["INBOX", "Promotions"]));
+        picker.toggle();
+        assert_eq!(picker.selection(), names(&["INBOX"]));
+    }
+
+    #[test]
+    fn the_picker_cursor_stops_at_both_ends() {
+        let mut picker = FolderPicker::new(&names(&["a", "b"]), &[], None);
+        picker.move_up();
+        assert_eq!(picker.cursor, 0);
+        picker.move_down();
+        picker.move_down();
+        picker.move_down();
+        assert_eq!(picker.cursor, 1);
+    }
+
+    #[test]
+    fn a_committed_selection_round_trips_into_scan_folders() {
+        let mut app = app();
+        app.open_folder_picker(&names(&["INBOX", "Promotions", "Receipts"]), None);
+
+        press(&mut app, KeyCode::Down); // Promotions
+        press(&mut app, KeyCode::Char(' ')); // deselect it
+        press(&mut app, KeyCode::Down); // Receipts
+        press(&mut app, KeyCode::Char(' ')); // select it
+        press(&mut app, KeyCode::Enter);
+
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.folders, names(&["INBOX", "Receipts"]));
+        let (account, _) = app.to_config().unwrap();
+        assert_eq!(account.scan_folders, names(&["INBOX", "Receipts"]));
+    }
+
+    #[test]
+    fn a_folder_missing_from_the_server_survives_a_save() {
+        let mut app = app(); // configured: INBOX, Promotions
+        app.open_folder_picker(&names(&["INBOX"]), None); // the server lost one
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.draft.folders, names(&["INBOX", "Promotions"]));
+        assert!(!app.is_dirty(), "an untouched list is not a change");
+
+        let io = FakeIo::new();
+        save(&mut app, &io);
+        assert_eq!(
+            io.saved.borrow()[0].0.scan_folders,
+            names(&["INBOX", "Promotions"]),
+        );
+    }
+
+    #[test]
+    fn committing_an_empty_selection_is_refused_and_says_so() {
+        let mut app = app();
+        app.open_folder_picker(&names(&["INBOX", "Promotions"]), None);
+
+        press(&mut app, KeyCode::Char(' ')); // deselect INBOX
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' ')); // deselect Promotions
+        press(&mut app, KeyCode::Enter);
+
+        assert!(picker(&app).notice.is_some(), "no reason was given");
+        assert_eq!(
+            app.draft.folders,
+            names(&["INBOX", "Promotions"]),
+            "the draft must be left alone",
+        );
+    }
+
+    #[test]
+    fn escaping_the_picker_leaves_the_folders_as_they_were() {
+        let mut app = app();
+        app.open_folder_picker(&names(&["INBOX", "Promotions"]), None);
+        press(&mut app, KeyCode::Char(' ')); // deselect INBOX
+        press(&mut app, KeyCode::Esc);
+
+        assert!(is_browsing(&app));
+        assert_eq!(app.draft.folders, names(&["INBOX", "Promotions"]));
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn free_text_entry_replaces_the_folder_list() {
+        let mut app = app();
+        app.open_folder_picker(&[], None); // no list to pick from
+
+        let seeded = picker(&app).free_text.clone().unwrap().chars().count();
+        for _ in 0..seeded {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_chars(&mut app, " Bulk , Junk ,");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(is_browsing(&app));
+        assert_eq!(
+            app.draft.folders,
+            names(&["Bulk", "Junk"]),
+            "whitespace and trailing separators should be dropped",
+        );
+    }
+
+    #[test]
+    fn free_text_holding_only_separators_is_refused() {
+        let mut app = app();
+        app.open_folder_picker(&[], None);
+
+        let seeded = picker(&app).free_text.clone().unwrap().chars().count();
+        for _ in 0..seeded {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_chars(&mut app, " , , ");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(picker(&app).notice.is_some());
+        assert_eq!(app.draft.folders, names(&["INBOX", "Promotions"]));
+    }
+
+    #[test]
+    fn q_is_typed_into_the_free_text_field_rather_than_closing_it() {
+        let mut app = app();
+        app.open_folder_picker(&[], None);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(
+            picker(&app).free_text.as_deref().unwrap().ends_with('q'),
+            "a folder name may contain a q",
+        );
+    }
+}

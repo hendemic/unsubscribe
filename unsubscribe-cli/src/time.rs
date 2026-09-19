@@ -163,3 +163,207 @@ fn local_time(utc_ts: &str) -> Option<libc::tm> {
     }
     Some(tm)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A twelfth of a 365-day year, worked out by hand rather than read from
+    /// the constant under test: 365 * 86400 / 12.
+    const MONTH: i64 = 2_628_000;
+    const DAY: i64 = 86_400;
+
+    /// Slack against the clock ticking between building a fixture and reading
+    /// it back. Generous next to a month, tight next to nothing.
+    const MARGIN: i64 = 3_600;
+
+    fn sender(last_seen: Option<i64>) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme Newsletter".to_string(),
+            email: "news@acme.example".to_string(),
+            domain: "acme.example".to_string(),
+            unsubscribe_urls: Vec::new(),
+            unsubscribe_mailto: Vec::new(),
+            one_click: false,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count: 1,
+            messages: Vec::new(),
+            last_seen,
+        }
+    }
+
+    /// Render a Unix timestamp the way the scan cache stores it.
+    ///
+    /// Built on the C library's calendar conversion so that expected values do
+    /// not come out of the same civil-date arithmetic they are checking.
+    fn iso_utc(unix_secs: i64) -> String {
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let time_t = unix_secs as libc::time_t;
+        assert!(
+            !unsafe { libc::gmtime_r(&time_t, &mut tm) }.is_null(),
+            "gmtime_r rejected {unix_secs}"
+        );
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            1900 + tm.tm_year,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+        )
+    }
+
+    // ─── timestamp parsing, which staleness rests on ────────────────────────
+
+    #[test]
+    fn known_timestamps_parse_to_their_known_unix_values() {
+        assert_eq!(parse_iso8601_age_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_age_secs("2000-01-01T00:00:00Z"),
+            Some(946_684_800)
+        );
+        assert_eq!(
+            parse_iso8601_age_secs("2001-09-09T01:46:40Z"),
+            Some(1_000_000_000)
+        );
+    }
+
+    #[test]
+    fn parsing_agrees_with_the_c_library_across_awkward_dates() {
+        // Leap day, the day after a leap day, a century boundary, and a
+        // year-end rollover -- the cases a hand-rolled calendar gets wrong.
+        for unix_secs in [
+            0,
+            951_782_400,   // 2000-02-29
+            951_868_800,   // 2000-03-01
+            1_709_164_800, // 2024-02-29
+            1_735_689_599, // 2024-12-31T23:59:59Z
+            1_735_689_600, // 2025-01-01T00:00:00Z
+        ] {
+            let rendered = iso_utc(unix_secs);
+            assert_eq!(
+                parse_iso8601_age_secs(&rendered),
+                Some(unix_secs as u64),
+                "round trip failed for {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_one_parses_to_nothing() {
+        for bad in ["", "yesterday", "2026-03-18", "2026-03-18T19:30", "Z"] {
+            assert_eq!(parse_iso8601_age_secs(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    // ─── is_stale ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_sender_with_no_date_is_never_stale() {
+        // A missing date is the adapter's failure, not the sender's age.
+        assert!(!is_stale(&sender(None), 1));
+        assert!(!is_stale(&sender(None), 1200));
+    }
+
+    #[test]
+    fn a_sender_seen_just_now_is_not_stale() {
+        assert!(!is_stale(&sender(Some(now_unix_secs())), 1));
+    }
+
+    #[test]
+    fn a_sender_just_inside_the_threshold_is_not_stale() {
+        let last_seen = now_unix_secs() - 12 * MONTH + MARGIN;
+        assert!(!is_stale(&sender(Some(last_seen)), 12));
+    }
+
+    #[test]
+    fn a_sender_just_past_the_threshold_is_stale() {
+        let last_seen = now_unix_secs() - 12 * MONTH - MARGIN;
+        assert!(is_stale(&sender(Some(last_seen)), 12));
+    }
+
+    #[test]
+    fn the_same_sender_is_stale_or_not_according_to_the_configured_months() {
+        // Seven months old: past a six-month threshold, inside a twelve.
+        let last_seen = now_unix_secs() - 7 * MONTH;
+        let sender = sender(Some(last_seen));
+        assert!(is_stale(&sender, 6), "should be stale at 6 months");
+        assert!(!is_stale(&sender, 12), "should not be stale at 12 months");
+    }
+
+    #[test]
+    fn the_twelve_month_default_is_one_calendar_year() {
+        const YEAR: i64 = 365 * DAY;
+        let now = now_unix_secs();
+        assert!(!is_stale(&sender(Some(now - YEAR + MARGIN)), 12));
+        assert!(is_stale(&sender(Some(now - YEAR - MARGIN)), 12));
+    }
+
+    #[test]
+    fn a_sender_dated_in_the_future_is_not_stale() {
+        // Clock skew on the server should not wrap into a huge age.
+        let last_seen = now_unix_secs() + 30 * DAY;
+        assert!(!is_stale(&sender(Some(last_seen)), 1));
+    }
+
+    // ─── scan_max_age_secs ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_freshness_window_is_the_configured_days_in_seconds() {
+        assert_eq!(scan_max_age_secs(1), 86_400);
+        assert_eq!(scan_max_age_secs(7), 604_800);
+        assert_eq!(scan_max_age_secs(30), 2_592_000);
+    }
+
+    #[test]
+    fn a_zero_day_window_is_zero_seconds() {
+        assert_eq!(scan_max_age_secs(0), 0);
+    }
+
+    // ─── is_scan_stale ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_scan_just_inside_the_window_is_fresh() {
+        let ts = iso_utc(now_unix_secs() - 7 * DAY + MARGIN);
+        assert!(!is_scan_stale(&ts, 7));
+    }
+
+    #[test]
+    fn a_scan_just_past_the_window_is_stale() {
+        let ts = iso_utc(now_unix_secs() - 7 * DAY - MARGIN);
+        assert!(is_scan_stale(&ts, 7));
+    }
+
+    #[test]
+    fn the_same_scan_is_stale_or_not_according_to_the_configured_days() {
+        let ts = iso_utc(now_unix_secs() - 10 * DAY);
+        assert!(is_scan_stale(&ts, 7), "should be stale with a 7 day window");
+        assert!(!is_scan_stale(&ts, 30), "should be fresh with a 30 day window");
+    }
+
+    #[test]
+    fn a_scan_from_a_moment_ago_is_fresh() {
+        assert!(!is_scan_stale(&iso_utc(now_unix_secs()), 1));
+    }
+
+    #[test]
+    fn a_very_old_scan_is_stale_even_at_the_longest_window() {
+        assert!(is_scan_stale("2000-01-01T00:00:00Z", 3650));
+    }
+
+    #[test]
+    fn an_unparseable_scan_timestamp_is_treated_as_fresh() {
+        // Better a display quirk than nagging about a scan we cannot date.
+        for bad in ["", "yesterday", "2026-03-18"] {
+            assert!(!is_scan_stale(bad, 7), "{bad:?} should not read as stale");
+        }
+    }
+
+    #[test]
+    fn a_scan_timestamped_in_the_future_is_fresh() {
+        let ts = iso_utc(now_unix_secs() + 30 * DAY);
+        assert!(!is_scan_stale(&ts, 1));
+    }
+}
