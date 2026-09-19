@@ -33,7 +33,8 @@ pub enum Action {
     Last,
     /// Open, confirm, or act on whatever is under the cursor.
     Activate,
-    /// Exactly one level back. Never quits.
+    /// Exactly one level back, or -- in the Run workflow -- out to the nav
+    /// with the sub-view left standing. Never quits.
     Back,
     /// Leave the app. Only the nav answers this.
     Quit,
@@ -63,8 +64,11 @@ pub struct Hint {
 ///
 /// Nothing here may collide with a reserved key (`j k g G q`, `/`, `?`), and a
 /// panel that offers one of these concepts uses this letter for it.
-pub const MNEMONICS: [(&str, &str); 10] = [
+pub const MNEMONICS: [(&str, &str); 11] = [
     ("a", "select all"),
+    // `c` cancels the work in front of the user. `Ctrl-C` is a different key
+    // and keeps its own meaning: the shell answers it before the key map.
+    ("c", "cancel"),
     // `n` is also the "no" of a confirmation, which is the same convention in
     // every panel that asks one.
     ("n", "select none"),
@@ -125,7 +129,9 @@ pub fn action(key: KeyEvent, text_field: bool) -> Option<Action> {
         KeyCode::Char('?') => Some(Action::Help),
         KeyCode::Char('/') => Some(Action::Search),
         KeyCode::Char(' ') => Some(Action::Toggle),
-        KeyCode::Char(c) if is_mnemonic(c) => Some(Action::Mnemonic(c)),
+        // A modified letter is never a panel action, so `Ctrl-C` cannot be
+        // read as the cancel letter if it ever reaches the key map.
+        KeyCode::Char(c) if !ctrl && is_mnemonic(c) => Some(Action::Mnemonic(c)),
         _ => None,
     }
 }
@@ -290,6 +296,19 @@ mod tests {
     fn esc_is_back_and_q_is_quit_and_they_are_never_the_same_key() {
         assert_eq!(action(key(KeyCode::Esc), false), Some(Action::Back));
         assert_eq!(action(key(KeyCode::Char('q')), false), Some(Action::Quit));
+    }
+
+    #[test]
+    fn ctrl_c_is_never_read_as_the_cancel_letter() {
+        // `c` cancels the work in front of the user; `Ctrl-C` leaves the app.
+        // The shell answers Ctrl-C before this map, and the map must not
+        // claim it either if that interception ever moves.
+        assert_eq!(action(ctrl(KeyCode::Char('c')), false), None);
+        assert_eq!(action(ctrl(KeyCode::Char('c')), true), None);
+        assert_eq!(
+            action(key(KeyCode::Char('c')), false),
+            Some(Action::Mnemonic('c'))
+        );
     }
 
     #[test]

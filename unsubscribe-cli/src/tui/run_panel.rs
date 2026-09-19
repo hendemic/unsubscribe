@@ -297,6 +297,7 @@ mod tests {
             Nav::Stay => "stay",
             Nav::Push(_) => "push",
             Nav::Pop => "pop",
+            Nav::Park => "park",
             Nav::Quit => "quit",
             Nav::Effect(Effect::Scan) => "scan",
             Nav::Effect(Effect::Review) => "review",
