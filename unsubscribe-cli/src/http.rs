@@ -26,8 +26,9 @@ const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 /// Returns true if `ip` must never be reached by an unattended unsubscribe
 /// request: loopback, private (RFC 1918), link-local (including the
 /// `169.254.169.254` cloud metadata address), carrier-grade NAT
-/// (RFC 6598), unspecified, multicast, or an IPv6 unique-local/link-local
-/// range. IPv4-mapped IPv6 addresses are unwrapped and classified as IPv4.
+/// (RFC 6598), "this network" (0.0.0.0/8), reserved (240.0.0.0/4),
+/// multicast, broadcast, or an IPv6 unique-local/link-local range.
+/// IPv4-mapped IPv6 addresses are unwrapped and classified as IPv4.
 ///
 /// This is the single source of truth for "is this address safe to
 /// connect to" -- used both to reject literal-IP URLs before any network
@@ -46,16 +47,28 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local() // covers 169.254.169.254
-        || ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_broadcast()
         || is_cgnat(ip)
+        || is_current_network(ip)
+        || is_reserved(ip)
 }
 
 /// 100.64.0.0/10 (RFC 6598 carrier-grade NAT).
 fn is_cgnat(ip: Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
     a == 100 && (b & 0b1100_0000) == 0b0100_0000
+}
+
+/// 0.0.0.0/8 ("this network", RFC 791/1122) -- a superset of the single
+/// unspecified address `0.0.0.0`.
+fn is_current_network(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 0
+}
+
+/// 240.0.0.0/4 (reserved for future use, RFC 1112).
+fn is_reserved(ip: Ipv4Addr) -> bool {
+    (ip.octets()[0] & 0xf0) == 0xf0
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
@@ -108,6 +121,21 @@ impl fmt::Display for SsrfBlocked {
 }
 
 impl std::error::Error for SsrfBlocked {}
+
+/// Walks an error's `source()` chain looking for a block we raised
+/// ourselves (from [`SsrfDnsResolver`] or the redirect policy in
+/// [`ReqwestHttpClient::new`]), which reqwest re-wraps in its own error
+/// types on the way back out of `send()`.
+fn find_ssrf_blocked(err: &(dyn std::error::Error + 'static)) -> Option<BlockReason> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(blocked) = e.downcast_ref::<SsrfBlocked>() {
+            return Some(blocked.0);
+        }
+        current = e.source();
+    }
+    None
+}
 
 /// Checks a URL against every requirement that can be decided without a
 /// network round trip: scheme, embedded credentials, and (when the host is
@@ -232,6 +260,22 @@ impl ReqwestHttpClient {
         Ok(parsed)
     }
 
+    /// Maps a `send()` failure to an `anyhow::Error`.
+    ///
+    /// A block raised during the request itself -- resolved-address
+    /// rejection in [`SsrfDnsResolver`], or a blocked redirect target from
+    /// the policy in [`Self::new`] -- arrives here wrapped in reqwest's own
+    /// error types. Promote it back to the top-level message so
+    /// `UnsubscribeResult::detail` shows "blocked: ..." rather than a
+    /// generic "request failed" wrapper; any other failure keeps that
+    /// existing wrapper.
+    fn map_send_error(err: reqwest::Error, action: &str, url: &str) -> anyhow::Error {
+        match find_ssrf_blocked(&err) {
+            Some(reason) => anyhow::anyhow!("{} ({url})", reason.detail()),
+            None => anyhow::Error::new(err).context(format!("{action} request failed: {url}")),
+        }
+    }
+
     /// Reads a response into a `HttpResponse`, capping the body so an
     /// oversized response is never buffered in full.
     ///
@@ -260,7 +304,7 @@ impl HttpClient for ReqwestHttpClient {
             .client
             .get(checked)
             .send()
-            .with_context(|| format!("GET request failed: {url}"))?;
+            .map_err(|e| Self::map_send_error(e, "GET", url))?;
 
         Self::finish_response(resp)
     }
@@ -273,7 +317,7 @@ impl HttpClient for ReqwestHttpClient {
         }
         let resp = builder
             .send()
-            .with_context(|| format!("GET request failed: {url}"))?;
+            .map_err(|e| Self::map_send_error(e, "GET", url))?;
 
         Self::finish_response(resp)
     }
@@ -285,7 +329,7 @@ impl HttpClient for ReqwestHttpClient {
             .post(checked)
             .form(params)
             .send()
-            .with_context(|| format!("POST form request failed: {url}"))?;
+            .map_err(|e| Self::map_send_error(e, "POST form", url))?;
 
         Self::finish_response(resp)
     }
@@ -298,7 +342,7 @@ impl HttpClient for ReqwestHttpClient {
             .header("Content-Type", content_type)
             .body(body.to_string())
             .send()
-            .with_context(|| format!("POST body request failed: {url}"))?;
+            .map_err(|e| Self::map_send_error(e, "POST body", url))?;
 
         Self::finish_response(resp)
     }
@@ -321,7 +365,7 @@ impl HttpClient for ReqwestHttpClient {
         }
         let resp = builder
             .send()
-            .with_context(|| format!("POST body request failed: {url}"))?;
+            .map_err(|e| Self::map_send_error(e, "POST body", url))?;
 
         Self::finish_response(resp)
     }
