@@ -46,9 +46,6 @@ enum Commands {
         /// Rescan the mailbox without asking, ignoring any cached scan
         #[arg(long, conflicts_with = "cached")]
         rescan: bool,
-        /// Send unsubscribe emails for mailto-only senders
-        #[arg(long)]
-        mailto: bool,
     },
     /// Only scan and list senders with unsubscribe links
     Scan {
@@ -155,7 +152,6 @@ fn main() -> Result<()> {
             min_emails,
             cached,
             rescan,
-            mailto,
         } => commands::run::cmd_run(
             &account,
             &credential,
@@ -166,7 +162,6 @@ fn main() -> Result<()> {
             min_emails,
             cached,
             rescan,
-            mailto,
         ),
         Commands::Scan { min_emails } => {
             commands::scan::cmd_scan(
@@ -304,8 +299,10 @@ pub(crate) fn make_provider(
 
 /// Create the appropriate email sender for mailto unsubscribe based on provider type.
 ///
-/// Gmail users get `GmailSender` (sends via Gmail API). IMAP users get `SmtpSender`
-/// once SMTP support is added. Until then, IMAP users cannot use `--mailto`.
+/// Gmail users get `GmailSender` (sends via Gmail API). IMAP users get `SmtpSender`,
+/// using the configured (or derived) SMTP host. Mailto unsubscribe is attempted
+/// automatically alongside HTTP; callers should treat a failure here as
+/// non-fatal and skip mailto-only senders rather than aborting the run.
 pub(crate) fn make_email_sender(
     account: &AccountConfig,
     credential: &Credential,

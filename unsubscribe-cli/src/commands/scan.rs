@@ -11,7 +11,7 @@ use unsubscribe_core::{
 };
 
 use crate::commands::load_history;
-use crate::terminal::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
+use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{
     age_secs_since, format_relative_age, is_stale, now_iso8601, utc_to_local_date,
     SCAN_MAX_AGE_SECS,
@@ -281,7 +281,7 @@ pub fn cmd_scan(
         } else if !s.unsubscribe_urls.is_empty() {
             ("http", CYAN)
         } else {
-            ("mailto", YELLOW)
+            ("mailto", BLUE)
         };
         println!(
             " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}{marker_color}{marker}{RESET}",

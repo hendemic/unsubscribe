@@ -256,7 +256,7 @@ impl UnsubscribeMethod {
             Self::FormPost => "form POST",
             Self::FormGet => "form GET",
             Self::ConfirmLink => "confirm link",
-            Self::MailtoSent => "mailto (sent)",
+            Self::MailtoSent => "mailto",
             Self::MailtoFailed => "mailto (failed)",
             Self::MailtoSkipped => "mailto (skipped)",
             Self::None => "none",

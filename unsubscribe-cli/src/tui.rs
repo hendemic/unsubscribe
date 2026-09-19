@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use ratatui::prelude::*;
@@ -11,6 +11,9 @@ use unsubscribe_core::{split_previously_unsubscribed, SenderInfo, UnsubscribeAtt
 use crate::time::{
     is_stale, parse_iso8601_age_secs, utc_to_local_display, MONTH_NAMES, SCAN_MAX_AGE_SECS,
 };
+
+/// Number of selectable rows Ctrl+Up/Ctrl+Down jumps at a time.
+const JUMP_ROWS: usize = 5;
 
 /// Guard that restores the terminal on drop, even if we panic or return early
 struct TerminalGuard;
@@ -169,6 +172,20 @@ impl App {
         }
     }
 
+    /// Move up by `n` selectable rows, stopping early at the top.
+    fn move_up_by(&mut self, n: usize) {
+        for _ in 0..n {
+            self.move_up();
+        }
+    }
+
+    /// Move down by `n` selectable rows, stopping early at the bottom.
+    fn move_down_by(&mut self, n: usize) {
+        for _ in 0..n {
+            self.move_down();
+        }
+    }
+
     fn count_selected(&self) -> usize {
         [
             &self.previous_selected,
@@ -294,6 +311,12 @@ pub fn select_senders(
                 }
                 KeyCode::Enter => {
                     break;
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.move_up_by(JUMP_ROWS)
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.move_down_by(JUMP_ROWS)
                 }
                 KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.move_down(),
@@ -754,7 +777,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Help line
     let help = Paragraph::new(
-        " Space: toggle | a: select all | n: deselect all | j/k: move | Enter: confirm | q: quit",
+        " Space: toggle | a: select all | n: deselect all | j/k: move | Ctrl+↑/↓: jump 5 | Enter: confirm | q: quit",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(help, chunks[4]);
