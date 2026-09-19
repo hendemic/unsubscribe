@@ -87,11 +87,11 @@ impl DataStore for FileDataStore {
         wtr.write_record(["email", "method", "success", "detail", "url"])?;
         for r in results {
             wtr.write_record([
-                &r.email,
-                &r.method,
+                r.email.as_str(),
+                r.method.label(),
                 &r.success.to_string(),
-                &r.detail,
-                &r.url,
+                r.detail.as_str(),
+                r.url.as_str(),
             ])?;
         }
         wtr.flush()?;

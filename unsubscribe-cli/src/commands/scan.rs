@@ -191,7 +191,9 @@ pub fn cmd_export(
     let mut wtr =
         csv::Writer::from_path(output).context("Failed to create CSV")?;
 
-    wtr.write_record(["name", "email", "domain", "method", "emails", "url", "stale"])?;
+    wtr.write_record([
+        "name", "email", "domain", "list_id", "method", "emails", "url", "stale",
+    ])?;
 
     for s in &senders {
         let method = if s.one_click {
@@ -208,13 +210,14 @@ pub fn cmd_export(
         let stale = is_stale(s).to_string();
 
         wtr.write_record([
-            &s.display_name,
-            &s.email,
-            &s.domain,
+            s.display_name.as_str(),
+            s.email.as_str(),
+            s.domain.as_str(),
+            s.list_id.as_deref().unwrap_or(""),
             method,
             &s.email_count.to_string(),
-            &url,
-            &stale,
+            url.as_str(),
+            stale.as_str(),
         ])?;
     }
 

@@ -7,8 +7,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use unsubscribe_core::{
-    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, EmailSender,
-    Folder, FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
+    domain_from_email, list_id_warning, parse_from_header, parse_list_id, parse_list_unsubscribe,
+    EmailProvider, EmailSender, Folder, FolderMessage, MessageId, ScanProgress, ScanResult,
+    SenderInfo,
 };
 
 use api::{
@@ -172,7 +173,8 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
                  GET /gmail/v1/users/me/messages/{id}?format=metadata\
                  &metadataHeaders=From\
                  &metadataHeaders=List-Unsubscribe\
-                 &metadataHeaders=List-Unsubscribe-Post HTTP/1.1\r\n\
+                 &metadataHeaders=List-Unsubscribe-Post\
+                 &metadataHeaders=List-Id HTTP/1.1\r\n\
                  \r\n"
                 // Note: internalDate is returned in the message object itself,
                 // not as a metadata header — no need to request it via metadataHeaders.
@@ -470,6 +472,8 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
 
         let has_one_click = meta.header("List-Unsubscribe-Post").is_some();
 
+        let list_id_header = meta.header("List-Id").map(str::to_string);
+
         let Some(from_header) = meta.header("From") else {
             progress.on_messages_scanned(inbox, 1);
             return;
@@ -485,6 +489,16 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
         }
         let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
 
+        // A List-Id that is present but unparseable is worth surfacing: it means
+        // this sender's history will be missing its list identity.
+        let list_id = list_id_header.as_deref().and_then(parse_list_id);
+        if let (None, Some(raw)) = (&list_id, &list_id_header) {
+            let w = list_id_warning(&sender_email, raw);
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+        }
+
         let message_id = MessageId::new(id.to_string());
         let msg_timestamp = meta.timestamp_secs();
 
@@ -498,6 +512,8 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
                 unsubscribe_urls: Vec::new(),
                 unsubscribe_mailto: Vec::new(),
                 one_click: false,
+                list_id: None,
+                list_unsubscribe_raw: None,
                 email_count: 0,
                 messages: Vec::new(),
                 last_seen: None,
@@ -508,6 +524,15 @@ impl<C: unsubscribe_core::HttpClient> GmailProvider<C> {
         // for a sender are the freshest — preserve them and skip older ones.
         if entry.unsubscribe_urls.is_empty() && !urls.is_empty() {
             entry.unsubscribe_urls = urls;
+        }
+
+        // Same newest-first reasoning: the first identity fields we see for a
+        // sender come from their most recent message.
+        if entry.list_unsubscribe_raw.is_none() {
+            entry.list_unsubscribe_raw = Some(unsub_header);
+        }
+        if entry.list_id.is_none() {
+            entry.list_id = list_id;
         }
         for m in mailtos {
             if !entry.unsubscribe_mailto.contains(&m) {
@@ -799,7 +824,11 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or((200, "{}".to_string()));
-            HttpResponse { status, body }
+            HttpResponse {
+                status,
+                body,
+                final_url: Some(url.to_string()),
+            }
         }
     }
 

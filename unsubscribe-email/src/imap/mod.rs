@@ -7,8 +7,9 @@ use mail_parser::MessageParser;
 use native_tls::TlsStream;
 
 use unsubscribe_core::{
-    domain_from_email, parse_from_header, parse_list_unsubscribe, EmailProvider, Folder,
-    FolderMessage, MessageId, ScanProgress, ScanResult, SenderInfo,
+    domain_from_email, list_id_warning, parse_from_header, parse_list_id,
+    parse_list_unsubscribe, EmailProvider, Folder, FolderMessage, MessageId, ScanProgress,
+    ScanResult, SenderInfo,
 };
 
 /// Maximum concurrent IMAP connections per scan. Gmail allows ~15 simultaneous
@@ -265,6 +266,8 @@ fn scan_folder(
 
             let has_one_click = parsed.header_raw("List-Unsubscribe-Post").is_some();
 
+            let list_id_header = parsed.header_raw("List-Id").map(|v| v.to_string());
+
             let from_raw = parsed
                 .header_raw("From")
                 .map(|v| v.to_string())
@@ -281,6 +284,16 @@ fn scan_folder(
                 }
             }
             let (urls, mailtos) = (parsed_unsub.urls, parsed_unsub.mailtos);
+
+            // A List-Id that is present but unparseable is worth surfacing: it
+            // means this sender's history will be missing its list identity.
+            let list_id = list_id_header.as_deref().and_then(parse_list_id);
+            if let (None, Some(raw)) = (&list_id, &list_id_header) {
+                let w = list_id_warning(&sender_email, raw);
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
 
             // Encode the IMAP UID into a MessageId: "folder:uid:uidvalidity"
             let message_id = encode_message_id(
@@ -299,6 +312,8 @@ fn scan_folder(
                     unsubscribe_urls: Vec::new(),
                     unsubscribe_mailto: Vec::new(),
                     one_click: false,
+                    list_id: None,
+                    list_unsubscribe_raw: None,
                     email_count: 0,
                     messages: Vec::new(),
                     last_seen: None,
@@ -310,6 +325,13 @@ fn scan_folder(
             // the freshest and least likely to be expired.
             if !urls.is_empty() {
                 entry.unsubscribe_urls = urls;
+            }
+
+            // Same chronological reasoning: the last message wins the identity
+            // fields, so the sender's current list membership is what is recorded.
+            entry.list_unsubscribe_raw = Some(unsub_header);
+            if list_id.is_some() {
+                entry.list_id = list_id;
             }
             for m in mailtos {
                 if !entry.unsubscribe_mailto.contains(&m) {
@@ -359,6 +381,8 @@ fn merge_folder_result(
             unsubscribe_urls: Vec::new(),
             unsubscribe_mailto: Vec::new(),
             one_click: false,
+            list_id: None,
+            list_unsubscribe_raw: None,
             email_count: 0,
             messages: Vec::new(),
             last_seen: None,
@@ -377,6 +401,24 @@ fn merge_folder_result(
         if sender.one_click {
             entry.one_click = true;
         }
+
+        // Identity fields come from the freshest message. Folders are scanned
+        // independently, so compare their newest message dates -- this has to
+        // happen before `entry.last_seen` is advanced below.
+        let incoming_is_newer = match (entry.last_seen, sender.last_seen) {
+            (Some(existing), Some(incoming)) => incoming >= existing,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if sender.list_id.is_some() && (entry.list_id.is_none() || incoming_is_newer) {
+            entry.list_id = sender.list_id.clone();
+        }
+        if sender.list_unsubscribe_raw.is_some()
+            && (entry.list_unsubscribe_raw.is_none() || incoming_is_newer)
+        {
+            entry.list_unsubscribe_raw = sender.list_unsubscribe_raw.clone();
+        }
+
         entry.email_count += sender.email_count;
         entry.messages.extend(sender.messages);
 
@@ -495,6 +537,8 @@ mod tests {
             unsubscribe_urls: urls.into_iter().map(String::from).collect(),
             unsubscribe_mailto: mailtos.into_iter().map(String::from).collect(),
             one_click,
+            list_id: None,
+            list_unsubscribe_raw: None,
             email_count,
             messages,
             last_seen: None,

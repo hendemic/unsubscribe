@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
-use unsubscribe_core::{AccountConfig, Credential, DataStore, Folder, SenderInfo, UnsubscribeResult};
+use unsubscribe_core::{
+    AccountConfig, Credential, DataStore, Folder, SenderInfo, UnsubscribeMethod, UnsubscribeResult,
+};
 
 use crate::action_log::append_log_entry;
 use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
@@ -117,10 +119,12 @@ pub fn cmd_run(
                     .to_string();
                 UnsubscribeResult {
                     email: s.email.clone(),
-                    method: "dry-run".to_string(),
+                    method: UnsubscribeMethod::DryRun,
                     success: true,
                     detail: "Would unsubscribe".to_string(),
                     url,
+                    http_status: None,
+                    final_url: None,
                 }
             })
             .collect()
