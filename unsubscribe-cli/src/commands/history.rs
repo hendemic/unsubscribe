@@ -333,7 +333,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: parse_date accepts out-of-range months and days, see issue #110"]
     fn a_date_that_could_not_exist_is_a_usage_error() {
         // `--since 2026-13-01` is currently read as 2027-01-01 and
         // `--since 2026-02-30` as 2026-03-02, so a typo silently selects the

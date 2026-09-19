@@ -80,10 +80,19 @@ fn days_to_civil(day_count: i64) -> (i64, u32, u32) {
 }
 
 /// Parse an ISO 8601 timestamp (e.g., "2026-03-18T19:30:00Z") into Unix seconds.
+///
+/// Strict on purpose: this also reads dates a person typed (`--since`), and a
+/// mistyped date that quietly becomes a different day selects a window nobody
+/// asked for. Anything that is not a real UTC moment at or after the epoch is
+/// `None`.
 pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     // Minimal parser for the format produced by now_iso8601(): YYYY-MM-DDThh:mm:ssZ
     let b = ts.as_bytes();
     if b.len() < 19 {
+        return None;
+    }
+    let separators = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, expected)| b.get(*at) != Some(expected)) {
         return None;
     }
     let year: i64 = ts.get(0..4)?.parse().ok()?;
@@ -92,6 +101,16 @@ pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     let hour: u64 = ts.get(11..13)?.parse().ok()?;
     let min: u64 = ts.get(14..16)?.parse().ok()?;
     let sec: u64 = ts.get(17..19)?.parse().ok()?;
+
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
+        return None;
+    }
 
     // Convert civil date to days since epoch (inverse of days_to_civil)
     let (y, m) = if month <= 2 {
@@ -105,7 +124,18 @@ pub fn parse_iso8601_age_secs(ts: &str) -> Option<u64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let day_count = era * 146097 + doe as i64 - 719468;
 
-    Some(day_count as u64 * 86400 + hour * 3600 + min * 60 + sec)
+    Some(u64::try_from(day_count).ok()? * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// How many days a month has, leap years included.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Age of an ISO 8601 UTC timestamp in seconds, or `None` if it will not parse.
@@ -404,7 +434,6 @@ mod parse_date_tests {
     }
 
     #[test]
-    #[ignore = "bug: a date before 1970 panics on overflow, see issue #110"]
     fn a_date_before_the_epoch_is_handled_rather_than_panicking() {
         // `parse_iso8601_age_secs` returns seconds as `u64`, and casts a
         // negative day count into it: `unsubscribe history --since 1969-12-31`
@@ -433,7 +462,6 @@ mod parse_date_tests {
     }
 
     #[test]
-    #[ignore = "bug: separators are not checked, see issue #110"]
     fn a_date_written_with_the_wrong_separators_is_rejected() {
         // Only the digit positions are read, so `2026/03/18` is accepted as
         // 2026-03-18 -- forgiving, but it means genuinely malformed input is
@@ -442,7 +470,6 @@ mod parse_date_tests {
     }
 
     #[test]
-    #[ignore = "bug: no range check on month or day, see issue #110"]
     fn a_date_that_could_not_exist_is_rejected() {
         // Each of these currently parses to a different, real day: month 13
         // rolls into the next January, day 32 into the next month, and day 0
