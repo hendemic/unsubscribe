@@ -1076,6 +1076,248 @@ mod tests {
             .collect();
         assert_eq!(selected, ["p1@test.com", "a2@test.com", "s1@test.com"]);
     }
+
+    // -------------------------------------------------------------------
+    // Ctrl+Up / Ctrl+Down jump (Issue #79 / #111)
+    // -------------------------------------------------------------------
+
+    /// The rows the cursor is allowed to rest on, in display order. Derived
+    /// from the layout rather than from the movement code, so it is an
+    /// independent yardstick for how far a jump travelled.
+    fn selectable_rows(app: &App) -> Vec<usize> {
+        (0..app.total_rows())
+            .filter(|&row| !app.is_non_selectable(row))
+            .collect()
+    }
+
+    /// Position of the cursor within `selectable_rows`.
+    fn selectable_position(app: &App) -> usize {
+        selectable_rows(app)
+            .iter()
+            .position(|&row| row == app.cursor)
+            .expect("cursor must rest on a selectable row")
+    }
+
+    #[test]
+    fn jumping_down_advances_five_selectable_rows_across_sections() {
+        let mut app = all_three_sections();
+        let start = selectable_position(&app);
+
+        app.move_down_by(JUMP_ROWS);
+
+        assert_eq!(
+            selectable_position(&app) - start,
+            5,
+            "a jump should cover five selectable rows, whatever sits between them"
+        );
+        // Rows 1,2,3 are the previous section and 6,7,8 the active one, so this
+        // jump crosses a spacer and a header on the way.
+        assert_eq!(app.cursor, 8);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::Active(1)));
+    }
+
+    #[test]
+    fn jumping_up_retreats_five_selectable_rows_across_sections() {
+        let mut app = all_three_sections();
+        app.cursor = 13;
+        let start = selectable_position(&app);
+
+        app.move_up_by(JUMP_ROWS);
+
+        assert_eq!(start - selectable_position(&app), 5);
+        assert_eq!(app.cursor, 6);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllActive));
+    }
+
+    #[test]
+    fn a_jump_down_and_back_up_returns_to_the_starting_row() {
+        // Started far enough from both ends that neither jump is clamped.
+        let mut app = all_three_sections();
+        app.cursor = 3;
+
+        app.move_down_by(JUMP_ROWS);
+        assert_eq!(app.cursor, 12);
+        app.move_up_by(JUMP_ROWS);
+
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn a_jump_down_near_the_bottom_stops_on_the_last_selectable_row() {
+        let mut app = all_three_sections();
+        app.cursor = 12; // one selectable row above the end
+
+        app.move_down_by(JUMP_ROWS);
+
+        let last_selectable = *selectable_rows(&app).last().expect("rows exist");
+        assert_eq!(app.cursor, last_selectable);
+        assert_eq!(app.cursor, 13);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::Stale(1)));
+    }
+
+    #[test]
+    fn a_jump_up_near_the_top_stops_on_the_first_selectable_row() {
+        let mut app = all_three_sections();
+        app.cursor = 2; // one selectable row below the top
+
+        app.move_up_by(JUMP_ROWS);
+
+        assert_eq!(app.cursor, app.first_selectable());
+        assert_eq!(app.cursor, 1);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllPrevious));
+    }
+
+    #[test]
+    fn repeated_jumps_settle_on_the_ends_without_overshooting() {
+        let mut app = all_three_sections();
+        for _ in 0..5 {
+            app.move_down_by(JUMP_ROWS);
+        }
+        assert_eq!(app.cursor, 13, "should rest on the last row, not past it");
+
+        for _ in 0..5 {
+            app.move_up_by(JUMP_ROWS);
+        }
+        assert_eq!(app.cursor, 1, "should rest on the first selectable row");
+    }
+
+    /// Build a screen with the given number of senders per section. Section
+    /// sizes shift where the headers and spacers fall, which is what decides
+    /// whether a jump can strand the cursor on one.
+    fn sections_of(previous: usize, active: usize, stale: usize) -> App {
+        let mut senders = Vec::new();
+        let mut history = Vec::new();
+        for i in 0..previous {
+            let email = format!("p{i}@test.com");
+            history.push(unsubscribed(&email));
+            senders.push(make_sender(&email, 1));
+        }
+        for i in 0..active {
+            senders.push(make_sender(&format!("a{i}@test.com"), 1));
+        }
+        for i in 0..stale {
+            senders.push(make_stale_sender(&format!("s{i}@test.com"), 1));
+        }
+        App::with_history(senders, &history, Preferences::default())
+    }
+
+    #[test]
+    fn a_jump_from_any_row_lands_on_a_selectable_row() {
+        // Where the headers and spacers fall depends on the section sizes, so
+        // sweep a range of layouts and every starting row in both directions.
+        // A jump that counted display rows instead of selectable ones would
+        // strand the cursor on a spacer in one of these.
+        for (previous, active, stale) in [
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 3, 0),
+            (0, 3, 2),
+            (2, 1, 2),
+            (2, 0, 0),
+            (1, 4, 1),
+            (3, 3, 3),
+            (6, 0, 6),
+        ] {
+            for start in selectable_rows(&sections_of(previous, active, stale)) {
+                let mut down = sections_of(previous, active, stale);
+                down.cursor = start;
+                down.move_down_by(JUMP_ROWS);
+                assert!(
+                    !down.is_non_selectable(down.cursor),
+                    "in ({previous},{active},{stale}), jump down from row {start} \
+                     landed on row {} ({:?})",
+                    down.cursor,
+                    down.row_kind(down.cursor)
+                );
+
+                let mut up = sections_of(previous, active, stale);
+                up.cursor = start;
+                up.move_up_by(JUMP_ROWS);
+                assert!(
+                    !up.is_non_selectable(up.cursor),
+                    "in ({previous},{active},{stale}), jump up from row {start} \
+                     landed on row {} ({:?})",
+                    up.cursor,
+                    up.row_kind(up.cursor)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_jump_covers_five_selectable_rows_in_every_layout_long_enough_for_it() {
+        // Independent of the layout: five steps means five selectable rows,
+        // and fewer only when the list runs out.
+        for (previous, active, stale) in [(0, 9, 0), (2, 1, 2), (3, 3, 3), (6, 0, 6)] {
+            let mut app = sections_of(previous, active, stale);
+            let rows = selectable_rows(&app);
+            let start = selectable_position(&app);
+
+            app.move_down_by(JUMP_ROWS);
+
+            let expected = (start + 5).min(rows.len() - 1);
+            assert_eq!(
+                selectable_position(&app),
+                expected,
+                "({previous},{active},{stale}): jump from selectable row {start} of {}",
+                rows.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_jump_down_into_a_trailing_empty_active_section_stops_on_its_select_all() {
+        // Layout: PreviousHeader(0), SelectAllPrevious(1), Previous(0..2),
+        // Spacer(4), ActiveHeader(5), SelectAllActive(6). The last two rows
+        // before the end are a spacer and a header, so an overshooting jump
+        // would strand the cursor on one of them.
+        let mut app = App::with_history(
+            vec![make_sender("p1@test.com", 1), make_sender("p2@test.com", 2)],
+            &[unsubscribed("p1@test.com"), unsubscribed("p2@test.com")],
+            Preferences::default(),
+        );
+
+        app.move_down_by(JUMP_ROWS);
+
+        assert_eq!(app.cursor, 6);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllActive));
+    }
+
+    #[test]
+    fn a_jump_in_an_empty_list_does_not_panic() {
+        let mut app = App::with_history(vec![], &[], Preferences::default());
+
+        app.move_down_by(JUMP_ROWS);
+        assert_eq!(app.cursor, 1);
+        app.move_up_by(JUMP_ROWS);
+        assert_eq!(app.cursor, 1);
+        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllActive));
+    }
+
+    #[test]
+    fn a_jump_in_a_list_shorter_than_the_jump_does_not_overshoot() {
+        let mut app = App::with_history(
+            vec![make_sender("only@test.com", 1)],
+            &[],
+            Preferences::default(),
+        );
+        // Rows: ActiveHeader(0), SelectAllActive(1), Active(0) at 2.
+        app.move_down_by(JUMP_ROWS);
+        assert_eq!(app.cursor, 2);
+        app.move_up_by(JUMP_ROWS);
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn jumping_does_not_change_any_selection() {
+        // Movement is navigation only — a jump that toggled rows on the way
+        // past would be silently destructive.
+        let mut app = all_three_sections();
+        app.move_down_by(JUMP_ROWS);
+        app.move_up_by(JUMP_ROWS);
+
+        assert_eq!(app.count_selected(), 0);
+    }
 }
 
 fn draw(f: &mut Frame, app: &mut App) {

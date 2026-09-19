@@ -1527,4 +1527,309 @@ mod tests {
             "archive 500 should propagate with status code, got: {msg}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // List-Id and raw List-Unsubscribe capture (Issue #92 / #111)
+    // -----------------------------------------------------------------------
+
+    /// A metadata response carrying the identity headers a scan reads for
+    /// history evidence. `list_id` and `internal_date_ms` are optional so a
+    /// test can model a message that simply omits them.
+    fn make_identity_metadata_response(
+        id: &str,
+        from: &str,
+        unsub: &str,
+        list_id: Option<&str>,
+        internal_date_ms: Option<&str>,
+    ) -> String {
+        let list_id_header = list_id
+            .map(|v| format!(r#",{{"name":"List-Id","value":"{v}"}}"#))
+            .unwrap_or_default();
+        let internal_date = internal_date_ms
+            .map(|ms| format!(r#","internalDate":"{ms}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"id":"{id}"{internal_date},"payload":{{"headers":[
+                {{"name":"From","value":"{from}"}},
+                {{"name":"List-Unsubscribe","value":"{unsub}"}}
+                {list_id_header}
+            ]}}}}"#
+        )
+    }
+
+    /// The body of the batch metadata request the scan sent, if it sent one.
+    fn batch_request_body(calls: &[(String, String, String)]) -> Option<String> {
+        calls
+            .iter()
+            .find(|(_, url, _)| url.contains("/batch/gmail/"))
+            .map(|(_, _, body)| body.clone())
+    }
+
+    #[test]
+    fn metadata_request_asks_gmail_for_the_list_id_header() {
+        // Gmail only returns the headers named in metadataHeaders. If List-Id
+        // is not requested, every scanned sender silently loses its list
+        // identity — and history is append-only, so it cannot be backfilled.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["msg1"], None));
+        http.push(
+            200,
+            make_batch_response(&[make_identity_metadata_response(
+                "msg1",
+                "News <news@example.com>",
+                "<https://example.com/unsub>",
+                Some("<news.example.com>"),
+                None,
+            )]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let _ = provider.scan(&[], &NoopProgress).unwrap();
+
+        let body = batch_request_body(&provider.http.calls())
+            .expect("scan should issue a batch metadata request");
+        assert!(
+            body.contains("metadataHeaders=List-Id"),
+            "batch request must ask for List-Id, got: {body}"
+        );
+    }
+
+    #[test]
+    fn scanned_sender_carries_normalized_list_id_and_verbatim_list_unsubscribe() {
+        // The list id is normalized (brackets stripped, lowercased) because the
+        // casing senders use varies; the List-Unsubscribe header is kept exactly
+        // as received so a later violation report can quote it.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["msg1"], None));
+        http.push(
+            200,
+            make_batch_response(&[make_identity_metadata_response(
+                "msg1",
+                "Acme <news@acme.com>",
+                "<https://acme.com/unsub?t=1>, <mailto:unsub@acme.com>",
+                Some("Acme News <News.ACME.Example.COM>"),
+                None,
+            )]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        let sender = &result.senders[0];
+        assert_eq!(sender.list_id.as_deref(), Some("news.acme.example.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=1>, <mailto:unsub@acme.com>"),
+            "the raw header must survive verbatim, not normalized or split"
+        );
+    }
+
+    #[test]
+    fn most_recent_message_wins_when_list_id_changes() {
+        // Gmail returns newest-first, so the first message processed for a
+        // sender is their current list membership. An older message moving the
+        // sender back to a list they left would misrecord the history.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["newer", "older"], None));
+        http.push(
+            200,
+            make_batch_response(&[
+                make_identity_metadata_response(
+                    "newer",
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub?t=new>",
+                    Some("<weekly.acme.com>"),
+                    Some("1700000000000"),
+                ),
+                make_identity_metadata_response(
+                    "older",
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub?t=old>",
+                    Some("<daily.acme.com>"),
+                    Some("1600000000000"),
+                ),
+            ]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        let sender = &result.senders[0];
+        assert_eq!(sender.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            sender.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=new>")
+        );
+        // 1700000000000 ms -> 1700000000 s; independently: the newer of the two.
+        assert_eq!(sender.last_seen, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn newer_message_without_a_list_id_does_not_clear_an_older_one() {
+        // Senders drop List-Id on transactional mail. Losing the identity
+        // because the newest message happened to omit the header would leave
+        // the history with nothing to point at.
+        // Three messages, newest first: the newest carries no List-Id, and the
+        // two behind it disagree. The middle one is the sender's most recent
+        // known list membership, so it is what should be recorded.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["newest", "middle", "oldest"], None));
+        http.push(
+            200,
+            make_batch_response(&[
+                make_identity_metadata_response(
+                    "newest",
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub?t=new>",
+                    None,
+                    Some("1700000000000"),
+                ),
+                make_identity_metadata_response(
+                    "middle",
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub?t=mid>",
+                    Some("<weekly.acme.com>"),
+                    Some("1650000000000"),
+                ),
+                make_identity_metadata_response(
+                    "oldest",
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub?t=old>",
+                    Some("<daily.acme.com>"),
+                    Some("1600000000000"),
+                ),
+            ]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        let sender = &result.senders[0];
+        assert_eq!(
+            sender.list_id.as_deref(),
+            Some("weekly.acme.com"),
+            "the newest message's missing List-Id should not clear the value, \
+             and the oldest message should not win it back"
+        );
+    }
+
+    #[test]
+    fn unparseable_list_id_yields_none_and_a_scan_warning() {
+        // "Acme News" has no brackets and no dotted token, so there is nothing
+        // to record. The user needs to hear about it: their history will be
+        // missing this sender's list identity.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["msg1"], None));
+        http.push(
+            200,
+            make_batch_response(&[make_identity_metadata_response(
+                "msg1",
+                "Acme <news@acme.com>",
+                "<https://acme.com/unsub>",
+                Some("Acme News"),
+                None,
+            )]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        assert_eq!(result.senders[0].list_id, None);
+        assert_eq!(
+            result.warnings,
+            vec!["news@acme.com: unparseable List-Id: Acme News".to_string()],
+            "an unparseable List-Id should produce exactly one warning naming the sender"
+        );
+    }
+
+    #[test]
+    fn absent_list_id_yields_none_and_no_warning() {
+        // Most mail has no List-Id at all. That is normal, not a problem to
+        // report — warning on it would bury the real ones.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["msg1"], None));
+        http.push(
+            200,
+            make_batch_response(&[make_identity_metadata_response(
+                "msg1",
+                "Acme <news@acme.com>",
+                "<https://acme.com/unsub>",
+                None,
+                None,
+            )]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        assert_eq!(result.senders[0].list_id, None);
+        assert!(
+            result.warnings.is_empty(),
+            "an absent List-Id is not worth warning about, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn a_repeated_unparseable_list_id_warns_once_per_sender() {
+        // Ten messages from one broken sender should not produce ten identical
+        // lines in the warnings summary.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["m1", "m2", "m3"], None));
+        let parts: Vec<String> = ["m1", "m2", "m3"]
+            .iter()
+            .map(|id| {
+                make_identity_metadata_response(
+                    id,
+                    "Acme <news@acme.com>",
+                    "<https://acme.com/unsub>",
+                    Some("Acme News"),
+                    None,
+                )
+            })
+            .collect();
+        http.push(200, make_batch_response(&parts));
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        assert_eq!(result.warnings.len(), 1, "got: {:?}", result.warnings);
+    }
+
+    #[test]
+    fn each_sender_keeps_its_own_list_id() {
+        // Two senders in one batch must not share identity fields.
+        let http = MockHttpClient::new();
+        http.push(200, make_list_response(&["a1", "b1"], None));
+        http.push(
+            200,
+            make_batch_response(&[
+                make_identity_metadata_response(
+                    "a1",
+                    "A <a@a.com>",
+                    "<https://a.com/unsub>",
+                    Some("<list-a.a.com>"),
+                    None,
+                ),
+                make_identity_metadata_response(
+                    "b1",
+                    "B <b@b.com>",
+                    "<https://b.com/unsub>",
+                    Some("<list-b.b.com>"),
+                    None,
+                ),
+            ]),
+        );
+
+        let provider = GmailProvider::new("test-token", http);
+        let result = provider.scan(&[], &NoopProgress).unwrap();
+
+        let by_email: std::collections::HashMap<&str, Option<&str>> = result
+            .senders
+            .iter()
+            .map(|s| (s.email.as_str(), s.list_id.as_deref()))
+            .collect();
+        assert_eq!(by_email["a@a.com"], Some("list-a.a.com"));
+        assert_eq!(by_email["b@b.com"], Some("list-b.b.com"));
+    }
 }
