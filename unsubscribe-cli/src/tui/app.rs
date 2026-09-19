@@ -212,6 +212,9 @@ pub enum Effect {
     Scan,
     /// Review the senders, using the cache when it is worth using.
     Review,
+    /// Scan the mailbox and refresh the cache, but stop there rather than
+    /// moving on to sender selection.
+    ScanOnly,
     /// The selection was confirmed: ask before anything is sent.
     ConfirmRun,
     /// The scan worker reported; act on how it ended.
@@ -401,6 +404,15 @@ impl Stacks {
     }
 }
 
+/// What a scan the Run panel started should do once it finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanIntent {
+    /// Move on to selecting who to unsubscribe from.
+    Select,
+    /// Stay on the Run panel; the scan only refreshes the cache.
+    ScanOnly,
+}
+
 /// What the shell is waiting for an answer to.
 enum Pending {
     /// Confirm before a run actually sends anything.
@@ -431,6 +443,10 @@ pub struct Shell {
     dialog: Option<Dialog>,
     pending: Option<Pending>,
     status: Option<StatusMessage>,
+    /// What the scan currently running (or the last one started) should do
+    /// once it finishes. Set right before the scan is pushed; there is only
+    /// ever one scan in flight, so one field is enough to remember it.
+    scan_intent: ScanIntent,
     quit: bool,
     /// Quit was confirmed while a worker was still going: the loop tears the
     /// terminal down only once that worker has actually stopped, so a run is
@@ -452,6 +468,7 @@ impl Shell {
             dialog: None,
             pending: None,
             status: None,
+            scan_intent: ScanIntent::Select,
             quit: false,
             quit_when_idle: false,
         }
@@ -935,8 +952,9 @@ impl Shell {
     /// Every effect that needs nothing but the shell's own state.
     fn perform_pure(&mut self, effect: Effect) {
         match effect {
-            Effect::Scan => self.start_scan(),
+            Effect::Scan => self.start_scan(ScanIntent::Select),
             Effect::Review => self.review(),
+            Effect::ScanOnly => self.start_scan(ScanIntent::ScanOnly),
             Effect::ConfirmRun => self.confirm_run(),
             Effect::ScanEnded => self.scan_ended(),
             Effect::RunEnded => {
@@ -1034,13 +1052,14 @@ impl Shell {
             // Nothing cached, or the cache is not usable; either way the
             // mailbox is the only source left.
             ScanAction::Rescan | ScanAction::CacheUnavailable | ScanAction::Ask { .. } => {
-                self.start_scan()
+                self.start_scan(ScanIntent::Select)
             }
         }
     }
 
     /// Start a scan on a worker thread and show it.
-    fn start_scan(&mut self) {
+    fn start_scan(&mut self, intent: ScanIntent) {
+        self.scan_intent = intent;
         let shared = ScanShared::new();
         let outcome = worker::spawn_scan(
             self.ctx.account.clone(),
@@ -1066,7 +1085,18 @@ impl Shell {
                     ));
                     return;
                 }
-                self.open_selection(*obtained);
+                match self.scan_intent {
+                    ScanIntent::Select => self.open_selection(*obtained),
+                    // The cache is already what the scan just wrote; the
+                    // panel only needs the numbers it implies recomputed.
+                    ScanIntent::ScanOnly => {
+                        let count = obtained.senders.len();
+                        self.refresh();
+                        self.set_status(StatusMessage::success(format!(
+                            "Scan complete \u{2014} {count} senders with unsubscribe links."
+                        )));
+                    }
+                }
             }
             ScanEnded::Cancelled => {
                 self.refresh();
@@ -2765,6 +2795,34 @@ mod tests {
                 "and the selection is waiting under Run"
             );
             assert_eq!(shell.run_activity(), RunActivity::Parked);
+        }
+
+        #[test]
+        fn scan_only_returns_to_the_run_panel_with_refreshed_stats_instead_of_selecting() {
+            let mut shell = shell();
+            open(&mut shell, Section::Run);
+            let (tx, rx) = mpsc::channel();
+            shell.scan_intent = ScanIntent::ScanOnly;
+            shell.apply(Nav::Push(SubView::Scan(Box::new(ScanScreen::new(
+                ScanShared::new(),
+                rx,
+            )))));
+
+            tx.send(worker::ScanOutcome::Done(scanned(2)))
+                .expect("the screen is listening");
+            let nav = shell.stacks.run.last_mut().map(SubView::tick).expect("a scan");
+            let effect = shell.apply(nav).expect("the scan reports its ending");
+            shell.perform_pure(effect);
+
+            assert!(
+                shell.stacks.run.is_empty(),
+                "the scan finished and nothing was pushed to replace it -- \
+                 no selection to move on to"
+            );
+            assert!(
+                matches!(&shell.status, Some(status) if status.text.contains('2')),
+                "the user is told the scan finished, not left to guess"
+            );
         }
 
         #[test]

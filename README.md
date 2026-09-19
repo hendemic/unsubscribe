@@ -45,16 +45,17 @@ highlighted.
 │   Warnings (2)     │                                   │
 │   Logs             │ > Unsubscribe from new scan       │
 │   Settings         │   Unsubscribe from cached         │
-│                    │                                   │
+│                    │   Scan only                       │
 │   Quit             │                                   │
 ├────────────────────┴───────────────────────────────────┤
 │ ↑↓ move  Enter open  ? help  q quit                    │
 └────────────────────────────────────────────────────────┘
 ```
 
-- **Run** — what the last scan found, and the two ways to act on it: scan the
-  mailbox afresh, or work from the last scan. The scan, the sender selection,
-  the confirmation, the run and its results all happen inside this panel.
+- **Run** — what the last scan found, and the three ways to act on it: scan
+  the mailbox afresh and unsubscribe, work from the last scan, or just scan
+  to refresh the cache. The scan, the sender selection, the confirmation, the
+  run and its results all happen inside this panel.
 - **Unsubscribe List** — every sender that has been asked, what it did after,
   and its full timeline.
 - **Warnings** — `List-Unsubscribe` headers the last scan could not parse.
