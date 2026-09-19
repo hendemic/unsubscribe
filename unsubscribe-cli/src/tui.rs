@@ -21,6 +21,8 @@ pub mod app;
 pub mod components;
 pub mod config;
 pub mod home;
+pub mod run;
+pub mod scan;
 pub mod select;
 pub mod warnings;
 pub mod worker;

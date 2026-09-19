@@ -223,6 +223,24 @@ impl App {
             .sum()
     }
 
+    /// The senders currently ticked, without consuming the screen.
+    ///
+    /// The confirmation is asked over the top of the screen, so backing out of
+    /// it has to leave the selection exactly as it was.
+    pub(crate) fn selected_senders(&self) -> Vec<SenderInfo> {
+        let sections = [
+            (&self.previous, &self.previous_selected),
+            (&self.active, &self.active_selected),
+            (&self.stale, &self.stale_selected),
+        ];
+        sections
+            .iter()
+            .flat_map(|(senders, selected)| senders.iter().zip(selected.iter()))
+            .filter(|(_, selected)| **selected)
+            .map(|(sender, _)| sender.clone())
+            .collect()
+    }
+
     /// Consume the app and produce `(sender, selected)` for each sender.
     pub(crate) fn into_results(self) -> Vec<(SenderInfo, bool)> {
         let previous = self.previous.into_iter().zip(self.previous_selected);

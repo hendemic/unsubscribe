@@ -58,6 +58,12 @@ impl ScanProgress for CliScanProgress {
             pb.finish();
         }
     }
+
+    /// The scriptable front-end has no cancel key: Ctrl-C still ends the
+    /// process, exactly as it always did.
+    fn should_cancel(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +188,12 @@ impl RunObserver for CliRunObserver {
     fn on_warning(&self, warning: &RunWarning) {
         print_run_warning(warning);
     }
+
+    /// Nothing to poll: a scripted run has no cancel key, and Ctrl-C ends the
+    /// process as before.
+    fn should_cancel(&self) -> bool {
+        false
+    }
 }
 
 /// Observer for the commands that only obtain senders (`scan`, `export`) and
@@ -196,6 +208,10 @@ impl RunObserver for CliWarningsOnly {
     fn on_archive_done(&self, _archived: u32) {}
     fn on_warning(&self, warning: &RunWarning) {
         print_run_warning(warning);
+    }
+
+    fn should_cancel(&self) -> bool {
+        false
     }
 }
 

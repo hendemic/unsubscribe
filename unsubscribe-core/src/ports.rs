@@ -21,6 +21,25 @@ pub trait ScanProgress: Send + Sync {
 
     /// Called when a folder scan is complete.
     fn on_folder_done(&self, folder: &Folder);
+
+    /// Running totals once another folder's results have been merged in.
+    ///
+    /// Senders are deduplicated across folders, so only the adapter can say
+    /// how many *distinct* senders have been found so far; it reports the
+    /// figure whenever it changes. Consumers that show no live tally ignore
+    /// it, which is the default.
+    fn on_totals(&self, _senders: u32, _warnings: u32) {}
+
+    /// Whether the consumer has asked the scan to stop.
+    ///
+    /// Adapters poll this between batches -- never mid-fetch -- and return
+    /// whatever they have; [`crate::pipeline::scan_senders`] then discards it
+    /// and leaves the existing cache alone, so a cancelled scan costs nothing
+    /// but the time it ran for. Cancelling is a consumer's choice, so the
+    /// default is never, and an adapter that cannot poll is still correct.
+    fn should_cancel(&self) -> bool {
+        false
+    }
 }
 
 /// No-op implementation for consumers that don't need progress reporting.

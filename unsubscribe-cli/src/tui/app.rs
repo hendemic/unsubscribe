@@ -7,6 +7,7 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
@@ -14,8 +15,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unsubscribe_core::{
-    annotate_senders, load_cached_senders, record_resumptions, AccountConfig, ConfigStore,
-    Credential, DataStore, Preferences, RunPlan, RunPolicy, SenderInfo,
+    annotate_senders, decide_scan_action, load_cached_senders, record_resumptions, AccountConfig,
+    CachedScanSummary, ConfigStore, Credential, DataStore, ObtainedSenders, Preferences, RunPlan,
+    RunPolicy, ScanAction, SenderInfo,
 };
 use unsubscribe_persistence::{
     FileDataStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
@@ -28,12 +30,16 @@ use super::config::{SettingsApp, SettingsIo};
 use super::home::{HomeScreen, HomeStats};
 use super::select::{App as SelectScreen, SelectAction};
 use super::warnings::WarningsScreen;
-use super::worker::{self, SelectionContext};
-use super::{config, home, select, suspended, warnings, TerminalGuard, Tui};
+use super::run::{PlanCounts, RunScreen};
+use super::scan::{ScanEnded, ScanScreen};
+use super::worker::{self, RunShared, ScanShared, SelectionContext};
+use super::{config, home, run, scan, select, suspended, warnings, TerminalGuard, Tui};
 use crate::commands::config::ConfigIo;
 use crate::commands::load_history;
-use crate::progress::{CliRunObserver, CliWarningsOnly};
-use crate::time::{age_secs_since, format_relative_age, now_unix_secs, utc_to_local_display};
+use crate::progress::CliWarningsOnly;
+use crate::time::{
+    age_secs_since, format_relative_age, now_unix_secs, scan_max_age_secs, utc_to_local_display,
+};
 
 /// How long the loop waits for a key before redrawing anyway.
 ///
@@ -145,9 +151,6 @@ pub enum Nav {
     Stay,
     Push(Screen),
     Pop,
-    /// Replace the top of the stack, for a screen that hands over rather than
-    /// nests (scan \u{2192} selection).
-    Replace(Screen),
     Quit,
     /// Something only the shell can do.
     Effect(Effect),
@@ -161,6 +164,13 @@ pub enum Effect {
     Review,
     /// The selection screen was confirmed: ask before anything is sent.
     ConfirmRun,
+    /// The scan worker reported; act on how it ended.
+    ScanEnded,
+    /// The run worker reported; refresh what the ending changed.
+    RunEnded,
+    /// Esc during a scan or a run: ask before stopping.
+    ConfirmCancelScan,
+    ConfirmCancelRun,
     OpenHistory,
     OpenWarnings,
     OpenSettings,
@@ -177,6 +187,8 @@ pub enum Effect {
 /// One screen in the stack.
 pub enum Screen {
     Home(HomeScreen),
+    Scan(Box<ScanScreen>),
+    Run(Box<RunScreen>),
     Select {
         app: Box<SelectScreen>,
         /// The history the selection was annotated against, needed to plan.
@@ -194,6 +206,8 @@ impl Screen {
     fn title(&self) -> &'static str {
         match self {
             Self::Home(_) => "Home",
+            Self::Scan(_) => "Scan",
+            Self::Run(_) => "Run",
             Self::Select { .. } => "Review senders",
             Self::Settings { .. } => "Settings",
             Self::Warnings(_) => "Scan warnings",
@@ -203,6 +217,8 @@ impl Screen {
     fn hints(&self) -> &str {
         match self {
             Self::Home(screen) => screen.hints(),
+            Self::Scan(screen) => screen.hints(),
+            Self::Run(screen) => screen.hints(),
             Self::Select { app, .. } => app.hints(),
             Self::Settings { app, .. } => config::hints(app),
             Self::Warnings(screen) => screen.hints(),
@@ -213,6 +229,8 @@ impl Screen {
     fn keys(&self) -> Vec<(&'static str, &'static str)> {
         match self {
             Self::Home(screen) => screen.keys(),
+            Self::Scan(screen) => screen.keys(),
+            Self::Run(screen) => screen.keys(),
             Self::Select { .. } => vec![
                 ("Space", "select or deselect the sender"),
                 ("a / n", "select all / none"),
@@ -242,9 +260,20 @@ impl Screen {
         }
     }
 
+    /// Poll a background worker, if the screen has one. Called once a frame.
+    fn tick(&mut self) -> Nav {
+        match self {
+            Self::Scan(screen) => screen.tick(),
+            Self::Run(screen) => screen.tick(),
+            _ => Nav::Stay,
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) -> Nav {
         match self {
             Self::Home(screen) => screen.on_key(key),
+            Self::Scan(screen) => screen.on_key(key),
+            Self::Run(screen) => screen.on_key(key),
             Self::Select { app, .. } => match app.on_key(key) {
                 SelectAction::None => Nav::Stay,
                 SelectAction::Confirm => Nav::Effect(Effect::ConfirmRun),
@@ -264,6 +293,8 @@ impl Screen {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         match self {
             Self::Home(screen) => home::render(f, area, screen),
+            Self::Scan(screen) => scan::render(f, area, screen),
+            Self::Run(screen) => run::render(f, area, screen),
             Self::Select { app, .. } => select::render(f, area, app),
             Self::Settings { app, .. } => config::render(f, area, app),
             Self::Warnings(screen) => warnings::render(f, area, screen),
@@ -278,7 +309,14 @@ enum Pending {
     /// Confirm before a run actually sends anything.
     Run {
         plan: Box<RunPlan>,
+        counts: Box<PlanCounts>,
     },
+    /// The cache-or-rescan question: yes reuses the cached scan, no rescans.
+    UseCachedScan {
+        cached: Box<ObtainedSenders>,
+    },
+    CancelScan,
+    CancelRun,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +381,11 @@ impl Shell {
             if self.status.as_ref().is_some_and(StatusMessage::expired) {
                 self.status = None;
             }
+            // Workers report between frames, so the screen is never more
+            // than one tick behind what the pipeline has done.
+            let nav = self.top().tick();
+            self.apply(nav, terminal)?;
+
             terminal.draw(|f| self.render(f))?;
 
             if !event::poll(TICK)? {
@@ -394,24 +437,33 @@ impl Shell {
             return Ok(());
         }
 
-        match self.top().on_key(key) {
+        let nav = self.top().on_key(key);
+        self.apply(nav, terminal)
+    }
+
+    /// Carry out what a screen asked for.
+    fn apply(&mut self, nav: Nav, terminal: &mut Tui) -> Result<()> {
+        match nav {
             Nav::Stay => {}
             Nav::Push(screen) => self.stack.push(screen),
             Nav::Pop => {
                 // Home is the floor: popping it would leave nothing to draw.
                 if self.stack.len() > 1 {
                     self.stack.pop();
+                    self.dismiss_dialog();
                     self.refresh_home();
                 }
-            }
-            Nav::Replace(screen) => {
-                self.stack.pop();
-                self.stack.push(screen);
             }
             Nav::Quit => self.quit = true,
             Nav::Effect(effect) => self.perform(effect, terminal)?,
         }
         Ok(())
+    }
+
+    /// Close whatever was being asked, because the screen under it has gone.
+    fn dismiss_dialog(&mut self) {
+        self.dialog = None;
+        self.pending = None;
     }
 
     // -- effects ----------------------------------------------------------
@@ -420,9 +472,45 @@ impl Shell {
         match effect {
             // Until the in-app scan and run screens exist, both hand off to
             // the command that already does this, with the app suspended.
-            Effect::Scan => self.handoff_run(terminal, true)?,
-            Effect::Review => self.review(terminal)?,
+            Effect::Scan => self.start_scan(),
+            Effect::Review => self.review(),
             Effect::ConfirmRun => self.confirm_run(),
+            Effect::ScanEnded => self.scan_ended(),
+            Effect::RunEnded => {
+                self.refresh_home();
+                // The screen keeps its summary; a failure also gets a modal,
+                // because an archive that did not happen is not a detail.
+                let failure = match self.stack.last() {
+                    Some(Screen::Run(screen)) => screen.failure().map(str::to_string),
+                    _ => None,
+                };
+                if let Some(message) = failure {
+                    self.dialog = Some(Dialog::error("Run failed", message));
+                }
+            }
+            Effect::ConfirmCancelScan => {
+                self.pending = Some(Pending::CancelScan);
+                self.dialog = Some(Dialog::confirm(
+                    "Cancel the scan",
+                    [
+                        "Stop scanning and throw away what has been read?".to_string(),
+                        String::new(),
+                        "The last complete scan stays in the cache, untouched.".to_string(),
+                    ],
+                ));
+            }
+            Effect::ConfirmCancelRun => {
+                self.pending = Some(Pending::CancelRun);
+                self.dialog = Some(Dialog::confirm(
+                    "Cancel the run",
+                    [
+                        "Stop after the sender being attempted now?".to_string(),
+                        String::new(),
+                        "Attempts already made stay recorded, and the senders                          already handled are still archived."
+                            .to_string(),
+                    ],
+                ));
+            }
             Effect::OpenHistory => {
                 self.dialog = Some(Dialog::notice(
                     "History",
@@ -456,7 +544,18 @@ impl Shell {
 
     fn resolve(&mut self, pending: Pending, toggled: bool, terminal: &mut Tui) -> Result<()> {
         match pending {
-            Pending::Run { plan } => self.start_run(*plan, toggled, terminal)?,
+            Pending::Run { plan, counts } => self.start_run(*plan, *counts, toggled),
+            Pending::UseCachedScan { cached } => self.open_selection(*cached),
+            Pending::CancelScan => {
+                if let Some(Screen::Scan(screen)) = self.stack.last_mut() {
+                    screen.request_cancel();
+                }
+            }
+            Pending::CancelRun => {
+                if let Some(Screen::Run(screen)) = self.stack.last_mut() {
+                    screen.request_cancel();
+                }
+            }
             Pending::Reauthenticate => {
                 let config_dir = self.ctx.config_dir.clone();
                 let outcome = suspended(terminal, || {
@@ -475,28 +574,124 @@ impl Shell {
         Ok(())
     }
 
-    /// Open the selection screen on the cached scan.
+    /// Decide between the cached scan and a fresh one, then act on it.
     ///
-    /// With nothing cached there is nothing to review, so this falls through
-    /// to a scan. The grouping and the verdicts come from `annotate_senders`,
-    /// and what it observes is recorded before the screen opens -- seeing a
-    /// sender ignore an unsubscribe is evidence whether or not the user then
-    /// cancels.
-    fn review(&mut self, terminal: &mut Tui) -> Result<()> {
-        let Some(cached) = load_cached_senders(
+    /// The decision is [`decide_scan_action`] in core -- the same function the
+    /// `run` command asks -- so the app and a scripted run never disagree
+    /// about when a cache is too old to trust.
+    fn review(&mut self) {
+        let usable = load_cached_senders(
             &self.ctx.cache,
             &self.ctx.account.account_id,
             self.ctx.preferences.min_emails,
             &CliWarningsOnly,
-        ) else {
-            return self.handoff_run(terminal, true);
-        };
+        );
+        let summary = usable.as_ref().map(|cache| CachedScanSummary {
+            sender_count: cache.senders.len(),
+            age_secs: age_secs_since(&cache.scanned_at),
+        });
+        let action = decide_scan_action(
+            summary,
+            false,
+            false,
+            true,
+            scan_max_age_secs(self.ctx.preferences.cache_max_age_days),
+        );
 
+        match action {
+            ScanAction::UseCache => {
+                self.open_selection(usable.expect("UseCache implies a usable cache"));
+            }
+            // Nothing cached, or the caller demanded a cache that is not
+            // there; either way the mailbox is the only source left.
+            ScanAction::Rescan | ScanAction::CacheUnavailable => self.start_scan(),
+            ScanAction::Ask { default_cached } => {
+                let cached = usable.expect("Ask implies a usable cache");
+                let age = age_secs_since(&cached.scanned_at)
+                    .map(format_relative_age)
+                    .map(|age| format!(" ({age})"))
+                    .unwrap_or_default();
+                let when = utc_to_local_display(&cached.scanned_at)
+                    .unwrap_or_else(|| cached.scanned_at.clone());
+                self.dialog = Some(
+                    Dialog::confirm(
+                        "Use the cached scan?",
+                        [
+                            format!("Last scan {when}{age}."),
+                            format!("{} senders with unsubscribe links.", cached.senders.len()),
+                            String::new(),
+                            if default_cached {
+                                "Recent enough to reuse.".to_string()
+                            } else {
+                                "Older than your cache_max_age_days \u{2014} a rescan is suggested."
+                                    .to_string()
+                            },
+                        ],
+                    )
+                    .with_hints(" y: use the cached scan | n/Esc: scan the mailbox again"),
+                );
+                self.pending = Some(Pending::UseCachedScan {
+                    cached: Box::new(cached),
+                });
+            }
+        }
+    }
+
+    /// Start a scan on a worker thread and show it.
+    fn start_scan(&mut self) {
+        let shared = ScanShared::new();
+        let outcome = worker::spawn_scan(
+            self.ctx.account.clone(),
+            self.ctx.credential.clone(),
+            self.ctx.preferences,
+            Arc::clone(&shared),
+        );
+        self.stack
+            .push(Screen::Scan(Box::new(ScanScreen::new(shared, outcome))));
+    }
+
+    /// Act on how a scan ended.
+    fn scan_ended(&mut self) {
+        let Some(Screen::Scan(screen)) = self.stack.pop() else {
+            return;
+        };
+        self.dismiss_dialog();
+        match screen.into_ended() {
+            ScanEnded::Done(obtained) => {
+                if obtained.senders.is_empty() {
+                    self.refresh_home();
+                    self.set_status(StatusMessage::warning(
+                        "No senders with unsubscribe links found.",
+                    ));
+                    return;
+                }
+                self.open_selection(*obtained);
+            }
+            ScanEnded::Cancelled => {
+                self.refresh_home();
+                self.set_status(StatusMessage::warning(
+                    "Scan cancelled \u{2014} the previous scan is untouched.",
+                ));
+            }
+            ScanEnded::Failed(message) => {
+                self.refresh_home();
+                self.dialog = Some(Dialog::error("Scan failed", message));
+            }
+        }
+    }
+
+    /// Annotate senders against the history and open the selection screen.
+    ///
+    /// Observe, then judge: what the annotation reveals is recorded before the
+    /// screen opens, because seeing a sender ignore an unsubscribe is evidence
+    /// whether or not the user then cancels -- and it is what makes the
+    /// ignored rung spent when the plan is built.
+    fn open_selection(&mut self, obtained: ObtainedSenders) {
         let stored = load_history(self.ctx.history_store(), &self.ctx.account.account_id);
         let policy = self.ctx.policy(false);
         let annotated = annotate_senders(
             &self.ctx.account.account_id,
-            cached.senders,
+            obtained.senders,
             &stored.attempts,
             &stored.resumptions,
             &policy,
@@ -522,116 +717,55 @@ impl Shell {
             app: Box::new(app),
             history: Box::new(history),
         });
-        Ok(())
     }
 
     /// Turn the selection into a plan and ask before anything is sent.
+    ///
+    /// The selection screen stays on the stack: the question is asked over
+    /// it, so declining leaves every tick where the user put it.
     fn confirm_run(&mut self) {
-        let Some(Screen::Select { app, history }) = self.stack.pop() else {
+        let Some(Screen::Select { app, history }) = self.stack.last() else {
             return;
         };
-        let selected: Vec<SenderInfo> = app
-            .into_results()
-            .into_iter()
-            .filter(|(_, selected)| *selected)
-            .map(|(sender, _)| sender)
-            .collect();
+        let selected: Vec<SenderInfo> = app.selected_senders();
 
         if selected.is_empty() {
             self.set_status(StatusMessage::warning("Nothing selected."));
             return;
         }
 
-        let plan = worker::plan(
-            selected,
-            &history,
-            &self.ctx.policy(false),
-            now_unix_secs(),
-        );
+        let plan = worker::plan(selected, history, &self.ctx.policy(false), now_unix_secs());
+        let counts = PlanCounts::of(&plan);
         self.dialog = Some(
             Dialog::confirm("Confirm run", plan_summary(&plan)).with_toggle("Dry run", false),
         );
         self.pending = Some(Pending::Run {
             plan: Box::new(plan),
+            counts: Box::new(counts),
         });
     }
 
-    /// Carry out a confirmed plan.
+    /// Carry out a confirmed plan on a worker thread.
     ///
-    /// Suspended for now, so the existing reporting still shows what happened;
-    /// the run screen takes this over.
-    fn start_run(&mut self, plan: RunPlan, dry_run: bool, terminal: &mut Tui) -> Result<()> {
+    /// The selection screen goes now rather than at confirmation time: its
+    /// senders are in the plan, and coming back to it would offer a second
+    /// run over mail that has just been archived.
+    fn start_run(&mut self, plan: RunPlan, counts: PlanCounts, dry_run: bool) {
+        if matches!(self.stack.last(), Some(Screen::Select { .. })) {
+            self.stack.pop();
+        }
         let policy = worker::policy(&self.ctx.preferences, dry_run);
-        let account = self.ctx.account.clone();
-        let credential = self.ctx.credential.clone();
-        let log_path = unsubscribe_persistence::data_dir().join("unsubscribe_log.csv");
-        let observer = CliRunObserver::new(dry_run, &account.archive_folder, log_path);
-
-        let outcome = {
-            let cache = &self.ctx.cache;
-            let history = self.ctx.history_store();
-            suspended(terminal, || {
-                let outcome = worker::execute(
-                    &account,
-                    &credential,
-                    cache,
-                    history,
-                    &plan,
-                    &policy,
-                    &observer,
-                )?;
-                press_enter_to_return()?;
-                Ok(outcome)
-            })?
-        };
-
-        match outcome {
-            Ok(outcome) => {
-                self.refresh_home();
-                self.set_status(StatusMessage::success(format!(
-                    "{} succeeded, {} failed, {} archived.",
-                    outcome.succeeded(),
-                    outcome.failed(),
-                    outcome.archived
-                )));
-            }
-            Err(e) => self.fail("Run failed", &e),
-        }
-        Ok(())
-    }
-
-    /// Suspend the app and run the existing `run` command end to end.
-    ///
-    /// The interim wiring for the first sub-issue: the app can already reach
-    /// the whole flow, and the screens that bring it inside replace this.
-    fn handoff_run(&mut self, terminal: &mut Tui, rescan: bool) -> Result<()> {
-        let account = self.ctx.account.clone();
-        let credential = self.ctx.credential.clone();
-        let preferences = self.ctx.preferences;
-        let data = FileDataStore::new();
-        let outcome = {
-            let cache = &self.ctx.cache;
-            let history = self.ctx.history_store();
-            suspended(terminal, || {
-                crate::commands::run::cmd_run(
-                    &account,
-                    &credential,
-                    &data,
-                    cache,
-                    history,
-                    &preferences,
-                    false,
-                    false,
-                    rescan,
-                )?;
-                press_enter_to_return()
-            })?
-        };
-        match outcome {
-            Ok(()) => self.refresh_home(),
-            Err(e) => self.fail("Run failed", &e),
-        }
-        Ok(())
+        let shared = RunShared::new();
+        let result = worker::spawn_run(
+            self.ctx.account.clone(),
+            self.ctx.credential.clone(),
+            plan,
+            policy,
+            Arc::clone(&shared),
+        );
+        self.stack.push(Screen::Run(Box::new(RunScreen::new(
+            shared, result, counts, dry_run,
+        ))));
     }
 
     fn open_settings(&mut self) {

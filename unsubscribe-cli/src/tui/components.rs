@@ -23,6 +23,9 @@ pub struct Dialog {
     /// An extra yes/no the dialog carries, shown as a checkbox and toggled
     /// with `d`. Used for the run confirmation's dry-run switch.
     pub toggle: Option<DialogToggle>,
+    /// Footer hints, when the default wording would misdescribe the choice
+    /// (a two-way question where "no" is an action of its own).
+    pub hints: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +64,7 @@ impl Dialog {
             title: title.into(),
             body: body.into_iter().collect(),
             toggle: None,
+            hints: None,
         }
     }
 
@@ -72,6 +76,7 @@ impl Dialog {
             title: title.into(),
             body: wrapped_lines(&message.into()),
             toggle: None,
+            hints: None,
         }
     }
 
@@ -82,6 +87,7 @@ impl Dialog {
             title: title.into(),
             body: body.into_iter().collect(),
             toggle: None,
+            hints: None,
         }
     }
 
@@ -92,6 +98,13 @@ impl Dialog {
             label: label.into(),
             on,
         });
+        self
+    }
+
+    /// Replace the footer wording.
+    #[must_use]
+    pub fn with_hints(mut self, hints: impl Into<String>) -> Self {
+        self.hints = Some(hints.into());
         self
     }
 
@@ -124,7 +137,10 @@ impl Dialog {
     }
 
     /// The footer hint while this dialog is up.
-    pub fn hints(&self) -> &'static str {
+    pub fn hints(&self) -> &str {
+        if let Some(hints) = &self.hints {
+            return hints;
+        }
         match self.kind {
             DialogKind::Confirm if self.toggle.is_some() => {
                 " Enter/y: confirm | d: toggle dry run | Esc/n: cancel"
@@ -145,7 +161,6 @@ pub struct StatusMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
-    Info,
     Success,
     Warning,
 }
@@ -157,10 +172,6 @@ impl StatusMessage {
             kind,
             shown_at: Instant::now(),
         }
-    }
-
-    pub fn info(text: impl Into<String>) -> Self {
-        Self::new(StatusKind::Info, text)
     }
 
     pub fn success(text: impl Into<String>) -> Self {
@@ -178,7 +189,6 @@ impl StatusMessage {
 
     fn color(&self) -> Color {
         match self.kind {
-            StatusKind::Info => Color::Cyan,
             StatusKind::Success => Color::Green,
             StatusKind::Warning => Color::Yellow,
         }
