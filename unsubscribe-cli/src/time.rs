@@ -4,31 +4,20 @@
 
 use unsubscribe_core::SenderInfo;
 
-/// Seconds in a month, taken as a twelfth of a 365-day year so that the
-/// default threshold of 12 months is exactly one year.
-const SECS_PER_MONTH: i64 = 365 * 24 * 60 * 60 / 12;
-
 /// Month abbreviations for the hand-rolled date formatting below.
 pub const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// Current time in Unix seconds (UTC), or 0 if the clock is before the epoch.
-pub fn now_unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub use unsubscribe_core::now_unix_secs;
 
 /// A sender is stale when their most recent message predates the configured
-/// threshold. Senders whose adapter gave no date are never stale.
+/// threshold, judged against the clock right now.
+///
+/// The rule itself lives in core so the pipeline and the screens agree; this
+/// only supplies "now" for the display paths that have no run to take it from.
 pub fn is_stale(sender: &SenderInfo, stale_after_months: u32) -> bool {
-    let now = now_unix_secs();
-    match sender.last_seen {
-        Some(ts) => now - ts > i64::from(stale_after_months) * SECS_PER_MONTH,
-        None => false,
-    }
+    unsubscribe_core::is_stale(sender, stale_after_months, now_unix_secs())
 }
 
 /// The configured cached-scan freshness window, in seconds.

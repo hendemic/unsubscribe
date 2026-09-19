@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{SenderInfo, UnsubscribeMethod};
+use crate::escalation::{next_step, NextStep};
+use crate::types::{SenderInfo, UnsubscribeMethod, UnsubscribeResult};
 
 /// One recorded unsubscribe attempt against one sender.
 ///
@@ -42,6 +43,9 @@ pub struct UnsubscribeAttempt {
     pub final_url: Option<String>,
     /// The `List-Unsubscribe` header as received, kept verbatim as evidence.
     pub list_unsubscribe_raw: Option<String>,
+    /// Id of the earlier attempt this one escalates from -- the successful
+    /// request the sender ignored. `None` for an attempt that answers nothing.
+    pub follows_attempt_id: Option<String>,
     /// Human-readable summary of the outcome.
     pub detail: String,
 }
@@ -65,6 +69,7 @@ impl UnsubscribeAttempt {
         url: String,
         final_url: Option<String>,
         list_unsubscribe_raw: Option<String>,
+        follows_attempt_id: Option<String>,
         detail: String,
     ) -> Self {
         Self {
@@ -80,9 +85,79 @@ impl UnsubscribeAttempt {
             url,
             final_url,
             list_unsubscribe_raw,
+            follows_attempt_id,
             detail,
         }
     }
+
+    /// Build the history record for a completed attempt.
+    ///
+    /// The sender supplies the identity evidence (domain, list id, the raw
+    /// `List-Unsubscribe` header) and the result supplies what the attempt
+    /// did. `attempted_at` is passed in rather than read from the clock so
+    /// the mapping stays testable and the caller decides what "now" means.
+    /// `follows_attempt_id` links an escalated attempt to the one it answers.
+    #[must_use]
+    pub fn from_result(
+        account: &str,
+        sender: &SenderInfo,
+        result: &UnsubscribeResult,
+        attempted_at: i64,
+        follows_attempt_id: Option<String>,
+    ) -> Self {
+        Self::new(
+            account.to_string(),
+            sender.email.clone(),
+            sender.domain.clone(),
+            sender.list_id.clone(),
+            attempted_at,
+            result.method,
+            result.success,
+            result.http_status,
+            result.url.clone(),
+            result.final_url.clone(),
+            sender.list_unsubscribe_raw.clone(),
+            follows_attempt_id,
+            result.detail.clone(),
+        )
+    }
+}
+
+impl UnsubscribeAttempt {
+    /// Whether this attempt was made against `sender`.
+    ///
+    /// `List-Id` decides when the attempt and the scan both carry one, since
+    /// the From address may have rotated since; otherwise the address does,
+    /// case-insensitively.
+    #[must_use]
+    pub fn is_about(&self, sender: &SenderInfo) -> bool {
+        match (
+            normalized_list_id(self.list_id.as_deref()),
+            normalized_list_id(sender.list_id.as_deref()),
+        ) {
+            (Some(recorded), Some(scanned)) => recorded == scanned,
+            _ => self.sender_email.eq_ignore_ascii_case(&sender.email),
+        }
+    }
+}
+
+/// Every attempt the history holds about one sender, oldest first.
+///
+/// The history is already ordered oldest-first by the store, so this only
+/// filters.
+pub fn attempts_about<'a>(
+    sender: &'a SenderInfo,
+    attempts: &'a [UnsubscribeAttempt],
+) -> impl Iterator<Item = &'a UnsubscribeAttempt> {
+    attempts.iter().filter(move |a| a.is_about(sender))
+}
+
+/// Every resumption the history holds about one sender, oldest first.
+pub fn resumptions_about<'a>(
+    sender: &'a SenderInfo,
+    resumptions: &'a [Resumption],
+) -> impl Iterator<Item = &'a Resumption> {
+    resumptions.iter().filter(move |r| r.is_about(sender))
 }
 
 /// Reduce a history to the most recent *successful* attempt per sender address.
@@ -94,11 +169,33 @@ impl UnsubscribeAttempt {
 pub fn latest_successful_attempts(
     attempts: &[UnsubscribeAttempt],
 ) -> HashMap<String, UnsubscribeAttempt> {
+    latest_successful_by(attempts, |attempt| {
+        Some(attempt.sender_email.to_lowercase())
+    })
+}
+
+/// The same reduction keyed by RFC 2919 `List-Id`, skipping attempts that
+/// carried none.
+///
+/// Senders rotate From addresses and send through ESPs, so the list identifier
+/// is the stabler half of a sender's identity and is tried first.
+#[must_use]
+pub fn latest_successful_attempts_by_list_id(
+    attempts: &[UnsubscribeAttempt],
+) -> HashMap<String, UnsubscribeAttempt> {
+    latest_successful_by(attempts, |attempt| normalized_list_id(attempt.list_id.as_deref()))
+}
+
+/// Keep the newest successful attempt per key, ignoring attempts with no key.
+fn latest_successful_by(
+    attempts: &[UnsubscribeAttempt],
+    key_of: impl Fn(&UnsubscribeAttempt) -> Option<String>,
+) -> HashMap<String, UnsubscribeAttempt> {
     attempts
         .iter()
         .filter(|a| a.success)
-        .fold(HashMap::new(), |mut latest, attempt| {
-            let key = attempt.sender_email.to_lowercase();
+        .filter_map(|attempt| key_of(attempt).map(|key| (key, attempt)))
+        .fold(HashMap::new(), |mut latest, (key, attempt)| {
             let keep = latest
                 .get(&key)
                 .is_none_or(|existing: &UnsubscribeAttempt| {
@@ -111,15 +208,300 @@ pub fn latest_successful_attempts(
         })
 }
 
+/// A `List-Id` trimmed and lowercased, or `None` when there is nothing usable.
+fn normalized_list_id(list_id: Option<&str>) -> Option<String> {
+    list_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// An account's successful unsubscribes, indexed the two ways a sender can be
+/// recognised.
+///
+/// Built once per run and asked about each scanned sender, because the answer
+/// drives both what the screens show and whether a resumption gets recorded.
+#[derive(Debug, Clone, Default)]
+pub struct LatestAttempts {
+    by_list_id: HashMap<String, UnsubscribeAttempt>,
+    by_email: HashMap<String, UnsubscribeAttempt>,
+}
+
+impl LatestAttempts {
+    /// Index an account's history.
+    #[must_use]
+    pub fn from_history(attempts: &[UnsubscribeAttempt]) -> Self {
+        Self {
+            by_list_id: latest_successful_attempts_by_list_id(attempts),
+            by_email: latest_successful_attempts(attempts),
+        }
+    }
+
+    /// The successful attempt this sender's history hangs off.
+    ///
+    /// `List-Id` wins when both the sender and a recorded attempt carry one,
+    /// since the address may since have rotated; otherwise the address decides,
+    /// case-insensitively.
+    #[must_use]
+    pub fn for_sender(&self, sender: &SenderInfo) -> Option<&UnsubscribeAttempt> {
+        normalized_list_id(sender.list_id.as_deref())
+            .and_then(|id| self.by_list_id.get(&id))
+            .or_else(|| self.by_email.get(&sender.email.to_lowercase()))
+    }
+
+    /// Whether the account has any successful unsubscribe on record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_list_id.is_empty() && self.by_email.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resumptions: senders that ignored a successful unsubscribe
+// ---------------------------------------------------------------------------
+
+/// One observation that a sender kept mailing after a successful unsubscribe.
+///
+/// Append-only evidence like an attempt, and keyed to the attempt that was
+/// ignored, so a violation report can show the pair: this is when they were
+/// told, this is what arrived afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resumption {
+    /// UUID for this observation.
+    pub id: String,
+    /// Account the mail arrived in.
+    pub account: String,
+    /// Sender address as the scan saw it.
+    pub sender_email: String,
+    /// RFC 2919 list identifier, when the sender's mail carried one.
+    pub list_id: Option<String>,
+    /// Id of the successful attempt that was ignored. At most one resumption
+    /// is ever recorded per attempt.
+    pub attempt_id: String,
+    /// When the observation was made, in Unix seconds (UTC).
+    pub observed_at: i64,
+    /// Date of the newest message seen from the sender, in Unix seconds (UTC).
+    pub last_seen: i64,
+    /// How many messages the scan attributed to the sender.
+    pub email_count: u32,
+}
+
+impl Resumption {
+    /// Build an observation with a freshly generated id.
+    #[must_use]
+    pub fn new(
+        account: String,
+        sender_email: String,
+        list_id: Option<String>,
+        attempt_id: String,
+        observed_at: i64,
+        last_seen: i64,
+        email_count: u32,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            account,
+            sender_email,
+            list_id,
+            attempt_id,
+            observed_at,
+            last_seen,
+            email_count,
+        }
+    }
+
+    /// Whether this observation is about the same sender as `sender`.
+    ///
+    /// Matched the same way attempts are: `List-Id` when both sides have one,
+    /// the address otherwise.
+    #[must_use]
+    pub fn is_about(&self, sender: &SenderInfo) -> bool {
+        match (
+            normalized_list_id(self.list_id.as_deref()),
+            normalized_list_id(sender.list_id.as_deref()),
+        ) {
+            (Some(recorded), Some(scanned)) => recorded == scanned,
+            _ => self.sender_email.eq_ignore_ascii_case(&sender.email),
+        }
+    }
+}
+
+/// What a sender has done since a successful unsubscribe.
+///
+/// "Success" is not an HTTP 200 -- it is the mail stopping -- so this is the
+/// measurement that decides whether the loop is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsubscribeOutcome {
+    /// Nothing arrived after the unsubscribe, or the scan could not date the
+    /// sender's mail. Unknown is not a violation.
+    NoNewMail,
+    /// Mail arrived, but inside the window the sender is allowed to act in.
+    WithinGrace {
+        /// Whole days left before the window closes; zero once it has.
+        days_left: i64,
+    },
+    /// Mail arrived after the window closed: the unsubscribe was ignored.
+    Resumed {
+        /// Whole days between the unsubscribe and the newest message seen.
+        days_after: i64,
+    },
+}
+
+impl UnsubscribeOutcome {
+    /// Whether this sender ignored its unsubscribe.
+    #[must_use]
+    pub fn is_resumed(&self) -> bool {
+        matches!(self, Self::Resumed { .. })
+    }
+}
+
+/// Seconds in a day, for turning timestamps into the whole days people read.
+const SECS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// Judge one sender's mail against the unsubscribe that was supposed to stop it.
+///
+/// Pure, and the grace period arrives as an argument: what counts as "long
+/// enough to act" is the user's setting, not core's opinion. `last_seen` is
+/// the newest message the scan attributed to the sender.
+#[must_use]
+pub fn classify_outcome(
+    unsubscribed_at: i64,
+    last_seen: Option<i64>,
+    now: i64,
+    grace_period_days: u32,
+) -> UnsubscribeOutcome {
+    // An undated sender says nothing either way, and a message at or before
+    // the attempt is the mail we archived, not new mail.
+    let Some(last_seen) = last_seen.filter(|seen| *seen > unsubscribed_at) else {
+        return UnsubscribeOutcome::NoNewMail;
+    };
+
+    let grace_ends_at = unsubscribed_at + i64::from(grace_period_days) * SECS_PER_DAY;
+    if last_seen <= grace_ends_at {
+        return UnsubscribeOutcome::WithinGrace {
+            days_left: (grace_ends_at - now).div_euclid(SECS_PER_DAY).max(0),
+        };
+    }
+
+    UnsubscribeOutcome::Resumed {
+        days_after: (last_seen - unsubscribed_at).div_euclid(SECS_PER_DAY),
+    }
+}
+
+/// What the history says about a scanned sender that was unsubscribed before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderVerdict {
+    /// Id of the successful attempt being judged -- what a resumption is
+    /// recorded against.
+    pub attempt_id: String,
+    /// When that attempt succeeded, in Unix seconds (UTC).
+    pub unsubscribed_at: i64,
+    /// What has arrived since.
+    pub outcome: UnsubscribeOutcome,
+    /// Resumptions on record for this sender, counting one observed just now.
+    pub violation_count: u32,
+    /// What a retry would try, given everything already tried and ignored.
+    pub next_step: NextStep,
+}
+
+/// Judge a scanned sender against an account's history.
+///
+/// `None` means the sender has no successful unsubscribe behind it: nothing
+/// was ever ignored, so there is nothing to measure.
+#[must_use]
+pub fn judge_sender(
+    sender: &SenderInfo,
+    latest: &LatestAttempts,
+    attempts: &[UnsubscribeAttempt],
+    resumptions: &[Resumption],
+    now: i64,
+    grace_period_days: u32,
+) -> Option<SenderVerdict> {
+    let attempt = latest.for_sender(sender)?;
+    let outcome = classify_outcome(
+        attempt.attempted_at,
+        sender.last_seen,
+        now,
+        grace_period_days,
+    );
+
+    let recorded = resumptions.iter().filter(|r| r.is_about(sender)).count() as u32;
+    // A resumption we are about to record for the first time still counts
+    // towards what the user is shown.
+    let newly_observed = u32::from(
+        outcome.is_resumed()
+            && !resumptions
+                .iter()
+                .any(|r| r.attempt_id == attempt.id),
+    );
+
+    Some(SenderVerdict {
+        attempt_id: attempt.id.clone(),
+        unsubscribed_at: attempt.attempted_at,
+        outcome,
+        violation_count: recorded + newly_observed,
+        next_step: next_step(sender, attempts, resumptions),
+    })
+}
+
 /// A scanned sender that has been successfully unsubscribed from before.
 ///
-/// Seeing one again means the unsubscribe was ignored, which is the whole point
-/// of keeping a history -- so consumers surface these first.
+/// Seeing one again means the unsubscribe may have been ignored, which is the
+/// whole point of keeping a history -- so consumers surface these first.
 #[derive(Debug, Clone)]
 pub struct PreviouslyUnsubscribed {
     pub sender: SenderInfo,
+    pub verdict: SenderVerdict,
+}
+
+impl PreviouslyUnsubscribed {
     /// When the last successful unsubscribe happened, in Unix seconds (UTC).
-    pub unsubscribed_at: i64,
+    #[must_use]
+    pub fn unsubscribed_at(&self) -> i64 {
+        self.verdict.unsubscribed_at
+    }
+}
+
+/// Every resumption this scan reveals that the history does not hold yet.
+///
+/// Worked out before any sender is judged in full, because a resumption
+/// observed now is what makes the ignored rung spent -- the run that catches a
+/// sender must escalate on that same run, not on the next one. At most one per
+/// ignored attempt: seeing the same one again records nothing new.
+#[must_use]
+pub fn observed_resumptions(
+    account: &str,
+    senders: &[SenderInfo],
+    attempts: &[UnsubscribeAttempt],
+    known: &[Resumption],
+    now: i64,
+    grace_period_days: u32,
+) -> Vec<Resumption> {
+    let latest = LatestAttempts::from_history(attempts);
+    senders
+        .iter()
+        .filter_map(|sender| {
+            let attempt = latest.for_sender(sender)?;
+            let outcome = classify_outcome(
+                attempt.attempted_at,
+                sender.last_seen,
+                now,
+                grace_period_days,
+            );
+            if !outcome.is_resumed() || known.iter().any(|r| r.attempt_id == attempt.id) {
+                return None;
+            }
+            Some(Resumption::new(
+                account.to_string(),
+                sender.email.clone(),
+                sender.list_id.clone(),
+                attempt.id.clone(),
+                now,
+                sender.last_seen.unwrap_or(now),
+                sender.email_count,
+            ))
+        })
+        .collect()
 }
 
 /// Scanned senders split by whether they have been unsubscribed from before.
@@ -133,30 +515,37 @@ pub struct SenderSections {
 
 /// Split scanned senders against an account's unsubscribe history.
 ///
-/// Matching is on the exact sender address, case-insensitively: a sender with
-/// only failed attempts is not "previously unsubscribed", because nothing was
-/// ever ignored. Pure and UI-free so the TUI and a headless server classify
-/// senders the same way.
+/// A sender with only failed attempts is not "previously unsubscribed",
+/// because nothing was ever ignored. Pure and UI-free so the TUI and a headless
+/// server classify senders the same way.
 #[must_use]
 pub fn split_previously_unsubscribed(
     senders: Vec<SenderInfo>,
     attempts: &[UnsubscribeAttempt],
+    resumptions: &[Resumption],
+    now: i64,
+    grace_period_days: u32,
 ) -> SenderSections {
-    let latest = latest_successful_attempts(attempts);
+    let latest = LatestAttempts::from_history(attempts);
 
-    senders.into_iter().fold(
-        SenderSections::default(),
-        |mut sections, sender| {
-            match latest.get(&sender.email.to_lowercase()) {
-                Some(attempt) => sections.previously_unsubscribed.push(PreviouslyUnsubscribed {
-                    unsubscribed_at: attempt.attempted_at,
-                    sender,
-                }),
+    senders
+        .into_iter()
+        .fold(SenderSections::default(), |mut sections, sender| {
+            match judge_sender(
+                &sender,
+                &latest,
+                attempts,
+                resumptions,
+                now,
+                grace_period_days,
+            ) {
+                Some(verdict) => sections
+                    .previously_unsubscribed
+                    .push(PreviouslyUnsubscribed { sender, verdict }),
                 None => sections.remaining.push(sender),
             }
             sections
-        },
-    )
+        })
 }
 
 #[cfg(test)]
@@ -187,8 +576,15 @@ mod tests {
             "https://example.com/unsub".to_string(),
             None,
             None,
+            None,
             "HTTP 200".to_string(),
         )
+    }
+
+    /// Split with no resumptions on record and the default grace period,
+    /// which is all these matching tests care about.
+    fn split(senders: Vec<SenderInfo>, attempts: &[UnsubscribeAttempt]) -> SenderSections {
+        split_previously_unsubscribed(senders, attempts, &[], 10_000, 14)
     }
 
     fn sender(email: &str) -> SenderInfo {
@@ -286,7 +682,7 @@ mod tests {
 
     #[test]
     fn no_history_leaves_every_sender_in_remaining() {
-        let sections = split_previously_unsubscribed(
+        let sections = split(
             vec![sender("a@acme.com"), sender("b@acme.com")],
             &[],
         );
@@ -299,14 +695,14 @@ mod tests {
 
     #[test]
     fn no_senders_yields_empty_sections() {
-        let sections = split_previously_unsubscribed(vec![], &[success("news@acme.com", 1_000)]);
+        let sections = split(vec![], &[success("news@acme.com", 1_000)]);
         assert!(sections.previously_unsubscribed.is_empty());
         assert!(sections.remaining.is_empty());
     }
 
     #[test]
     fn match_ignores_case_on_both_sides() {
-        let sections = split_previously_unsubscribed(
+        let sections = split(
             vec![sender("News@Acme.com")],
             &[success("NEWS@ACME.COM", 1_000)],
         );
@@ -316,7 +712,7 @@ mod tests {
 
     #[test]
     fn same_domain_different_address_does_not_match() {
-        let sections = split_previously_unsubscribed(
+        let sections = split(
             vec![sender("deals@acme.com")],
             &[success("news@acme.com", 1_000)],
         );
@@ -326,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_sender_with_only_failed_attempts_is_not_previously_unsubscribed() {
-        let sections = split_previously_unsubscribed(
+        let sections = split(
             vec![sender("news@acme.com")],
             &[failure("news@acme.com", 1_000)],
         );
@@ -341,8 +737,8 @@ mod tests {
             success("news@acme.com", 7_500),
             failure("news@acme.com", 9_000),
         ];
-        let sections = split_previously_unsubscribed(vec![sender("news@acme.com")], &attempts);
-        assert_eq!(sections.previously_unsubscribed[0].unsubscribed_at, 7_500);
+        let sections = split(vec![sender("news@acme.com")], &attempts);
+        assert_eq!(sections.previously_unsubscribed[0].unsubscribed_at(), 7_500);
     }
 
     #[test]
@@ -354,7 +750,7 @@ mod tests {
             sender("r2@acme.com"),
         ];
         let attempts = vec![success("p1@acme.com", 1), success("p2@acme.com", 2)];
-        let sections = split_previously_unsubscribed(senders, &attempts);
+        let sections = split(senders, &attempts);
 
         assert_eq!(
             sections
@@ -374,10 +770,233 @@ mod tests {
     fn every_sender_lands_in_exactly_one_section() {
         let senders: Vec<_> = (0..6).map(|i| sender(&format!("s{i}@acme.com"))).collect();
         let attempts = vec![success("s1@acme.com", 1), success("s4@acme.com", 1)];
-        let sections = split_previously_unsubscribed(senders, &attempts);
+        let sections = split(senders, &attempts);
         assert_eq!(
             sections.previously_unsubscribed.len() + sections.remaining.len(),
             6
         );
+    }
+}
+
+/// Mapping a finished attempt onto its history record.
+///
+/// These moved here with `UnsubscribeAttempt::from_result` when the run
+/// pipeline took over recording; they check the same evidence fields they
+/// always did.
+#[cfg(test)]
+mod from_result_tests {
+    use super::*;
+    use crate::types::{UnsubscribeMethod, UnsubscribeResult};
+    use std::collections::HashSet;
+
+    /// A sender carrying every piece of identity evidence an attempt records.
+    fn evidence_sender() -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: "news@acme.com".to_string(),
+            domain: "acme.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.com/unsub?t=abc".to_string()],
+            unsubscribe_mailto: vec!["mailto:unsub@acme.com".to_string()],
+            one_click: true,
+            list_id: Some("weekly.acme.com".to_string()),
+            list_unsubscribe_raw: Some(
+                "<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>".to_string(),
+            ),
+            email_count: 7,
+            messages: vec![],
+            last_seen: Some(1_700_000_000),
+        }
+    }
+
+    fn successful_result() -> UnsubscribeResult {
+        UnsubscribeResult {
+            email: "news@acme.com".to_string(),
+            method: UnsubscribeMethod::OneClickPost,
+            success: true,
+            detail: "HTTP 200".to_string(),
+            url: "https://acme.com/unsub?t=abc".to_string(),
+            http_status: Some(200),
+            final_url: Some("https://acme.com/unsub/done".to_string()),
+        }
+    }
+
+    /// Check a string against the RFC 4122 textual form: 8-4-4-4-12 lowercase
+    /// hex digits, with the version nibble set to 4 for a random UUID.
+    fn is_wellformed_uuid_v4(s: &str) -> bool {
+        let groups: Vec<&str> = s.split('-').collect();
+        if groups.len() != 5 {
+            return false;
+        }
+        if [8, 4, 4, 4, 12]
+            != [
+                groups[0].len(),
+                groups[1].len(),
+                groups[2].len(),
+                groups[3].len(),
+                groups[4].len(),
+            ]
+        {
+            return false;
+        }
+        if !groups
+            .iter()
+            .all(|g| g.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+        {
+            return false;
+        }
+        // Version 4 lives in the first nibble of the third group; the variant
+        // bits put the fourth group's first character in 8..=b.
+        groups[2].starts_with('4')
+            && matches!(groups[3].chars().next(), Some('8' | '9' | 'a' | 'b'))
+    }
+
+    #[test]
+    fn attempt_copies_every_evidence_field_from_the_sender_and_the_result() {
+        let attempt = UnsubscribeAttempt::from_result(
+            "me@example.com",
+            &evidence_sender(),
+            &successful_result(),
+            1_700_000_500,
+            None,
+        );
+
+        assert_eq!(attempt.account, "me@example.com");
+        assert_eq!(attempt.sender_email, "news@acme.com");
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(attempt.attempted_at, 1_700_000_500);
+        assert_eq!(attempt.method, "one_click_post");
+        assert!(attempt.success);
+        assert_eq!(attempt.http_status, Some(200));
+        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
+        assert_eq!(
+            attempt.final_url.as_deref(),
+            Some("https://acme.com/unsub/done")
+        );
+        assert_eq!(
+            attempt.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
+        );
+        assert_eq!(attempt.detail, "HTTP 200");
+    }
+
+    #[test]
+    fn attempt_records_the_senders_domain_not_the_accounts() {
+        // Both are email addresses; swapping them would silently file every
+        // attempt under the user's own domain.
+        let attempt = UnsubscribeAttempt::from_result(
+            "me@gmail.com",
+            &evidence_sender(),
+            &successful_result(),
+            0,
+            None,
+        );
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.account, "me@gmail.com");
+    }
+
+    #[test]
+    fn attempt_stores_the_stable_method_id_not_the_display_label() {
+        // MailtoSent is the case where the two differ: id "mailto_sent",
+        // label "mailto". Storing the label would break history on a rename.
+        let mut result = successful_result();
+        result.method = UnsubscribeMethod::MailtoSent;
+
+        let attempt =
+            UnsubscribeAttempt::from_result("me@example.com", &evidence_sender(), &result, 0, None);
+
+        assert_eq!(attempt.method, "mailto_sent");
+        assert_ne!(
+            attempt.method,
+            UnsubscribeMethod::MailtoSent.label(),
+            "the display label must not be what gets stored"
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_maps_the_same_fields_as_a_successful_one() {
+        let result = UnsubscribeResult {
+            email: "news@acme.com".to_string(),
+            method: UnsubscribeMethod::Get,
+            success: false,
+            detail: "HTTP 410".to_string(),
+            url: "https://acme.com/unsub?t=abc".to_string(),
+            http_status: Some(410),
+            final_url: None,
+        };
+
+        let attempt =
+            UnsubscribeAttempt::from_result("me@example.com", &evidence_sender(), &result, 0, None);
+
+        assert!(!attempt.success);
+        assert_eq!(attempt.method, "get");
+        assert_eq!(attempt.http_status, Some(410));
+        assert_eq!(attempt.detail, "HTTP 410");
+        assert_eq!(attempt.final_url, None);
+        // The identity evidence is recorded whether or not the attempt worked.
+        assert_eq!(attempt.sender_email, "news@acme.com");
+        assert_eq!(attempt.sender_domain, "acme.com");
+        assert_eq!(attempt.list_id.as_deref(), Some("weekly.acme.com"));
+        assert_eq!(
+            attempt.list_unsubscribe_raw.as_deref(),
+            Some("<https://acme.com/unsub?t=abc>, <mailto:unsub@acme.com>")
+        );
+        assert_eq!(attempt.url, "https://acme.com/unsub?t=abc");
+    }
+
+    #[test]
+    fn a_sender_without_identity_headers_records_none_rather_than_empty_strings() {
+        let mut sender = evidence_sender();
+        sender.list_id = None;
+        sender.list_unsubscribe_raw = None;
+        let mut result = successful_result();
+        result.method = UnsubscribeMethod::MailtoSkipped;
+        result.http_status = None;
+        result.final_url = None;
+        result.url = String::new();
+
+        let attempt = UnsubscribeAttempt::from_result("me@example.com", &sender, &result, 0, None);
+
+        assert_eq!(attempt.list_id, None);
+        assert_eq!(attempt.list_unsubscribe_raw, None);
+        assert_eq!(attempt.http_status, None);
+        assert_eq!(attempt.final_url, None);
+        assert_eq!(attempt.url, "");
+        assert_eq!(attempt.method, "mailto_skipped");
+    }
+
+    #[test]
+    fn each_attempt_gets_a_distinct_well_formed_uuid() {
+        // Histories from two devices merge as a union keyed by id, so a
+        // repeated id would silently drop an attempt.
+        let sender = evidence_sender();
+        let result = successful_result();
+        let ids: HashSet<String> = (0..64)
+            .map(|_| {
+                UnsubscribeAttempt::from_result("me@example.com", &sender, &result, 0, None).id
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 64, "attempt ids must be unique");
+        for id in &ids {
+            assert!(
+                is_wellformed_uuid_v4(id),
+                "id is not an RFC 4122 v4 UUID: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn attempted_at_is_the_timestamp_the_caller_supplied() {
+        // The clock is the caller's business now; the mapping must not
+        // substitute one of its own.
+        let attempt = UnsubscribeAttempt::from_result(
+            "me@example.com",
+            &evidence_sender(),
+            &successful_result(),
+            -42,
+            None,
+        );
+        assert_eq!(attempt.attempted_at, -42);
     }
 }

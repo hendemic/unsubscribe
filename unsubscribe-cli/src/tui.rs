@@ -6,10 +6,10 @@ use ratatui::widgets::*;
 use std::io;
 
 use unsubscribe_core::{
-    split_previously_unsubscribed, Preferences, SenderInfo, UnsubscribeAttempt,
+    AnnotatedSenders, NextStep, Preferences, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
-use crate::time::{is_scan_stale, is_stale, utc_to_local_display, MONTH_NAMES};
+use crate::time::{is_scan_stale, utc_to_local_display, MONTH_NAMES};
 
 pub mod config;
 
@@ -57,13 +57,15 @@ impl Drop for TerminalGuard {
 struct App {
     /// Senders with a prior successful unsubscribe, newest attempt date alongside.
     previous: Vec<SenderInfo>,
-    /// When each previously unsubscribed sender was last unsubscribed (Unix seconds).
-    previous_unsubscribed_at: Vec<i64>,
+    /// What the history says about each previously unsubscribed sender: when
+    /// it was unsubscribed, whether it honoured that, and how often it has not.
+    previous_verdicts: Vec<SenderVerdict>,
     /// Active senders (seen within the staleness threshold, or date unknown).
     active: Vec<SenderInfo>,
     /// Stale senders (last seen before the staleness threshold).
     stale: Vec<SenderInfo>,
-    /// Selection state for previously unsubscribed senders. Defaults to false.
+    /// Selection state for previously unsubscribed senders. Senders that
+    /// ignored an unsubscribe start selected; the rest do not.
     previous_selected: Vec<bool>,
     /// Selection state for active senders (parallel to `active`).
     active_selected: Vec<bool>,
@@ -81,37 +83,42 @@ struct App {
 }
 
 impl App {
-    /// Build the selection screen, promoting senders with a prior successful
-    /// unsubscribe into their own section.
-    fn with_history(
-        senders: Vec<SenderInfo>,
-        history: &[UnsubscribeAttempt],
-        preferences: Preferences,
-    ) -> Self {
-        let sections = split_previously_unsubscribed(senders, history);
+    /// Build the selection screen from the sections core already worked out.
+    ///
+    /// The grouping is [`unsubscribe_core::annotate_senders`]'s job, so the
+    /// screen and a headless run always agree about which sender is where.
+    fn new(annotated: AnnotatedSenders, preferences: Preferences) -> Self {
+        // The observations have already been recorded by the time the screen
+        // opens, so the screen only needs the three groups.
+        let AnnotatedSenders {
+            previously_unsubscribed,
+            active,
+            stale,
+            ..
+        } = annotated;
 
-        let (previous, previous_unsubscribed_at): (Vec<_>, Vec<_>) = sections
-            .previously_unsubscribed
+        let (previous, previous_verdicts): (Vec<_>, Vec<_>) = previously_unsubscribed
             .into_iter()
-            .map(|p| (p.sender, p.unsubscribed_at))
+            .map(|p| (p.sender, p.verdict))
             .unzip();
-
-        // A previously unsubscribed sender stays in that section even when it
-        // is also stale: that it came back at all is the interesting part.
-        let (stale, active): (Vec<_>, Vec<_>) = sections
-            .remaining
-            .into_iter()
-            .partition(|s| is_stale(s, preferences.stale_after_months));
 
         let rows = build_rows(previous.len(), active.len(), stale.len());
         let cursor = first_selectable_row(&rows);
 
+        // A sender that kept mailing after a successful unsubscribe is the
+        // reason this section exists, so it arrives already ticked; one still
+        // inside its grace period has not done anything wrong yet.
+        let previous_selected: Vec<bool> = previous_verdicts
+            .iter()
+            .map(|verdict| verdict.outcome.is_resumed())
+            .collect();
+
         Self {
-            previous_selected: vec![false; previous.len()],
+            previous_selected,
             active_selected: vec![false; active.len()],
             stale_selected: vec![false; stale.len()],
             previous,
-            previous_unsubscribed_at,
+            previous_verdicts,
             active,
             stale,
             rows,
@@ -311,14 +318,13 @@ impl RowKind {
 /// Run the TUI selection screen. Returns the senders with their selection state.
 /// Selected = true means the user wants to unsubscribe (or archive-only for stale senders).
 pub fn select_senders(
-    senders: Vec<SenderInfo>,
-    history: &[UnsubscribeAttempt],
+    annotated: AnnotatedSenders,
     scan_timestamp: Option<&str>,
     preferences: &Preferences,
 ) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
     let (_guard, mut terminal) = TerminalGuard::enter()?;
 
-    let mut app = App::with_history(senders, history, *preferences);
+    let mut app = App::new(annotated, *preferences);
     app.scan_timestamp = scan_timestamp.map(String::from);
 
     loop {
@@ -371,7 +377,35 @@ pub fn select_senders(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use unsubscribe_core::{Preferences, SenderInfo};
+    use unsubscribe_core::{
+        annotate_senders, now_unix_secs, Preferences, RunPolicy, SenderInfo, UnsubscribeAttempt,
+    };
+
+    /// Build the screen the way `run` does: annotate the scanned senders
+    /// against history in core, then hand the sections to the app.
+    fn app_with_history(
+        senders: Vec<SenderInfo>,
+        history: &[UnsubscribeAttempt],
+        preferences: Preferences,
+    ) -> App {
+        let policy = RunPolicy {
+            min_emails: preferences.min_emails,
+            stale_after_months: preferences.stale_after_months,
+            grace_period_days: preferences.grace_period_days,
+            dry_run: false,
+        };
+        App::new(
+            annotate_senders(
+                "user@example.com",
+                senders,
+                history,
+                &[],
+                &policy,
+                now_unix_secs(),
+            ),
+            preferences,
+        )
+    }
 
     /// Builds a minimal active (non-stale) SenderInfo.
     fn make_sender(email: &str, email_count: u32) -> SenderInfo {
@@ -425,21 +459,21 @@ mod tests {
 
     #[test]
     fn cursor_starts_on_select_all_active() {
-        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.cursor, 1);
         assert!(matches!(app.row_kind(1), RowKind::SelectAllActive));
     }
 
     #[test]
     fn move_up_stops_at_select_all_active() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.move_up();
         assert_eq!(app.cursor, 1, "should not move above SelectAllActive");
     }
 
     #[test]
     fn move_down_stops_at_last_row() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         // Rows: ActiveHeader(0), SelectAllActive(1), Active(2,3,4) = 5 rows
         for _ in 0..10 {
             app.move_down();
@@ -449,7 +483,7 @@ mod tests {
 
     #[test]
     fn move_up_and_down_traverse_selectable_rows() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         // Start at 1 (SelectAllActive), down to 2, 3, 4
         let mut visited = vec![app.cursor];
         for _ in 0..3 {
@@ -465,7 +499,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_any_unselected() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected.iter().all(|&s| s));
@@ -473,7 +507,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_deselects_when_all_selected() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.active_selected.fill(true);
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -481,7 +515,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_partially_selected() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.active_selected[0] = true;
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| s));
@@ -489,7 +523,7 @@ mod tests {
 
     #[test]
     fn toggle_on_sender_row_toggles_individual() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.cursor = 2; // first active sender (row 2)
         assert!(!app.active_selected[0]);
         app.toggle();
@@ -506,14 +540,14 @@ mod tests {
 
     #[test]
     fn select_all_sets_all_flags() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.select_all();
         assert!(app.active_selected.iter().all(|&s| s));
     }
 
     #[test]
     fn deselect_all_clears_all_flags() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         app.select_all();
         app.deselect_all();
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -525,7 +559,7 @@ mod tests {
 
     #[test]
     fn count_selected_correct() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.count_selected(), 0);
         app.active_selected[0] = true;
         app.active_selected[2] = true;
@@ -534,7 +568,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_sums_only_selected() {
-        let mut app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
         // a=10, b=20, c=5
         app.active_selected[1] = true; // b=20
         app.active_selected[2] = true; // c=5
@@ -543,7 +577,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_none_selected_is_zero() {
-        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert_eq!(app.total_emails_selected(), 0);
     }
 
@@ -557,7 +591,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let app = App::with_history(senders, &[], Preferences::default());
+        let app = app_with_history(senders, &[], Preferences::default());
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert!(!app.stale_selected[0]);
@@ -569,7 +603,7 @@ mod tests {
             make_stale_sender("old@test.com", 2),
             make_sender("new@test.com", 5),
         ];
-        let app = App::with_history(senders, &[], Preferences::default());
+        let app = app_with_history(senders, &[], Preferences::default());
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert_eq!(app.active[0].email, "new@test.com");
@@ -585,7 +619,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[], Preferences::default());
+        let mut app = app_with_history(senders, &[], Preferences::default());
         app.move_down(); // 2 (active sender)
         app.move_down(); // 5 (select all stale — skips Spacer+StaleHeader)
         assert_eq!(app.cursor, 5);
@@ -601,7 +635,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[], Preferences::default());
+        let mut app = app_with_history(senders, &[], Preferences::default());
         app.cursor = 5; // SelectAllStale
         app.toggle();
         assert!(app.stale_selected[0], "stale sender should be selected");
@@ -614,7 +648,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[], Preferences::default());
+        let mut app = app_with_history(senders, &[], Preferences::default());
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected[0], "active sender should be selected");
@@ -627,7 +661,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::with_history(senders, &[], Preferences::default());
+        let mut app = app_with_history(senders, &[], Preferences::default());
         app.active_selected[0] = true;
         let results = app.into_results();
         assert_eq!(results.len(), 2);
@@ -645,7 +679,7 @@ mod tests {
 
     #[test]
     fn empty_senders_no_panic() {
-        let mut app = App::with_history(vec![], &[], Preferences::default());
+        let mut app = app_with_history(vec![], &[], Preferences::default());
         assert_eq!(app.cursor, 1);
         assert_eq!(app.count_selected(), 0);
         assert_eq!(app.total_emails_selected(), 0);
@@ -680,6 +714,7 @@ mod tests {
             url: "https://test.com/unsub".to_string(),
             final_url: None,
             list_unsubscribe_raw: None,
+            follows_attempt_id: None,
             detail: "HTTP 200".to_string(),
         }
     }
@@ -696,7 +731,7 @@ mod tests {
             make_stale_sender("s2@test.com", 6),
         ];
         let history = vec![unsubscribed("p1@test.com"), unsubscribed("p2@test.com")];
-        App::with_history(senders, &history, Preferences::default())
+        app_with_history(senders, &history, Preferences::default())
     }
 
     fn emails(senders: &[SenderInfo]) -> Vec<&str> {
@@ -737,7 +772,7 @@ mod tests {
 
     #[test]
     fn previously_unsubscribed_section_is_omitted_when_empty() {
-        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert!(!app.rows.contains(&RowKind::PreviousHeader));
         assert!(!app.rows.contains(&RowKind::SelectAllPrevious));
         assert_eq!(app.rows[0], RowKind::ActiveHeader);
@@ -745,7 +780,7 @@ mod tests {
 
     #[test]
     fn stale_section_is_omitted_when_empty() {
-        let app = App::with_history(three_active_senders(), &[], Preferences::default());
+        let app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert!(!app.rows.contains(&RowKind::StaleHeader));
         assert!(!app.rows.contains(&RowKind::Spacer));
     }
@@ -754,7 +789,7 @@ mod tests {
     fn only_previously_unsubscribed_senders_still_shows_the_active_section() {
         // The active header is the screen's anchor, so it is drawn even with
         // nothing under it.
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_sender("p1@test.com", 1)],
             &[unsubscribed("p1@test.com")],
             Preferences::default(),
@@ -774,7 +809,7 @@ mod tests {
 
     #[test]
     fn only_stale_senders_still_shows_the_active_section() {
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_stale_sender("s1@test.com", 1)],
             &[],
             Preferences::default(),
@@ -794,7 +829,7 @@ mod tests {
 
     #[test]
     fn previously_unsubscribed_and_stale_with_no_active_senders() {
-        let app = App::with_history(
+        let app = app_with_history(
             vec![
                 make_sender("p1@test.com", 1),
                 make_stale_sender("s1@test.com", 2),
@@ -821,14 +856,14 @@ mod tests {
 
     #[test]
     fn no_senders_at_all_leaves_only_the_active_header_and_select_all() {
-        let app = App::with_history(vec![], &[], Preferences::default());
+        let app = app_with_history(vec![], &[], Preferences::default());
         assert_eq!(app.rows, vec![RowKind::ActiveHeader, RowKind::SelectAllActive]);
         assert_eq!(app.total_senders(), 0);
     }
 
     #[test]
     fn a_sender_that_is_both_stale_and_previously_unsubscribed_lands_in_previous() {
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_stale_sender("ghost@test.com", 1)],
             &[unsubscribed("ghost@test.com")],
             Preferences::default(),
@@ -839,7 +874,7 @@ mod tests {
 
     #[test]
     fn history_matches_the_scanned_sender_case_insensitively() {
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_sender("News@Test.com", 1)],
             &[unsubscribed("NEWS@TEST.COM")],
             Preferences::default(),
@@ -852,7 +887,7 @@ mod tests {
     fn a_failed_prior_attempt_does_not_promote_a_sender() {
         let mut attempt = unsubscribed("a1@test.com");
         attempt.success = false;
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_sender("a1@test.com", 1)],
             &[attempt],
             Preferences::default(),
@@ -866,12 +901,18 @@ mod tests {
         let mut older = unsubscribed("p1@test.com");
         older.id = "older".to_string();
         older.attempted_at = 1_600_000_000;
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_sender("p1@test.com", 1)],
             &[older, unsubscribed("p1@test.com")],
             Preferences::default(),
         );
-        assert_eq!(app.previous_unsubscribed_at, [1_700_000_000]);
+        assert_eq!(
+            app.previous_verdicts
+                .iter()
+                .map(|v| v.unsubscribed_at)
+                .collect::<Vec<_>>(),
+            [1_700_000_000]
+        );
     }
 
     // -------------------------------------------------------------------
@@ -879,7 +920,10 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn previously_unsubscribed_senders_start_deselected() {
+    fn previously_unsubscribed_senders_that_stopped_mailing_start_deselected() {
+        // These fixtures carry no `last_seen`, so nothing arrived after the
+        // unsubscribe as far as the app can tell. Senders caught mailing again
+        // start selected instead -- that is what the section is for.
         let app = all_three_sections();
         assert_eq!(app.previous_selected, [false, false]);
     }
@@ -1027,7 +1071,7 @@ mod tests {
 
     #[test]
     fn first_selectable_is_the_active_select_all_when_there_is_no_previous_section() {
-        let app = App::with_history(
+        let app = app_with_history(
             vec![make_stale_sender("s1@test.com", 1)],
             &[],
             Preferences::default(),
@@ -1198,7 +1242,7 @@ mod tests {
         for i in 0..stale {
             senders.push(make_stale_sender(&format!("s{i}@test.com"), 1));
         }
-        App::with_history(senders, &history, Preferences::default())
+        app_with_history(senders, &history, Preferences::default())
     }
 
     #[test]
@@ -1271,7 +1315,7 @@ mod tests {
         // Spacer(4), ActiveHeader(5), SelectAllActive(6). The last two rows
         // before the end are a spacer and a header, so an overshooting jump
         // would strand the cursor on one of them.
-        let mut app = App::with_history(
+        let mut app = app_with_history(
             vec![make_sender("p1@test.com", 1), make_sender("p2@test.com", 2)],
             &[unsubscribed("p1@test.com"), unsubscribed("p2@test.com")],
             Preferences::default(),
@@ -1285,7 +1329,7 @@ mod tests {
 
     #[test]
     fn a_jump_in_an_empty_list_does_not_panic() {
-        let mut app = App::with_history(vec![], &[], Preferences::default());
+        let mut app = app_with_history(vec![], &[], Preferences::default());
 
         app.move_down_by(JUMP_ROWS);
         assert_eq!(app.cursor, 1);
@@ -1296,7 +1340,7 @@ mod tests {
 
     #[test]
     fn a_jump_in_a_list_shorter_than_the_jump_does_not_overshoot() {
-        let mut app = App::with_history(
+        let mut app = app_with_history(
             vec![make_sender("only@test.com", 1)],
             &[],
             Preferences::default(),
@@ -1392,7 +1436,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             RowKind::Previous(idx) => {
                 items.push(previous_sender_row(
                     &app.previous[idx],
-                    app.previous_unsubscribed_at[idx],
+                    &app.previous_verdicts[idx],
                     app.previous_selected[idx],
                     is_cursor,
                 ));
@@ -1475,30 +1519,74 @@ fn select_all_row(selected: &[bool], is_cursor: bool) -> Line<'static> {
     Line::styled(format!(" {checkbox} Select All"), style)
 }
 
-/// A sender we already unsubscribed from, annotated with when that happened.
+/// A sender we already unsubscribed from, annotated with what happened next.
 ///
 /// Selecting one retries the unsubscribe and archives, exactly like an active
-/// sender -- the section is about drawing attention, not about behaving
-/// differently.
+/// sender. What the row adds is the measurement: an HTTP 200 was never the
+/// point, the mail stopping was.
 fn previous_sender_row(
     sender: &SenderInfo,
-    unsubscribed_at: i64,
+    verdict: &SenderVerdict,
     selected: bool,
     is_cursor: bool,
 ) -> Line<'static> {
     let text = format!(
-        "{}  unsubscribed {}",
+        "{}  unsubscribed {}  {}{}{}",
         sender_row_text(sender, selected),
-        format_date(unsubscribed_at),
+        format_date(verdict.unsubscribed_at),
+        outcome_label(verdict.outcome),
+        violations_label(verdict.violation_count),
+        next_step_label(verdict),
     );
     let style = if is_cursor {
         Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else if verdict.outcome.is_resumed() {
+        // The one row that is a finding rather than a listing.
+        Style::default().fg(Color::Red).bold()
     } else if selected {
         Style::default().fg(Color::Red)
-    } else {
+    } else if matches!(verdict.outcome, UnsubscribeOutcome::WithinGrace { .. }) {
         Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
     Line::styled(text, style)
+}
+
+/// How an outcome reads on a row.
+fn outcome_label(outcome: UnsubscribeOutcome) -> String {
+    match outcome {
+        UnsubscribeOutcome::NoNewMail => "no new mail".to_string(),
+        UnsubscribeOutcome::WithinGrace { days_left } => {
+            format!("within grace period ({days_left}d left)")
+        }
+        UnsubscribeOutcome::Resumed { days_after } => {
+            format!("resumed {days_after}d after unsubscribe")
+        }
+    }
+}
+
+/// What a retry of a sender that ignored its unsubscribe would do.
+///
+/// Only shown for senders that actually resumed: for the rest, what would be
+/// tried next is not yet a question anyone is asking.
+fn next_step_label(verdict: &SenderVerdict) -> String {
+    if !verdict.outcome.is_resumed() {
+        return String::new();
+    }
+    match &verdict.next_step {
+        NextStep::Exhausted => "  exhausted \u{2014} no methods left".to_string(),
+        step => format!("  {}", step.label()),
+    }
+}
+
+/// A repeat offender's tally, shown only once there is more than one.
+fn violations_label(violation_count: u32) -> String {
+    if violation_count > 1 {
+        format!("  ({violation_count} violations)")
+    } else {
+        String::new()
+    }
 }
 
 /// The text of a sender row, shared by the active and previously unsubscribed

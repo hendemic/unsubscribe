@@ -85,7 +85,7 @@ In `~/.local/share/email-unsubscribe` (or `$XDG_DATA_HOME`):
 
 | File | Contents |
 |------|----------|
-| `history.db` | Every unsubscribe attempt, kept permanently. Senders you have unsubscribed from before appear in their own section in the TUI, so you can see who started mailing again. |
+| `history.db` | Every unsubscribe attempt and every resumption, kept permanently. Senders you have unsubscribed from before appear in their own section in the TUI, labelled with whether the mail actually stopped. A sender that started up again after the grace period is recorded as a violation and a retry escalates to the next method it offers, rather than repeating the one it ignored. |
 | `cache.db` | The last scan. Disposable — deleting it only costs a rescan. |
 | `warnings.log` | Headers the last scan could not parse. |
 | `unsubscribe_log.csv` | The last run's results, rewritten each run. |
@@ -143,12 +143,14 @@ use the default:
 | `min_emails` | `3` | Minimum emails a sender needs to be listed. `0` shows every sender. Overridden per-run by `--min-emails`. |
 | `stale_after_months` | `12` | Months without a message before a sender counts as stale. Stale senders start deselected and are archived without an unsubscribe request. |
 | `cache_max_age_days` | `7` | Days a cached scan stays fresh. Past this, the scan timestamp is flagged as old. |
+| `grace_period_days` | `14` | Days a sender is given to honour an unsubscribe. Mail arriving after this counts as a resumption and is recorded as a violation. `0` counts any new mail immediately. |
 
 ```toml
 [preferences]
 min_emails = 3
 stale_after_months = 12
 cache_max_age_days = 7
+grace_period_days = 14
 ```
 
 ### Supported providers

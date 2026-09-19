@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use unsubscribe_core::{
     domain_from_email, list_id_warning, parse_from_header, parse_list_id, parse_list_unsubscribe,
     EmailProvider, EmailSender, Folder, FolderMessage, MessageId, ScanProgress, ScanResult,
+    ScanWatermark,
     SenderInfo,
 };
 
@@ -415,7 +416,13 @@ impl<C: unsubscribe_core::HttpClient> EmailProvider for GmailProvider<C> {
         let mut result: Vec<SenderInfo> = senders.into_values().collect();
         result.sort_by(|a, b| b.email_count.cmp(&a.email_count));
 
-        Ok(ScanResult { senders: result, warnings })
+        // Gmail message ids carry no ordering, so the watermark stays empty
+        // until this adapter tracks `historyId` in `adapter_state`.
+        Ok(ScanResult {
+            senders: result,
+            warnings,
+            watermark: ScanWatermark::default(),
+        })
     }
 
     /// Archive messages by removing the INBOX label and adding the destination

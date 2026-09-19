@@ -5,20 +5,25 @@ use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
-    decide_scan_action, latest_successful_attempts, AccountConfig, CacheMeta, CachedScan,
-    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, Preferences, ScanAction,
-    ScanCacheStore,
-    ScanWatermark, SenderInfo,
+    decide_scan_action, judge_sender, load_cached_senders, observed_resumptions, scan_senders,
+    AccountConfig, CachedScanSummary, Credential, DataStore, Folder, HistoryStore, LatestAttempts,
+    ObtainedSenders, Preferences, Resumption, RunObserver, RunPolicy, RunWarning, ScanAction,
+    ScanCacheStore, SenderInfo, SenderVerdict, UnsubscribeOutcome,
 };
 
 use crate::commands::load_history;
+use crate::progress::CliWarningsOnly;
 use crate::terminal::{BLUE, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{
-    age_secs_since, format_relative_age, is_stale, now_iso8601, utc_to_local_date,
+    age_secs_since, format_relative_age, is_stale, now_iso8601, now_unix_secs, utc_to_local_date,
     scan_max_age_secs,
 };
 use crate::{make_provider, progress};
 
+/// Scan the mailbox and return the senders worth showing, with any warnings.
+///
+/// A thin wrapper over the core pipeline's scan stage: this supplies the
+/// provider, the progress bars, and the timestamp, and core does the rest.
 pub fn do_scan(
     account: &AccountConfig,
     credential: &Credential,
@@ -26,75 +31,34 @@ pub fn do_scan(
     cache_store: &dyn ScanCacheStore,
     preferences: &Preferences,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
+    let obtained = run_scan(account, credential, store, cache_store, preferences)?;
+    Ok((obtained.senders, obtained.warnings))
+}
+
+/// The scan stage, with the CLI's progress bars and warning wording attached.
+fn run_scan(
+    account: &AccountConfig,
+    credential: &Credential,
+    store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
+    preferences: &Preferences,
+) -> Result<ObtainedSenders> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(account, credential)?;
     let folders: Vec<Folder> = account.scan_folders.iter().map(|f| Folder::new(f)).collect();
-    let progress = progress::CliScanProgress::new();
-    let scan_result = provider.scan(&folders, &progress)?;
+    let scan_progress = progress::CliScanProgress::new();
 
-    // Persist warnings via DataStore
-    store.write_warnings(&scan_result.warnings)?;
-
-    // Build watermark from scan results.
-    // MessageId format for IMAP: "folder:uid:uidvalidity"
-    // MessageId format for Gmail: opaque string (watermark via adapter_state instead)
-    let mut highest_uid = std::collections::HashMap::new();
-    let mut uid_validity_map = std::collections::HashMap::new();
-    for sender in &scan_result.senders {
-        for msg in &sender.messages {
-            let folder_key = msg.folder.as_str().to_string();
-            // Try to parse IMAP-style message IDs for watermark
-            let parts: Vec<&str> = msg.message_id.as_str().rsplitn(3, ':').collect();
-            if parts.len() == 3 {
-                if let (Ok(validity), Ok(uid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-                {
-                    let current = highest_uid.entry(folder_key.clone()).or_insert(0u32);
-                    if uid > *current {
-                        *current = uid;
-                    }
-                    uid_validity_map.insert(folder_key, validity);
-                }
-            }
-        }
-    }
-
-    // Cache results for --cached use
-    let cache = CachedScan {
-        meta: CacheMeta {
-            scanned_at: now_iso8601(),
-            format_version: 1,
-            account: account.account_id.clone(),
-        },
-        senders: scan_result.senders.clone(),
-        watermark: ScanWatermark {
-            highest_uid,
-            uid_validity: uid_validity_map,
-            adapter_state: None,
-        },
-    };
-    // The cache is disposable: failing to write it costs a rescan, not a run.
-    if let Err(e) = cache_store.write_scan_cache(&cache) {
-        eprintln!("{YELLOW}Warning: could not write scan cache: {e}{RESET}");
-    }
-
-    let senders: Vec<_> = scan_result
-        .senders
-        .into_iter()
-        .filter(|s| s.email_count >= preferences.min_emails)
-        .collect();
-
-    Ok((senders, scan_result.warnings))
-}
-
-/// The senders a `run` or `export` works from, and where they came from.
-pub struct ResolvedScan {
-    pub senders: Vec<SenderInfo>,
-    /// Scan warnings. Empty when the senders came from the cache, which does
-    /// not store them.
-    pub warnings: Vec<String>,
-    /// When the scan behind these senders was taken (ISO 8601, UTC).
-    pub scanned_at: String,
-    pub from_cache: bool,
+    scan_senders(
+        &account.account_id,
+        &folders,
+        provider.as_ref(),
+        cache_store,
+        store,
+        preferences.min_emails,
+        &now_iso8601(),
+        &scan_progress,
+        &CliWarningsOnly,
+    )
 }
 
 /// Decide between the cached scan and a fresh one, then produce the senders.
@@ -109,11 +73,16 @@ pub fn resolve_scan(
     cached: bool,
     rescan: bool,
     preferences: &Preferences,
-) -> Result<ResolvedScan> {
-    let usable = usable_cache(cache_store, &account.account_id, preferences.min_emails);
-    let summary = usable.as_ref().map(|(scanned_at, senders)| CachedScanSummary {
-        sender_count: senders.len(),
-        age_secs: age_secs_since(scanned_at),
+) -> Result<ObtainedSenders> {
+    let usable = load_cached_senders(
+        cache_store,
+        &account.account_id,
+        preferences.min_emails,
+        &CliWarningsOnly,
+    );
+    let summary = usable.as_ref().map(|cache| CachedScanSummary {
+        sender_count: cache.senders.len(),
+        age_secs: age_secs_since(&cache.scanned_at),
     });
 
     let action = decide_scan_action(
@@ -131,55 +100,16 @@ pub fn resolve_scan(
             bail!("No cached scan results found. Run `unsubscribe scan` first.")
         }
         ScanAction::Ask { default_cached } => {
-            let (scanned_at, senders) = usable.as_ref().expect("Ask implies a usable cache");
-            prompt_use_cached(scanned_at, senders.len(), default_cached)?
+            let cache = usable.as_ref().expect("Ask implies a usable cache");
+            prompt_use_cached(&cache.scanned_at, cache.senders.len(), default_cached)?
         }
     };
 
     if use_cache {
-        let (scanned_at, senders) = usable.expect("cache was checked before use");
-        return Ok(ResolvedScan {
-            senders,
-            warnings: Vec::new(),
-            scanned_at,
-            from_cache: true,
-        });
+        return Ok(usable.expect("cache was checked before use"));
     }
 
-    let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
-    Ok(ResolvedScan {
-        senders,
-        warnings,
-        scanned_at: now_iso8601(),
-        from_cache: false,
-    })
-}
-
-/// The cached scan for an account, if there is one worth offering.
-///
-/// An unreadable cache is warned about and then treated as absent -- it costs
-/// a rescan, not a run. So is an empty one: after enough runs prune their
-/// senders the cache holds nothing to choose, and asking would be noise.
-fn usable_cache(
-    cache_store: &dyn ScanCacheStore,
-    account: &str,
-    min_emails: u32,
-) -> Option<(String, Vec<SenderInfo>)> {
-    let cache = match cache_store.read_scan_cache(account) {
-        Ok(cache) => cache?,
-        Err(e) => {
-            eprintln!("{YELLOW}Warning: could not read the scan cache: {e}{RESET}");
-            return None;
-        }
-    };
-
-    let senders: Vec<_> = cache
-        .senders
-        .into_iter()
-        .filter(|s| s.email_count >= min_emails)
-        .collect();
-
-    (!senders.is_empty()).then_some((cache.meta.scanned_at, senders))
+    run_scan(account, credential, store, cache_store, preferences)
 }
 
 /// Ask whether to reuse the cached scan. Returns true for "use cached".
@@ -242,8 +172,42 @@ pub fn cmd_scan(
     preferences: &Preferences,
 ) -> Result<()> {
     let (senders, warnings) = do_scan(account, credential, store, cache_store, preferences)?;
-    let previously_unsubscribed =
-        latest_successful_attempts(&load_history(history, &account.account_id));
+
+    // Same judgement the run makes, so the two commands never disagree about
+    // which sender ignored its unsubscribe -- and recording it here means a
+    // plain `scan` builds the violation log too.
+    let history_view = load_history(history, &account.account_id);
+    let policy = run_policy(preferences);
+    let now = now_unix_secs();
+
+    // Observe first, judge second: a sender caught ignoring an unsubscribe on
+    // this very scan has already spent that rung.
+    let mut resumptions = history_view.resumptions;
+    let observed = observed_resumptions(
+        &account.account_id,
+        &senders,
+        &history_view.attempts,
+        &resumptions,
+        now,
+        policy.grace_period_days,
+    );
+    record_scan_resumptions(&observed, history);
+    resumptions.extend(observed);
+
+    let latest = LatestAttempts::from_history(&history_view.attempts);
+    let verdicts: Vec<Option<SenderVerdict>> = senders
+        .iter()
+        .map(|sender| {
+            judge_sender(
+                sender,
+                &latest,
+                &history_view.attempts,
+                &resumptions,
+                now,
+                policy.grace_period_days,
+            )
+        })
+        .collect();
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -261,22 +225,21 @@ pub fn cmd_scan(
     );
     println!("{DIM}{}{RESET}", "-".repeat(100));
 
-    for s in &senders {
+    for (s, verdict) in senders.iter().zip(&verdicts) {
         let name = if s.display_name.is_empty() {
             "-"
         } else {
             &s.display_name
         };
-        // A sender we already unsubscribed from is mailing again, so say so
-        // even when it is also stale.
-        let (marker, marker_color) =
-            if previously_unsubscribed.contains_key(&s.email.to_lowercase()) {
-                (" [unsubscribed]", RED)
-            } else if is_stale(s, preferences.stale_after_months) {
-                (" [stale]", DIM)
-            } else {
-                ("", DIM)
-            };
+        // What happened after a previous unsubscribe outranks staleness: a
+        // sender that came back is the finding, stale or not.
+        let (marker, marker_color) = match verdict {
+            Some(verdict) => (outcome_marker(verdict), outcome_color(verdict)),
+            None if is_stale(s, preferences.stale_after_months) => {
+                (" [stale]".to_string(), DIM)
+            }
+            None => (String::new(), DIM),
+        };
         let (method, method_color) = if s.one_click {
             ("1-click", GREEN)
         } else if !s.unsubscribe_urls.is_empty() {
@@ -298,12 +261,15 @@ pub fn cmd_scan(
         .iter()
         .filter(|s| is_stale(s, preferences.stale_after_months))
         .count();
-    let previous_count = senders
+    let previous_count = verdicts.iter().flatten().count();
+    let resumed_count = verdicts
         .iter()
-        .filter(|s| previously_unsubscribed.contains_key(&s.email.to_lowercase()))
+        .flatten()
+        .filter(|v| v.outcome.is_resumed())
         .count();
     let notes: Vec<String> = [
         (previous_count, "previously unsubscribed"),
+        (resumed_count, "resumed"),
         (stale_count, "stale"),
     ]
     .iter()
@@ -388,6 +354,57 @@ pub fn cmd_export(
     Ok(())
 }
 
+/// The policy a listing command judges senders under.
+fn run_policy(preferences: &Preferences) -> RunPolicy {
+    RunPolicy {
+        min_emails: preferences.min_emails,
+        stale_after_months: preferences.stale_after_months,
+        grace_period_days: preferences.grace_period_days,
+        dry_run: false,
+    }
+}
+
+/// Write every resumption this listing turned up.
+///
+/// `scan` changes nothing about the mailbox, but observing a sender ignore an
+/// unsubscribe is an observation either way, and it cannot be made again later.
+fn record_scan_resumptions(observed: &[Resumption], history: Option<&dyn HistoryStore>) {
+    let Some(history) = history else {
+        return;
+    };
+    for resumption in observed {
+        if let Err(e) = history.record_resumption(resumption) {
+            CliWarningsOnly.on_warning(&RunWarning::ResumptionNotRecorded(e.to_string()));
+        }
+    }
+}
+
+/// The short marker a listing row carries for a previously unsubscribed sender.
+fn outcome_marker(verdict: &SenderVerdict) -> String {
+    let violations = if verdict.violation_count > 1 {
+        format!(" x{}", verdict.violation_count)
+    } else {
+        String::new()
+    };
+    match verdict.outcome {
+        UnsubscribeOutcome::NoNewMail => " [unsubscribed]".to_string(),
+        UnsubscribeOutcome::WithinGrace { days_left } => {
+            format!(" [grace: {days_left}d left]")
+        }
+        UnsubscribeOutcome::Resumed { days_after } => {
+            format!(" [resumed {days_after}d after{violations}]")
+        }
+    }
+}
+
+fn outcome_color(verdict: &SenderVerdict) -> &'static str {
+    match verdict.outcome {
+        UnsubscribeOutcome::Resumed { .. } => RED,
+        UnsubscribeOutcome::WithinGrace { .. } => YELLOW,
+        UnsubscribeOutcome::NoNewMail => DIM,
+    }
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => &s[..byte_idx],
@@ -399,7 +416,7 @@ fn truncate(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use unsubscribe_core::{AuthType, ProviderType};
+    use unsubscribe_core::{AuthType, CacheMeta, CachedScan, ProviderType, ScanWatermark};
 
     /// A cache store whose answer to `read_scan_cache` is fixed per test.
     ///
@@ -500,19 +517,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // usable_cache
+    // load_cached_senders, through the CLI's cache store
     // -----------------------------------------------------------------------
 
     #[test]
     fn an_absent_cache_is_not_usable() {
         let store = FakeCacheStore::with(None);
-        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+        assert!(load_cached_senders(&store, "user@example.com", 3, &CliWarningsOnly).is_none());
     }
 
     #[test]
     fn an_unreadable_cache_is_treated_as_absent_rather_than_fatal() {
         let store = FakeCacheStore::unreadable();
-        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+        assert!(load_cached_senders(&store, "user@example.com", 3, &CliWarningsOnly).is_none());
     }
 
     #[test]
@@ -522,13 +539,13 @@ mod tests {
             sender("a@acme.com", 1),
             sender("b@acme.com", 2),
         ])));
-        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+        assert!(load_cached_senders(&store, "user@example.com", 3, &CliWarningsOnly).is_none());
     }
 
     #[test]
     fn a_cache_with_no_senders_at_all_is_not_usable() {
         let store = FakeCacheStore::with(Some(cached_scan(vec![])));
-        assert!(usable_cache(&store, "user@example.com", 0).is_none());
+        assert!(load_cached_senders(&store, "user@example.com", 0, &CliWarningsOnly).is_none());
     }
 
     #[test]
@@ -539,11 +556,15 @@ mod tests {
             sender("above@acme.com", 9),
         ])));
 
-        let (scanned_at, senders) =
-            usable_cache(&store, "user@example.com", 3).expect("cache is usable");
-        assert_eq!(scanned_at, "2026-03-18T19:30:00Z");
+        let cached = load_cached_senders(&store, "user@example.com", 3, &CliWarningsOnly)
+            .expect("cache is usable");
+        assert_eq!(cached.scanned_at, "2026-03-18T19:30:00Z");
         assert_eq!(
-            senders.iter().map(|s| s.email.as_str()).collect::<Vec<_>>(),
+            cached
+                .senders
+                .iter()
+                .map(|s| s.email.as_str())
+                .collect::<Vec<_>>(),
             ["exactly@acme.com", "above@acme.com"]
         );
     }

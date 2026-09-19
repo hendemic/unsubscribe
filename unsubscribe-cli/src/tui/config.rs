@@ -65,11 +65,12 @@ pub enum Field {
     MinEmails,
     StaleAfterMonths,
     CacheMaxAgeDays,
+    GracePeriodDays,
 }
 
 impl Field {
     /// Every field, in the order they appear on screen.
-    pub const ALL: [Field; 12] = [
+    pub const ALL: [Field; 13] = [
         Field::Provider,
         Field::Host,
         Field::Port,
@@ -82,6 +83,7 @@ impl Field {
         Field::MinEmails,
         Field::StaleAfterMonths,
         Field::CacheMaxAgeDays,
+        Field::GracePeriodDays,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -98,6 +100,7 @@ impl Field {
             Field::MinEmails => "Minimum emails",
             Field::StaleAfterMonths => "Stale after (months)",
             Field::CacheMaxAgeDays => "Cache max age (days)",
+            Field::GracePeriodDays => "Grace period (days)",
         }
     }
 
@@ -139,6 +142,7 @@ pub struct Draft {
     pub min_emails: String,
     pub stale_after_months: String,
     pub cache_max_age_days: String,
+    pub grace_period_days: String,
 }
 
 impl Draft {
@@ -162,6 +166,7 @@ impl Draft {
             min_emails: preferences.min_emails.to_string(),
             stale_after_months: preferences.stale_after_months.to_string(),
             cache_max_age_days: preferences.cache_max_age_days.to_string(),
+            grace_period_days: preferences.grace_period_days.to_string(),
         }
     }
 
@@ -180,6 +185,7 @@ impl Draft {
             Field::MinEmails => self.min_emails.clone(),
             Field::StaleAfterMonths => self.stale_after_months.clone(),
             Field::CacheMaxAgeDays => self.cache_max_age_days.clone(),
+            Field::GracePeriodDays => self.grace_period_days.clone(),
         }
     }
 
@@ -197,6 +203,7 @@ impl Draft {
             Field::MinEmails => self.min_emails = value,
             Field::StaleAfterMonths => self.stale_after_months = value,
             Field::CacheMaxAgeDays => self.cache_max_age_days = value,
+            Field::GracePeriodDays => self.grace_period_days = value,
         }
     }
 
@@ -245,6 +252,9 @@ impl Draft {
             }
             Field::CacheMaxAgeDays => {
                 preference(&value, PreferenceField::CacheMaxAgeDays).map(|_| ())
+            }
+            Field::GracePeriodDays => {
+                preference(&value, PreferenceField::GracePeriodDays).map(|_| ())
             }
         }
     }
@@ -306,6 +316,11 @@ impl Draft {
                 PreferenceField::CacheMaxAgeDays,
             )
             .map_err(|e| (Field::CacheMaxAgeDays, e))?,
+            grace_period_days: preference(
+                &self.grace_period_days,
+                PreferenceField::GracePeriodDays,
+            )
+            .map_err(|e| (Field::GracePeriodDays, e))?,
         };
 
         Ok((account, preferences))
@@ -1192,6 +1207,7 @@ mod tests {
             min_emails: 5,
             stale_after_months: 6,
             cache_max_age_days: 21,
+            grace_period_days: 14,
         }
     }
 
