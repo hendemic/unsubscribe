@@ -1608,3 +1608,380 @@ archive_folder = "Unsubscribed"
         assert_eq!(fixture.text(), broken, "the user's file was clobbered");
     }
 }
+
+/// Key-at-a-time reads and writes, as `unsubscribe config` uses them.
+#[cfg(test)]
+mod setting_io_tests {
+    use super::*;
+    use crate::settings::SettingKey;
+    use tempfile::TempDir;
+
+    /// An annotated config with an unknown key and a credential command in it:
+    /// everything a key-at-a-time write must leave alone.
+    const ANNOTATED: &str = r#"# Managed by hand. Please keep these notes.
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password_command = "pass show email/imap"
+auth_type = "password"
+provider = "imap"
+# Something a future version might add.
+experimental_flag = true
+
+[scan]
+# Folders swept for List-Unsubscribe headers.
+folders = ["INBOX", "Promotions"]
+archive_folder = "Unsubscribed"
+
+[preferences]
+min_emails = 5
+stale_after_months = 6
+cache_max_age_days = 21
+grace_period_days = 14
+"#;
+
+    struct Fixture {
+        _dir: TempDir,
+        path: PathBuf,
+        store: TomlConfigStore,
+    }
+
+    impl Fixture {
+        fn with(contents: &str) -> Self {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, contents).unwrap();
+            let store = TomlConfigStore::new(dir.path());
+            Fixture { _dir: dir, path, store }
+        }
+
+        fn new() -> Self {
+            Self::with(ANNOTATED)
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(&self.path).unwrap()
+        }
+
+        fn value(&self, key: SettingKey) -> String {
+            self.store.read_settings().unwrap().get(key)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_text_setting_reads_back_as_it_was_written() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .set_setting(SettingKey::ArchiveFolder, "Archive")
+            .unwrap();
+        assert_eq!(fixture.value(SettingKey::ArchiveFolder), "Archive");
+    }
+
+    #[test]
+    fn a_numeric_setting_is_written_as_a_bare_integer() {
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::MinEmails, "9").unwrap();
+        assert_eq!(fixture.value(SettingKey::MinEmails), "9");
+        assert!(
+            fixture.text().contains("min_emails = 9"),
+            "the number was quoted:\n{}",
+            fixture.text()
+        );
+    }
+
+    #[test]
+    fn a_list_setting_reads_back_as_the_list_it_was_given() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .set_setting(SettingKey::Folders, "INBOX,Archive, Sent ")
+            .unwrap();
+        assert_eq!(fixture.value(SettingKey::Folders), "INBOX, Archive, Sent");
+        assert!(
+            fixture.text().contains(r#"folders = ["INBOX", "Archive", "Sent"]"#),
+            "the list was not written as an array:\n{}",
+            fixture.text()
+        );
+    }
+
+    #[test]
+    fn writing_the_value_a_setting_already_has_leaves_the_file_byte_identical() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .set_setting(SettingKey::ArchiveFolder, "Unsubscribed")
+            .unwrap();
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a write must not disturb
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_write_keeps_every_comment_and_the_credential_command() {
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::Port, "143").unwrap();
+        let text = fixture.text();
+        for kept in [
+            "# Managed by hand. Please keep these notes.",
+            "# Folders swept for List-Unsubscribe headers.",
+            r#"password_command = "pass show email/imap""#,
+        ] {
+            assert!(text.contains(kept), "{kept} was lost:\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_write_keeps_keys_this_version_does_not_model() {
+        // A config edited by a newer build must survive an older one touching
+        // one key.
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::Port, "143").unwrap();
+        assert!(
+            fixture.text().contains("experimental_flag = true"),
+            "an unknown key was dropped:\n{}",
+            fixture.text()
+        );
+    }
+
+    #[test]
+    fn a_write_touches_only_the_line_it_names() {
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::Port, "143").unwrap();
+        assert_eq!(fixture.text(), ANNOTATED.replace("port = 993", "port = 143"));
+    }
+
+    #[test]
+    fn writing_one_key_does_not_materialise_defaults_the_user_never_chose() {
+        // The whole-document writers would fill in every key they model; these
+        // must not, or a first `config set` silently freezes today's defaults.
+        let minimal = "[account]\nhost = \"imap.example.com\"\nusername = \"user@example.com\"\n";
+        let fixture = Fixture::with(minimal);
+        fixture.store.set_setting(SettingKey::MinEmails, "9").unwrap();
+        let text = fixture.text();
+        assert!(!text.contains("stale_after_months"), "a default was written:\n{text}");
+        assert!(!text.contains("archive_folder"), "a default was written:\n{text}");
+        assert!(!text.contains("port ="), "a default was written:\n{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals leave the file alone
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_invalid_value_is_refused_and_nothing_is_written() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .store
+            .set_setting(SettingKey::Port, "70000")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Port must be a number between 1 and 65535"),
+            "the schema's own message should be reported: {error:#}"
+        );
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn an_out_of_range_preference_is_refused_and_nothing_is_written() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .store
+            .set_setting(SettingKey::StaleAfterMonths, "0")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("stale_after_months"), "{error:#}");
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn a_non_numeric_value_for_a_numeric_key_is_refused() {
+        let fixture = Fixture::new();
+        assert!(fixture.store.set_setting(SettingKey::MinEmails, "lots").is_err());
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn emptying_a_required_setting_is_refused() {
+        let fixture = Fixture::new();
+        assert!(fixture.store.set_setting(SettingKey::ArchiveFolder, "").is_err());
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn leaving_an_imap_account_with_no_folders_is_refused() {
+        let fixture = Fixture::new();
+        assert!(fixture.store.set_setting(SettingKey::Folders, " , ").is_err());
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    // -----------------------------------------------------------------------
+    // unset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsetting_an_optional_key_removes_it_and_restores_its_default() {
+        let fixture = Fixture::new();
+        fixture.store.unset_setting(SettingKey::MinEmails).unwrap();
+        assert!(!fixture.text().contains("min_emails"));
+        assert_eq!(
+            fixture.value(SettingKey::MinEmails),
+            SettingKey::MinEmails.default_value()
+        );
+    }
+
+    #[test]
+    fn blanking_an_optional_key_is_the_same_as_unsetting_it() {
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::SmtpHost, "smtp.example.com").unwrap();
+        let with_host = fixture.text();
+        fixture.store.set_setting(SettingKey::SmtpHost, "").unwrap();
+        let blanked = fixture.text();
+
+        fixture.store.set_setting(SettingKey::SmtpHost, "smtp.example.com").unwrap();
+        assert_eq!(fixture.text(), with_host);
+        fixture.store.unset_setting(SettingKey::SmtpHost).unwrap();
+        assert_eq!(fixture.text(), blanked);
+    }
+
+    #[test]
+    fn unsetting_a_required_key_is_refused_and_says_to_set_it_instead() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .store
+            .unset_setting(SettingKey::Username)
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("account.username"), "{message}");
+        assert!(message.contains("config set"), "{message}");
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn unsetting_the_host_of_an_imap_account_is_refused_by_validation() {
+        // `account.host` is optional in general -- Gmail has none -- but an
+        // IMAP account without one is broken, not defaulted.
+        let fixture = Fixture::new();
+        let error = fixture.store.unset_setting(SettingKey::Host).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Host cannot be empty"),
+            "{error:#}"
+        );
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn unsetting_the_host_of_a_gmail_account_is_allowed() {
+        let gmail = ANNOTATED.replace(r#"provider = "imap""#, r#"provider = "gmail""#);
+        let fixture = Fixture::with(&gmail);
+        fixture.store.unset_setting(SettingKey::Host).unwrap();
+        assert!(!fixture.text().contains("host ="));
+    }
+
+    #[test]
+    fn unsetting_a_key_that_is_not_in_the_file_changes_nothing() {
+        let fixture = Fixture::new();
+        fixture.store.unset_setting(SettingKey::SmtpHost).unwrap();
+        assert_eq!(fixture.text(), ANNOTATED);
+    }
+
+    #[test]
+    fn a_preferences_section_left_with_nothing_in_it_is_removed() {
+        let fixture = Fixture::new();
+        for key in [
+            SettingKey::MinEmails,
+            SettingKey::StaleAfterMonths,
+            SettingKey::CacheMaxAgeDays,
+            SettingKey::GracePeriodDays,
+        ] {
+            fixture.store.unset_setting(key).unwrap();
+        }
+        assert!(
+            !fixture.text().contains("[preferences]"),
+            "an empty section was left behind:\n{}",
+            fixture.text()
+        );
+    }
+
+    #[test]
+    fn a_preferences_section_created_by_a_write_explains_itself() {
+        let minimal = "[account]\nhost = \"imap.example.com\"\nusername = \"user@example.com\"\n";
+        let fixture = Fixture::with(minimal);
+        fixture.store.set_setting(SettingKey::GracePeriodDays, "30").unwrap();
+        let text = fixture.text();
+        assert!(text.contains("[preferences]"), "{text}");
+        assert!(
+            text.contains("# Behavior settings. Edit here or run `unsubscribe config`."),
+            "the new section was not annotated:\n{text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // explicit_settings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_setting_the_file_states_is_reported_as_explicit() {
+        let fixture = Fixture::new();
+        let explicit = fixture.store.explicit_settings().unwrap();
+        assert!(explicit.contains(&SettingKey::MinEmails));
+        assert!(explicit.contains(&SettingKey::Folders));
+    }
+
+    #[test]
+    fn a_setting_the_file_is_silent_about_is_not_explicit() {
+        let fixture = Fixture::new();
+        let explicit = fixture.store.explicit_settings().unwrap();
+        assert!(!explicit.contains(&SettingKey::SmtpHost));
+        assert!(!explicit.contains(&SettingKey::SmtpPort));
+    }
+
+    #[test]
+    fn a_value_that_happens_to_equal_the_default_is_still_explicit() {
+        // "Is a default" is read from the file, not guessed by comparing
+        // values, or a deliberate choice would look like an accident.
+        let fixture = Fixture::new();
+        assert_eq!(SettingKey::GracePeriodDays.default_value(), "14");
+        assert!(fixture
+            .store
+            .explicit_settings()
+            .unwrap()
+            .contains(&SettingKey::GracePeriodDays));
+    }
+
+    #[test]
+    fn a_key_becomes_explicit_when_set_and_stops_being_so_when_unset() {
+        let fixture = Fixture::new();
+        fixture.store.set_setting(SettingKey::SmtpPort, "465").unwrap();
+        assert!(fixture
+            .store
+            .explicit_settings()
+            .unwrap()
+            .contains(&SettingKey::SmtpPort));
+        fixture.store.unset_setting(SettingKey::SmtpPort).unwrap();
+        assert!(!fixture
+            .store
+            .explicit_settings()
+            .unwrap()
+            .contains(&SettingKey::SmtpPort));
+    }
+
+    #[test]
+    fn a_config_that_does_not_exist_states_nothing_explicitly() {
+        let dir = TempDir::new().unwrap();
+        let store = TomlConfigStore::new(dir.path());
+        assert!(store.explicit_settings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_file_points_at_the_file_in_the_configured_directory() {
+        let fixture = Fixture::new();
+        assert_eq!(fixture.store.config_file(), fixture.path);
+    }
+}

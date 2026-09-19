@@ -151,3 +151,182 @@ pub fn classify_provider_error(error: anyhow::Error) -> anyhow::Error {
     }
     error
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{anyhow, Context};
+
+    /// The documented table, written out rather than derived from `code()`, so
+    /// a renumbering has to be a deliberate edit in two places.
+    const DOCUMENTED: [(Exit, u8); 7] = [
+        (Exit::Success, 0),
+        (Exit::Failure, 1),
+        (Exit::Usage, 2),
+        (Exit::SomeFailed, 3),
+        (Exit::Auth, 4),
+        (Exit::Locked, 5),
+        (Exit::NothingToDo, 6),
+    ];
+
+    #[test]
+    fn every_outcome_has_the_exit_code_its_documentation_promises() {
+        for (exit, code) in DOCUMENTED {
+            assert_eq!(exit.code(), code, "{exit:?} changed its exit code");
+        }
+    }
+
+    #[test]
+    fn no_two_outcomes_share_an_exit_code() {
+        // A script branches on these, so a collision makes two different
+        // situations indistinguishable.
+        let mut codes: Vec<u8> = DOCUMENTED.iter().map(|(_, code)| *code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), DOCUMENTED.len());
+    }
+
+    #[test]
+    fn the_help_text_lists_every_code_the_program_can_return() {
+        for (exit, code) in DOCUMENTED {
+            assert!(
+                EXIT_CODE_HELP.contains(&format!("  {code}  ")),
+                "{exit:?} ({code}) is missing from the printed table:\n{EXIT_CODE_HELP}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // exit_code
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_successful_command_reports_its_own_outcome() {
+        for (exit, code) in DOCUMENTED {
+            assert_eq!(exit_code(&Ok(exit)), code);
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_failure_is_the_catch_all() {
+        let result: anyhow::Result<Exit> = Err(anyhow!("the disk caught fire"));
+        assert_eq!(exit_code(&result), 1);
+    }
+
+    #[test]
+    fn a_failure_that_names_its_outcome_reports_that_code() {
+        let result: anyhow::Result<Exit> =
+            Err(ExitError::new(Exit::Locked, "another run holds the lock").into());
+        assert_eq!(exit_code(&result), 5);
+    }
+
+    #[test]
+    fn a_usage_error_reports_two() {
+        let result: anyhow::Result<Exit> = Err(ExitError::usage("pass a selection flag").into());
+        assert_eq!(exit_code(&result), 2);
+    }
+
+    #[test]
+    fn an_exit_code_survives_being_wrapped_in_context() {
+        // Commands add context as an error travels up; the code must not be
+        // lost on the way.
+        let result: anyhow::Result<Exit> = Err(ExitError::new(Exit::Auth, "rejected"))
+            .context("while opening the mailbox")
+            .context("while running the timer job");
+        assert_eq!(exit_code(&result), 4);
+    }
+
+    #[test]
+    fn the_innermost_named_outcome_is_the_one_reported() {
+        let result: anyhow::Result<Exit> = Err(ExitError::new(Exit::NothingToDo, "no senders"))
+            .context("while planning the run");
+        assert_eq!(exit_code(&result), 6);
+    }
+
+    #[test]
+    fn the_message_of_an_exit_error_is_what_the_user_is_shown() {
+        let error = ExitError::usage("pass --yes to run unattended");
+        assert_eq!(error.to_string(), "pass --yes to run unattended");
+        assert_eq!(error.exit(), Exit::Usage);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_shapes_a_provider_rejects_a_login_in_are_recognised() {
+        let rejections = [
+            "[AUTHENTICATIONFAILED] Invalid credentials",
+            "LOGIN failed",
+            "Authentication failed for user@example.com",
+            "invalid_grant: token expired",
+            "HTTP 401 Unauthorized",
+            "No credentials found. Run `unsubscribe init`",
+        ];
+        for text in rejections {
+            assert!(
+                looks_like_auth_failure(&anyhow!("{text}")),
+                "{text:?} should read as an authentication failure"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_mistaken_for_a_rejected_login() {
+        for text in [
+            "connection reset by peer",
+            "Failed to move 3 messages to Unsubscribed",
+            "the scan cache is corrupt",
+        ] {
+            assert!(
+                !looks_like_auth_failure(&anyhow!("{text}")),
+                "{text:?} should not read as an authentication failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_buried_under_context_is_still_recognised() {
+        // The marker is usually the innermost cause; `{:#}` is what flattens
+        // the chain so the match can see it.
+        let error = anyhow!("[AUTHENTICATIONFAILED] Invalid credentials")
+            .context("Failed to open INBOX");
+        assert!(looks_like_auth_failure(&error));
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_provider_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_rejected_login_becomes_the_authentication_exit_code() {
+        let classified = classify_provider_error(anyhow!("LOGIN failed"));
+        assert_eq!(exit_code(&Err(classified)), 4);
+    }
+
+    #[test]
+    fn an_unrelated_provider_failure_keeps_the_catch_all_code() {
+        let classified = classify_provider_error(anyhow!("connection reset by peer"));
+        assert_eq!(exit_code(&Err(classified)), 1);
+    }
+
+    #[test]
+    fn classifying_never_overwrites_an_outcome_the_command_already_named() {
+        // A held lock whose message happens to mention a login is still a
+        // held lock.
+        let held = ExitError::new(Exit::Locked, "another run holds the lock: login failed");
+        let classified = classify_provider_error(held.into());
+        assert_eq!(exit_code(&Err(classified)), 5);
+    }
+
+    #[test]
+    fn classifying_keeps_the_message_the_provider_gave() {
+        let classified = classify_provider_error(
+            anyhow!("[AUTHENTICATIONFAILED] Invalid credentials").context("Failed to open INBOX"),
+        );
+        let shown = format!("{classified:#}");
+        assert!(shown.contains("Invalid credentials"), "{shown}");
+        assert!(shown.contains("Failed to open INBOX"), "{shown}");
+    }
+}

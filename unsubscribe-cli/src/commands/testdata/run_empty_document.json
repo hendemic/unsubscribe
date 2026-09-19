@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "command": "run",
+  "account": "user@example.com",
+  "scanned_at": "2026-03-18T09:00:00Z",
+  "senders": [],
+  "totals": {
+    "selected": 0,
+    "attempted": 0,
+    "succeeded": 0,
+    "failed": 0,
+    "archived_messages": 0
+  },
+  "warnings": [
+    "Unparseable header in INBOX"
+  ],
+  "exit_code": 6
+}

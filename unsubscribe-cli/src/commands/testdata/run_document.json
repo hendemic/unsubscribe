@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "command": "run",
+  "account": "user@example.com",
+  "dry_run": false,
+  "scanned_at": "2026-03-18T09:00:00Z",
+  "from_cache": true,
+  "senders": [
+    {
+      "email": "resumed@acme.example.com",
+      "display_name": "Acme News",
+      "domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "email_count": 4,
+      "messages": 1,
+      "selection_reason": "resumed",
+      "action": "unsubscribe",
+      "next_step": {
+        "kind": "exhausted"
+      },
+      "result": {
+        "method": "one_click_post",
+        "success": false,
+        "detail": "HTTP 500",
+        "url": "https://acme.example.com/u?id=1",
+        "http_status": 500,
+        "final_url": null
+      }
+    },
+    {
+      "email": "stale@acme.example.com",
+      "display_name": "Acme News",
+      "domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "email_count": 1,
+      "messages": 1,
+      "selection_reason": null,
+      "action": "archive_only",
+      "result": null
+    },
+    {
+      "email": "named@acme.example.com",
+      "display_name": "Acme News",
+      "domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "email_count": 2,
+      "messages": 1,
+      "selection_reason": "named",
+      "action": "exhausted",
+      "result": null
+    }
+  ],
+  "totals": {
+    "selected": 2,
+    "attempted": 1,
+    "succeeded": 0,
+    "failed": 1,
+    "archive_only": 1,
+    "exhausted": 1,
+    "archived_messages": 3,
+    "emails": 7
+  },
+  "unknown_senders": [
+    "gone@elsewhere.example.com"
+  ],
+  "warnings": [
+    "Unparseable header in INBOX"
+  ],
+  "exit_code": 3
+}

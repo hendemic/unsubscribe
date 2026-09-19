@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "command": "scan",
+  "account": "user@example.com",
+  "senders": [
+    {
+      "email": "resumed@acme.example.com",
+      "display_name": "Acme News",
+      "domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "email_count": 6,
+      "messages": 1,
+      "last_seen": null,
+      "method": "one_click",
+      "one_click": true,
+      "stale": false,
+      "history": {
+        "previously_unsubscribed": true,
+        "attempt_id": "11111111-1111-4111-8111-111111111111",
+        "unsubscribed_at": 1600000000,
+        "outcome": {
+          "state": "resumed",
+          "days_after": 30
+        },
+        "violation_count": 2,
+        "next_step": {
+          "kind": "exhausted"
+        }
+      }
+    },
+    {
+      "email": "quiet@acme.example.com",
+      "display_name": "Acme News",
+      "domain": "acme.example.com",
+      "list_id": "acme.list.example.com",
+      "email_count": 6,
+      "messages": 1,
+      "last_seen": 1000000000,
+      "method": "http",
+      "one_click": false,
+      "stale": true,
+      "history": null
+    }
+  ],
+  "totals": {
+    "senders": 2,
+    "emails": 12,
+    "stale": 1,
+    "previously_unsubscribed": 1,
+    "resumed": 1
+  },
+  "warnings": [
+    "Unparseable header in INBOX"
+  ]
+}

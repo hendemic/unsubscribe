@@ -603,3 +603,432 @@ fn run_document(
     doc.insert("exit_code".to_string(), json!(exit.code()));
     Value::Object(doc)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exit::exit_code;
+    use unsubscribe_core::{
+        AuthType, Folder as CoreFolder, FolderMessage, MessageId, NextStep, PlannedSender,
+        PreviouslyUnsubscribed, ProviderType, SenderVerdict, UnsubscribeMethod, UnsubscribeOutcome,
+        UnsubscribeResult,
+    };
+
+    fn account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@example.com".to_string(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.example.com".to_string()),
+            port: Some(993),
+            username: "user@example.com".to_string(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    fn sender(email: &str, count: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: "Acme News".to_string(),
+            email: email.to_string(),
+            domain: "acme.example.com".to_string(),
+            unsubscribe_urls: vec!["https://acme.example.com/u?id=1".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: true,
+            list_id: Some("acme.list.example.com".to_string()),
+            list_unsubscribe_raw: None,
+            email_count: count,
+            messages: vec![FolderMessage {
+                folder: CoreFolder::new("INBOX"),
+                message_id: MessageId::new(format!("INBOX:{email}")),
+            }],
+            last_seen: Some(1_700_000_000),
+        }
+    }
+
+    fn request(policy: SelectionPolicy, tty: Tty) -> RunRequest {
+        RunRequest {
+            dry_run: false,
+            cached: false,
+            rescan: false,
+            yes: false,
+            json: false,
+            policy,
+            tty,
+        }
+    }
+
+    fn headless_policy() -> SelectionPolicy {
+        SelectionPolicy {
+            resumed: true,
+            max_senders: 50,
+            ..SelectionPolicy::default()
+        }
+    }
+
+    fn plan_of(senders: &[&str]) -> RunPlan {
+        RunPlan {
+            to_unsubscribe: senders
+                .iter()
+                .map(|email| PlannedSender {
+                    sender: sender(email, 3),
+                    step: NextStep::FirstAttempt,
+                })
+                .collect(),
+            archive_only: Vec::new(),
+            exhausted: Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // confirm_plan
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_headless_run_with_yes_needs_no_confirmation() {
+        let request = RunRequest {
+            yes: true,
+            ..request(headless_policy(), Tty::detached())
+        };
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
+
+    #[test]
+    fn a_dry_run_is_its_own_confirmation() {
+        // It is about to change nothing, so there is nothing to agree to.
+        let request = RunRequest {
+            dry_run: true,
+            ..request(headless_policy(), Tty::detached())
+        };
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
+
+    #[test]
+    fn the_selection_screen_is_its_own_confirmation() {
+        let request = request(SelectionPolicy::default(), Tty::attached());
+        assert!(confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap());
+    }
+
+    #[test]
+    fn a_headless_run_without_yes_and_without_a_terminal_refuses_to_act() {
+        let request = request(headless_policy(), Tty::detached());
+        let error = confirm_plan(&plan_of(&["a@acme.example.com"]), &request).unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+    }
+
+    #[test]
+    fn the_refusal_names_the_flag_that_would_have_allowed_the_run() {
+        let request = request(headless_policy(), Tty::detached());
+        let error = confirm_plan(&plan_of(&["a@acme.example.com", "b@acme.example.com"]), &request)
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--yes"), "{message}");
+        assert!(message.contains("--dry-run"), "{message}");
+        assert!(message.contains('2'), "the size of the plan should be named: {message}");
+    }
+
+    #[test]
+    fn the_count_in_the_refusal_covers_every_sender_the_run_would_touch() {
+        // Archive-only and exhausted senders are acted on too.
+        let plan = RunPlan {
+            to_unsubscribe: vec![PlannedSender {
+                sender: sender("a@acme.example.com", 1),
+                step: NextStep::FirstAttempt,
+            }],
+            archive_only: vec![sender("b@acme.example.com", 1)],
+            exhausted: vec![sender("c@acme.example.com", 1)],
+        };
+        let request = request(headless_policy(), Tty::detached());
+        let message = format!("{:#}", confirm_plan(&plan, &request).unwrap_err());
+        assert!(message.contains(" 3 senders"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // choose_senders
+    // -----------------------------------------------------------------------
+
+    fn annotated() -> AnnotatedSenders {
+        AnnotatedSenders {
+            previously_unsubscribed: vec![PreviouslyUnsubscribed {
+                sender: sender("resumed@acme.example.com", 4),
+                verdict: SenderVerdict {
+                    attempt_id: "attempt-1".to_string(),
+                    unsubscribed_at: 1_600_000_000,
+                    outcome: UnsubscribeOutcome::Resumed { days_after: 30 },
+                    violation_count: 1,
+                    next_step: NextStep::Exhausted,
+                },
+            }],
+            active: vec![
+                sender("one@acme.example.com", 3),
+                sender("two@acme.example.com", 5),
+            ],
+            stale: Vec::new(),
+            new_resumptions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_policy_selection_never_opens_the_screen() {
+        // Reaching the TUI from here would hang a timer; the test runs without
+        // a terminal, so anything that tried would fail rather than return.
+        let request = request(headless_policy(), Tty::detached());
+        let selection = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap()
+            .expect("a policy selection is never a cancellation");
+        assert_eq!(
+            selection
+                .selected
+                .iter()
+                .map(|s| s.sender.email.as_str())
+                .collect::<Vec<_>>(),
+            ["resumed@acme.example.com"]
+        );
+    }
+
+    #[test]
+    fn a_selection_over_the_cap_refuses_before_anything_is_attempted() {
+        let request = request(
+            SelectionPolicy {
+                all_active: true,
+                max_senders: 1,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let error = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+    }
+
+    #[test]
+    fn the_cap_refusal_says_how_many_matched_and_how_to_allow_them() {
+        let request = request(
+            SelectionPolicy {
+                all_active: true,
+                max_senders: 1,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let error = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--max-senders 2"), "{message}");
+        assert!(message.contains("limit 1"), "{message}");
+    }
+
+    #[test]
+    fn a_policy_that_matches_nothing_is_an_empty_selection_not_a_cancellation() {
+        // Empty and cancelled are different outcomes; only one of them means
+        // the user changed their mind.
+        let request = request(
+            SelectionPolicy {
+                senders: vec!["nobody@elsewhere.example.com".to_string()],
+                max_senders: 50,
+                ..SelectionPolicy::default()
+            },
+            Tty::detached(),
+        );
+        let selection = choose_senders(annotated(), &request, "2026-03-18", &Preferences::default())
+            .unwrap()
+            .expect("a policy selection is never a cancellation");
+        assert!(selection.is_empty());
+        assert_eq!(selection.unknown, ["nobody@elsewhere.example.com"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The message a caller with no selection gets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_selection_required_message_lists_every_flag_that_would_satisfy_it() {
+        for flag in [
+            "--resumed",
+            "--all-active",
+            "--stale",
+            "--sender",
+            "--senders-file",
+            "--yes",
+        ] {
+            assert!(
+                SELECTION_REQUIRED.contains(flag),
+                "{flag} is missing from the message a headless caller gets"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON documents
+    // -----------------------------------------------------------------------
+
+    fn selection() -> Selection {
+        Selection {
+            selected: vec![
+                SelectedSender {
+                    sender: sender("resumed@acme.example.com", 4),
+                    reason: SelectionReason::Resumed,
+                },
+                SelectedSender {
+                    sender: sender("named@acme.example.com", 2),
+                    reason: SelectionReason::Named,
+                },
+            ],
+            unknown: vec!["gone@elsewhere.example.com".to_string()],
+            over_cap: None,
+        }
+    }
+
+    fn reasons() -> HashMap<String, SelectionReason> {
+        selection()
+            .selected
+            .iter()
+            .map(|s| (s.sender.email.to_lowercase(), s.reason))
+            .collect()
+    }
+
+    fn executed_plan() -> RunPlan {
+        RunPlan {
+            to_unsubscribe: vec![PlannedSender {
+                sender: sender("resumed@acme.example.com", 4),
+                step: NextStep::Exhausted,
+            }],
+            archive_only: vec![sender("stale@acme.example.com", 1)],
+            exhausted: vec![sender("named@acme.example.com", 2)],
+        }
+    }
+
+    fn outcome() -> RunOutcome {
+        RunOutcome {
+            results: vec![UnsubscribeResult {
+                email: "resumed@acme.example.com".to_string(),
+                method: UnsubscribeMethod::OneClickPost,
+                success: false,
+                detail: "HTTP 500".to_string(),
+                url: "https://acme.example.com/u?id=1".to_string(),
+                http_status: Some(500),
+                final_url: None,
+            }],
+            archived: 3,
+            cancelled: false,
+        }
+    }
+
+    fn document() -> Value {
+        run_document(
+            &account(),
+            &request(headless_policy(), Tty::detached()),
+            "2026-03-18T09:00:00Z",
+            true,
+            &executed_plan(),
+            &outcome(),
+            &selection(),
+            &reasons(),
+            &["Unparseable header in INBOX".to_string()],
+            Exit::SomeFailed,
+        )
+    }
+
+    #[test]
+    fn the_run_document_matches_its_golden_shape() {
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/run_document.json")).unwrap();
+        assert_eq!(document(), golden);
+    }
+
+    #[test]
+    fn the_empty_run_document_matches_its_golden_shape() {
+        let document = empty_document(
+            &account(),
+            "2026-03-18T09:00:00Z",
+            &["Unparseable header in INBOX".to_string()],
+        );
+        let golden: Value =
+            serde_json::from_str(include_str!("testdata/run_empty_document.json")).unwrap();
+        assert_eq!(document, golden);
+    }
+
+    #[test]
+    fn every_sender_row_says_what_was_done_about_it() {
+        let document = document();
+        let actions: Vec<&str> = document["senders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["unsubscribe", "archive_only", "exhausted"]);
+    }
+
+    #[test]
+    fn only_an_attempted_sender_carries_a_result() {
+        let document = document();
+        let rows = document["senders"].as_array().unwrap();
+        assert_eq!(rows[0]["result"]["method"], json!("one_click_post"));
+        assert_eq!(rows[1]["result"], Value::Null);
+        assert_eq!(rows[2]["result"], Value::Null);
+    }
+
+    #[test]
+    fn a_sender_row_reports_the_flag_that_selected_it() {
+        let document = document();
+        let rows = document["senders"].as_array().unwrap();
+        assert_eq!(rows[0]["selection_reason"], json!("resumed"));
+        assert_eq!(rows[2]["selection_reason"], json!("named"));
+        // Not selected by a policy at all: reported as unknown rather than
+        // attributed to a flag it did not come from.
+        assert_eq!(rows[1]["selection_reason"], Value::Null);
+    }
+
+    #[test]
+    fn the_totals_count_what_happened_rather_than_what_was_planned() {
+        let totals = &document()["totals"];
+        assert_eq!(totals["selected"], json!(2));
+        assert_eq!(totals["attempted"], json!(1));
+        assert_eq!(totals["succeeded"], json!(0));
+        assert_eq!(totals["failed"], json!(1));
+        assert_eq!(totals["archived_messages"], json!(3));
+        assert_eq!(totals["emails"], json!(7));
+    }
+
+    #[test]
+    fn the_document_carries_the_exit_code_the_process_will_return() {
+        // A script that has already read the document should not need to check
+        // `$?` to know what happened.
+        assert_eq!(document()["exit_code"], json!(Exit::SomeFailed.code()));
+        let empty = empty_document(&account(), "2026-03-18T09:00:00Z", &[]);
+        assert_eq!(empty["exit_code"], json!(Exit::NothingToDo.code()));
+    }
+
+    #[test]
+    fn named_senders_that_were_not_in_the_scan_are_listed_not_dropped() {
+        assert_eq!(
+            document()["unknown_senders"],
+            json!(["gone@elsewhere.example.com"])
+        );
+    }
+
+    #[test]
+    fn a_dry_run_says_so_in_its_document() {
+        let request = RunRequest {
+            dry_run: true,
+            ..request(headless_policy(), Tty::detached())
+        };
+        let document = run_document(
+            &account(),
+            &request,
+            "2026-03-18T09:00:00Z",
+            false,
+            &executed_plan(),
+            &outcome(),
+            &selection(),
+            &reasons(),
+            &[],
+            Exit::Success,
+        );
+        assert_eq!(document["dry_run"], json!(true));
+        assert_eq!(document["from_cache"], json!(false));
+    }
+}

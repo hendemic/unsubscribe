@@ -503,3 +503,288 @@ grace_period_days = 14
         assert_eq!(fixture.io_ops.list_folders().unwrap(), Vec::<String>::new());
     }
 }
+
+/// The `config` subcommands as a script drives them.
+#[cfg(test)]
+mod config_command_tests {
+    use super::*;
+    use crate::exit::exit_code;
+
+    const CONFIG: &str = r#"# Keep me.
+[account]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+auth_type = "password"
+provider = "imap"
+
+[scan]
+folders = ["INBOX"]
+archive_folder = "Unsubscribed"
+
+[preferences]
+min_emails = 5
+"#;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("config.toml"), CONFIG).unwrap();
+            Fixture {
+                dir: dir.path().to_path_buf(),
+                _dir: dir,
+            }
+        }
+
+        fn run(&self, action: ConfigAction) -> Result<Exit> {
+            cmd_config(&self.dir, Some(action), false, Tty::detached())
+        }
+
+        fn get(&self, key: &str) -> String {
+            let store = TomlConfigStore::new(&self.dir);
+            let key = SettingKey::parse(key).expect("a known key");
+            store.read_settings().unwrap().get(key)
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.dir.join("config.toml")).unwrap()
+        }
+    }
+
+    fn set(key: &str, values: &[&str]) -> ConfigAction {
+        ConfigAction::Set {
+            key: key.to_string(),
+            value: values.iter().map(|v| (*v).to_string()).collect(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_scalar_setting_set_from_the_command_line_reads_back() {
+        let fixture = Fixture::new();
+        fixture.run(set("preferences.min_emails", &["9"])).unwrap();
+        assert_eq!(fixture.get("preferences.min_emails"), "9");
+        fixture
+            .run(ConfigAction::Get {
+                key: "preferences.min_emails".to_string(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_list_setting_accepts_several_arguments() {
+        let fixture = Fixture::new();
+        fixture
+            .run(set("scan.folders", &["INBOX", "Promotions"]))
+            .unwrap();
+        assert_eq!(fixture.get("scan.folders"), "INBOX, Promotions");
+    }
+
+    #[test]
+    fn a_list_setting_accepts_one_comma_separated_argument() {
+        // Both spellings are natural; neither is worth refusing.
+        let fixture = Fixture::new();
+        fixture
+            .run(set("scan.folders", &["INBOX,Promotions"]))
+            .unwrap();
+        assert_eq!(fixture.get("scan.folders"), "INBOX, Promotions");
+    }
+
+    #[test]
+    fn unsetting_a_setting_restores_its_default() {
+        let fixture = Fixture::new();
+        fixture
+            .run(ConfigAction::Unset {
+                key: "preferences.min_emails".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            fixture.get("preferences.min_emails"),
+            SettingKey::MinEmails.default_value()
+        );
+    }
+
+    #[test]
+    fn every_subcommand_that_succeeded_reports_success() {
+        let fixture = Fixture::new();
+        for action in [
+            ConfigAction::List,
+            ConfigAction::Path,
+            ConfigAction::Get {
+                key: "account.host".to_string(),
+            },
+            set("account.port", &["143"]),
+            ConfigAction::Unset {
+                key: "account.smtp_port".to_string(),
+            },
+        ] {
+            assert_eq!(fixture.run(action).unwrap(), Exit::Success);
+        }
+    }
+
+    #[test]
+    fn a_set_preserves_the_rest_of_the_file() {
+        let fixture = Fixture::new();
+        fixture.run(set("account.port", &["143"])).unwrap();
+        assert_eq!(fixture.text(), CONFIG.replace("port = 993", "port = 143"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Refusals
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_unknown_key_is_a_usage_error_that_lists_the_known_ones() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .run(ConfigAction::Get {
+                key: "scan.folder".to_string(),
+            })
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Unknown setting `scan.folder`"), "{message}");
+        assert!(message.contains("scan.folders"), "{message}");
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+    }
+
+    #[test]
+    fn setting_an_unknown_key_is_refused_before_anything_is_written() {
+        let fixture = Fixture::new();
+        assert!(fixture.run(set("preferences.nonsense", &["1"])).is_err());
+        assert_eq!(fixture.text(), CONFIG);
+    }
+
+    #[test]
+    fn an_invalid_value_is_a_usage_error_and_leaves_the_file_untouched() {
+        let fixture = Fixture::new();
+        let error = fixture.run(set("account.port", &["70000"])).unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+        assert!(
+            message.contains("Port must be a number between 1 and 65535"),
+            "the settings screen's own message should be reported: {message}"
+        );
+        assert_eq!(fixture.text(), CONFIG);
+    }
+
+    #[test]
+    fn giving_a_scalar_key_several_values_is_a_usage_error() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .run(set("account.host", &["imap.one.example", "imap.two.example"]))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+        assert!(message.contains("takes one value"), "{message}");
+        assert_eq!(fixture.text(), CONFIG);
+    }
+
+    #[test]
+    fn unsetting_a_required_key_is_a_usage_error() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .run(ConfigAction::Unset {
+                key: "account.username".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+        assert_eq!(fixture.text(), CONFIG);
+    }
+
+    #[test]
+    fn a_credential_is_neither_readable_nor_writable_through_config() {
+        let fixture = Fixture::new();
+        for key in ["account.password", "account.password_command", "credentials"] {
+            assert!(
+                fixture
+                    .run(ConfigAction::Get {
+                        key: key.to_string()
+                    })
+                    .is_err(),
+                "{key} should not be readable"
+            );
+            assert!(
+                fixture.run(set(key, &["hunter2"])).is_err(),
+                "{key} should not be writable"
+            );
+        }
+        assert_eq!(fixture.text(), CONFIG);
+    }
+
+    #[test]
+    fn a_missing_config_file_points_at_init_rather_than_failing_obscurely() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let error = cmd_config(dir.path(), Some(ConfigAction::List), false, Tty::detached())
+            .unwrap_err();
+        assert_eq!(exit_code(&Err(error)), Exit::Usage.code());
+    }
+
+    #[test]
+    fn asking_where_the_config_lives_works_before_there_is_one() {
+        // "Where would my config go?" is a fair question to ask first.
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            cmd_config(dir.path(), Some(ConfigAction::Path), false, Tty::detached()).unwrap(),
+            Exit::Success
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bare `config`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bare_config_without_a_terminal_lists_the_settings_instead_of_opening_a_screen() {
+        // A screen needs someone to look at it; there is nobody here.
+        let fixture = Fixture::new();
+        assert_eq!(
+            cmd_config(&fixture.dir, None, false, Tty::detached()).unwrap(),
+            Exit::Success
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_dotted_key_resolves_to_the_setting_it_names() {
+        assert_eq!(parse_key("scan.folders").unwrap(), SettingKey::Folders);
+        assert_eq!(parse_key("  SCAN.FOLDERS ").unwrap(), SettingKey::Folders);
+    }
+
+    #[test]
+    fn a_single_value_is_passed_through_whatever_the_key_is() {
+        assert_eq!(join_values(SettingKey::Host, &["h".to_string()]).unwrap(), "h");
+        assert_eq!(
+            join_values(SettingKey::Folders, &["INBOX".to_string()]).unwrap(),
+            "INBOX"
+        );
+    }
+
+    #[test]
+    fn several_values_for_a_list_become_one_comma_separated_value() {
+        assert_eq!(
+            join_values(
+                SettingKey::Folders,
+                &["INBOX".to_string(), "Sent".to_string()]
+            )
+            .unwrap(),
+            "INBOX,Sent"
+        );
+    }
+
+    #[test]
+    fn a_default_that_is_nothing_is_described_as_unset() {
+        assert_eq!(display_default(SettingKey::SmtpHost), "unset");
+        assert_eq!(display_default(SettingKey::GracePeriodDays), "14");
+    }
+}
