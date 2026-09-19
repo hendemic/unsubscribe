@@ -2377,14 +2377,15 @@ mod tests {
             press(&mut shell, Action::Back);
 
             press(&mut shell, Action::Activate);
-
             assert!(shell.active_sub_view().is_some(), "back in the scan");
-            let effect = {
-                let nav = shell.dispatch_action(Action::Activate);
-                shell.apply(nav)
-            };
-            assert!(effect.is_none(), "Enter did not start a second scan");
-            assert_eq!(shell.stacks.run.len(), 1);
+
+            // Enter now lands on the scan's own Cancel button, not on the Run
+            // panel's two start actions -- there is no way to begin a second
+            // scan while this one is still there.
+            act(&mut shell, Action::Activate);
+
+            assert!(shell.dialog.is_some(), "it offered to stop this scan");
+            assert_eq!(shell.stacks.run.len(), 1, "and started nothing new");
         }
 
         #[test]
@@ -2636,6 +2637,66 @@ mod tests {
 
             assert_eq!(shell.depth(), 1);
             assert_eq!(selected_emails(&shell), chosen);
+        }
+
+        // -- the same thing, through the visible button ---------------------
+
+        #[test]
+        fn enter_on_a_scans_button_asks_exactly_what_c_asks() {
+            let mut by_key = scanning();
+            act(&mut by_key, Action::Mnemonic('c'));
+            let mut by_button = scanning();
+            act(&mut by_button, Action::Activate);
+
+            assert!(by_button.dialog.is_some());
+            assert_eq!(
+                by_button.dialog.as_ref().map(|d| d.title.clone()),
+                by_key.dialog.as_ref().map(|d| d.title.clone())
+            );
+        }
+
+        #[test]
+        fn enter_on_a_runs_button_asks_exactly_what_c_asks() {
+            let mut shell = unsubscribing();
+
+            act(&mut shell, Action::Activate);
+
+            assert!(matches!(shell.pending, Some(Pending::CancelRun)));
+        }
+
+        #[test]
+        fn enter_on_the_selections_way_out_follows_the_same_confirmation_rule() {
+            // Untouched: it just goes. Changed: it asks. Exactly as `c` does.
+            let mut clean = shell();
+            open(&mut clean, Section::Run);
+            clean.apply(Nav::Push(selection_view()));
+            press(&mut clean, Action::Last); // onto the way out
+            act(&mut clean, Action::Activate);
+            assert!(clean.dialog.is_none());
+            assert_eq!(clean.depth(), 0);
+
+            let mut dirty = shell();
+            open(&mut dirty, Section::Run);
+            dirty.apply(Nav::Push(selection_view()));
+            press(&mut dirty, Action::Mnemonic('a'));
+            press(&mut dirty, Action::Last);
+            act(&mut dirty, Action::Activate);
+            assert!(dirty.dialog.is_some());
+            assert_eq!(dirty.depth(), 1, "still there while it asks");
+        }
+
+        #[test]
+        fn every_run_sub_view_has_a_button_the_cursor_can_reach() {
+            for build in [scanning as fn() -> Shell, unsubscribing] {
+                let shell = build();
+                let labelled = match shell.stacks.run.last() {
+                    Some(SubView::Scan(screen)) => screen.button().is_some(),
+                    Some(SubView::Running(screen)) => screen.button().is_some(),
+                    _ => false,
+                };
+                assert!(labelled, "a Run sub-view with nothing to press");
+                assert!(shell.focus_actions().contains(&Action::Activate));
+            }
         }
 
         #[test]

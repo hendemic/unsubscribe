@@ -65,6 +65,10 @@ pub struct RunScreen {
     outcome: Option<Result<Box<RunOutcome>, String>>,
     cursor: usize,
     scroll_offset: usize,
+    /// Whether the action button below the list has the cursor rather than an
+    /// attempt row. It starts with it: while a run is going there is nothing
+    /// worth browsing yet, and stopping should not need the hotkey.
+    on_button: bool,
     /// Index into the rendered rows of the attempt being inspected.
     detail: Option<usize>,
 }
@@ -86,6 +90,7 @@ impl RunScreen {
             outcome: None,
             cursor: 0,
             scroll_offset: 0,
+            on_button: true,
             detail: None,
         }
     }
@@ -139,6 +144,52 @@ impl RunScreen {
             .collect()
     }
 
+    /// The action row under the list, and what it says it does. `None` while
+    /// the run is already stopping: there is nothing left for it to do.
+    #[must_use]
+    pub fn button(&self) -> Option<&'static str> {
+        match self.state {
+            RunState::Running => Some("Stop run"),
+            RunState::Cancelling => None,
+            RunState::Finished => Some("Close"),
+        }
+    }
+
+    /// Whether the button is what `Enter` would act on right now.
+    #[must_use]
+    pub fn button_focused(&self) -> bool {
+        self.on_button && self.button().is_some()
+    }
+
+    /// Move between the attempt rows and the button below them.
+    ///
+    /// The button sits one row past the end of the list, so `End`/`G` and
+    /// pressing down past the last attempt both land on it, and moving up
+    /// from it takes hold of the list.
+    fn move_cursor(&mut self, action: Action) -> bool {
+        let attempts = self.attempts().len();
+        let last = attempts.saturating_sub(1);
+
+        if self.on_button {
+            if keys::is_backwards(action) && attempts > 0 {
+                self.on_button = false;
+                self.cursor = match action {
+                    Action::First => 0,
+                    _ => last,
+                };
+            }
+            return keys::move_cursor(action, 0, 0).is_some();
+        }
+        let Some(cursor) = keys::move_cursor(action, self.cursor, last) else {
+            return false;
+        };
+        // Past the bottom of the list is the button, not a clamp.
+        self.on_button =
+            !keys::is_backwards(action) && (cursor == self.cursor || action == Action::Last);
+        self.cursor = cursor;
+        true
+    }
+
     pub fn on_action(&mut self, action: Action) -> Nav {
         // The inspection pop-up is one level of its own: Esc closes it before
         // anything else can read the key.
@@ -148,12 +199,13 @@ impl RunScreen {
             }
             return Nav::Stay;
         }
-        let last = self.attempts().len().saturating_sub(1);
-        if let Some(cursor) = keys::move_cursor(action, self.cursor, last) {
-            self.cursor = cursor;
+        if self.move_cursor(action) {
             return Nav::Stay;
         }
         match action {
+            // The button and `c` are the same action; a sender row keeps its
+            // own meaning of "show me this attempt".
+            Action::Activate if self.button_focused() => self.cancel(),
             Action::Activate if self.state == RunState::Finished => {
                 self.detail = Some(self.cursor);
                 Nav::Stay
@@ -161,15 +213,20 @@ impl RunScreen {
             // Esc parks the run rather than ending it: the worker carries on
             // and the nav becomes reachable while it does.
             Action::Back => Nav::Park,
-            Action::Mnemonic('c') => match self.state {
-                RunState::Running => Nav::Effect(Effect::ConfirmCancelRun),
-                // Already stopping: asking again would change nothing.
-                RunState::Cancelling => Nav::Stay,
-                // Nothing left to stop; the results close back to the panel,
-                // whose counts are already refreshed by then.
-                RunState::Finished => Nav::Pop,
-            },
+            Action::Mnemonic('c') => self.cancel(),
             _ => Nav::Stay,
+        }
+    }
+
+    /// What `c` and the button both do.
+    fn cancel(&mut self) -> Nav {
+        match self.state {
+            RunState::Running => Nav::Effect(Effect::ConfirmCancelRun),
+            // Already stopping: asking again would change nothing.
+            RunState::Cancelling => Nav::Stay,
+            // Nothing left to stop; the results close back to the panel,
+            // whose counts are already refreshed by then.
+            RunState::Finished => Nav::Pop,
         }
     }
 
@@ -181,10 +238,7 @@ impl RunScreen {
         }
         match self.state {
             RunState::Cancelling => vec![Action::Help, Action::Back],
-            RunState::Running => keys::list_actions(&[Action::Mnemonic('c')]),
-            RunState::Finished => {
-                keys::list_actions(&[Action::Activate, Action::Mnemonic('c')])
-            }
+            _ => keys::list_actions(&[Action::Activate, Action::Mnemonic('c')]),
         }
     }
 
@@ -218,14 +272,18 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut RunScreen) {
         .filter(|event| matches!(event, RunEvent::Sender { .. }))
         .collect();
     // While the run is going the newest row is the interesting one, so the
-    // cursor follows it until the user takes hold of it.
-    if screen.state == RunState::Running {
+    // cursor follows it until the user takes hold of the list.
+    if screen.state == RunState::Running && screen.on_button {
         screen.cursor = attempts.len().saturating_sub(1);
     }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(6)])
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(u16::from(screen.button().is_some())),
+            Constraint::Length(6),
+        ])
         .split(area);
 
     let height = (chunks[0].height as usize).saturating_sub(2);
@@ -236,7 +294,9 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut RunScreen) {
         .enumerate()
         .skip(screen.scroll_offset)
         .take(height)
-        .map(|(index, event)| attempt_row(event, index == screen.cursor))
+        .map(|(index, event)| {
+            attempt_row(event, index == screen.cursor && !screen.button_focused())
+        })
         .collect();
 
     let title = match (screen.dry_run, screen.state) {
@@ -273,7 +333,14 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &mut RunScreen) {
         chunks[0],
     );
 
-    f.render_widget(footer(screen, &events), chunks[1]);
+    if let Some(label) = screen.button() {
+        f.render_widget(
+            super::components::button(label, screen.button_focused()),
+            chunks[1],
+        );
+    }
+
+    f.render_widget(footer(screen, &events), chunks[2]);
 
     if let Some(index) = screen.detail {
         if let Some(event) = attempts.get(index) {
@@ -766,6 +833,7 @@ mod tests {
         // The log also holds archive rows; they are not attempts and the
         // cursor must not reach them.
         let (mut screen, _shared, _tx) = screen_with(3);
+        screen.on_action(Action::First); // take hold of the list
 
         for _ in 0..10 {
             screen.on_action(Action::MoveDown);
@@ -777,23 +845,101 @@ mod tests {
     #[test]
     fn moving_up_stops_at_the_first_attempt() {
         let (mut screen, _shared, _tx) = screen_with(3);
-        screen.on_action(Action::Last);
+        screen.on_action(Action::MoveUp); // off the button, onto the last row
 
         for _ in 0..10 {
             screen.on_action(Action::MoveUp);
         }
 
         assert_eq!(screen.cursor, 0);
+        assert!(!screen.button_focused());
     }
 
     #[test]
-    fn g_and_shift_g_jump_to_the_first_and_last_attempt() {
+    fn g_and_shift_g_jump_to_the_last_row_and_the_first_attempt() {
         let (mut screen, _shared, _tx) = screen_with(4);
 
-        screen.on_action(Action::Last);
-        assert_eq!(screen.cursor, 3);
         screen.on_action(Action::First);
         assert_eq!(screen.cursor, 0);
+        assert!(!screen.button_focused());
+
+        // The button is the last row, so G lands on it rather than on the
+        // last attempt -- the same rule every list in the app follows.
+        screen.on_action(Action::Last);
+        assert!(screen.button_focused());
+    }
+
+    // -- the cancel button ---------------------------------------------------
+
+    #[test]
+    fn the_button_has_the_cursor_before_the_user_touches_anything() {
+        // A run has little else worth focusing, so stopping it must not
+        // depend on knowing the hotkey.
+        let (screen, _shared, _tx) = screen_with(2);
+
+        assert!(screen.button_focused());
+        assert_eq!(screen.button(), Some("Stop run"));
+    }
+
+    #[test]
+    fn enter_on_the_button_asks_the_same_question_as_c() {
+        let (mut screen, _shared, _tx) = screen_with(2);
+
+        assert_eq!(
+            nav_name(&screen.on_action(Action::Activate)),
+            "confirm cancel"
+        );
+    }
+
+    #[test]
+    fn enter_on_an_attempt_row_still_inspects_it() {
+        let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_action(Action::First);
+
+        screen.on_action(Action::Activate);
+
+        assert_eq!(screen.detail, Some(0), "the row, not the button");
+    }
+
+    #[test]
+    fn moving_up_from_the_button_takes_hold_of_the_list_and_down_gives_it_back() {
+        let (mut screen, _shared, _tx) = screen_with(3);
+
+        screen.on_action(Action::MoveUp);
+        assert!(!screen.button_focused());
+        assert_eq!(screen.cursor, 2, "the last attempt");
+
+        screen.on_action(Action::MoveDown);
+        assert!(screen.button_focused(), "past the bottom is the button");
+    }
+
+    #[test]
+    fn the_button_says_what_it_does_at_each_stage_and_goes_when_there_is_nothing_to_do() {
+        let (mut screen, _shared, _tx) = screen_with(1);
+        assert_eq!(screen.button(), Some("Stop run"));
+
+        screen.request_cancel();
+        assert_eq!(screen.button(), None, "already stopping");
+        assert!(!screen.button_focused());
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "stay");
+
+        let finished = finished(RunResult::Done(Box::default()));
+        assert_eq!(finished.button(), Some("Close"));
+    }
+
+    #[test]
+    fn enter_on_the_results_button_closes_them_without_asking() {
+        let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_action(Action::Last); // onto the button
+
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "pop");
+    }
+
+    #[test]
+    fn a_button_that_can_be_pressed_is_a_key_the_screen_advertises() {
+        let (screen, _shared, _tx) = screen_with(1);
+
+        assert!(screen.actions().contains(&Action::Activate));
     }
 
     #[test]
@@ -810,6 +956,10 @@ mod tests {
         ] {
             screen.on_action(action);
             assert_eq!(screen.cursor, 0);
+            assert!(
+                screen.button_focused(),
+                "with no attempts the button is all there is to focus"
+            );
         }
     }
 
@@ -818,6 +968,7 @@ mod tests {
     #[test]
     fn an_attempt_can_only_be_inspected_once_the_run_has_finished() {
         let (mut screen, _shared, _tx) = screen_with(2);
+        screen.on_action(Action::First); // off the button, onto a row
 
         screen.on_action(Action::Activate);
 
@@ -827,6 +978,7 @@ mod tests {
     #[test]
     fn enter_inspects_the_highlighted_attempt_and_esc_closes_it() {
         let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_action(Action::First);
         screen.on_action(Action::MoveDown);
 
         screen.on_action(Action::Activate);
@@ -842,7 +994,9 @@ mod tests {
     #[test]
     fn a_key_that_closes_the_detail_does_not_also_leave_the_screen() {
         let mut screen = finished(RunResult::Done(Box::default()));
+        screen.on_action(Action::First);
         screen.on_action(Action::Activate);
+        assert!(screen.detail.is_some(), "the overlay is up");
 
         assert_eq!(
             nav_name(&screen.on_action(Action::Back)),

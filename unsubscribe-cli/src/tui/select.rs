@@ -118,6 +118,16 @@ impl App {
         }
     }
 
+    /// What `c` and the Cancel row both do: a selection the user has not
+    /// touched has nothing to lose, so only a changed one is asked about.
+    fn cancel(&self) -> SelectAction {
+        if self.is_dirty() {
+            SelectAction::ConfirmCancel
+        } else {
+            SelectAction::Cancel
+        }
+    }
+
     /// Whether any tick differs from the ones the screen opened with.
     #[must_use]
     pub(crate) fn is_dirty(&self) -> bool {
@@ -158,10 +168,13 @@ impl App {
             RowKind::Previous(idx) => self.previous_selected[idx] = !self.previous_selected[idx],
             RowKind::Active(idx) => self.active_selected[idx] = !self.active_selected[idx],
             RowKind::Stale(idx) => self.stale_selected[idx] = !self.stale_selected[idx],
+            // Nothing to tick: Space on the way out would be a strange way
+            // to leave, and Enter is what acts on it.
             RowKind::PreviousHeader
             | RowKind::ActiveHeader
             | RowKind::StaleHeader
-            | RowKind::Spacer => {}
+            | RowKind::Spacer
+            | RowKind::Cancel => {}
         }
     }
 
@@ -305,6 +318,11 @@ fn build_rows(previous: usize, active: usize, stale: usize) -> Vec<RowKind> {
         rows.extend((0..stale).map(RowKind::Stale));
     }
 
+    // The way out, last so it is never in the way of the senders: reached by
+    // `End`/`G` or by pressing down past the final row.
+    rows.push(RowKind::Spacer);
+    rows.push(RowKind::Cancel);
+
     rows
 }
 
@@ -320,6 +338,8 @@ enum RowKind {
     StaleHeader,
     SelectAllStale,
     Stale(usize),
+    /// The action row that discards the selection.
+    Cancel,
 }
 
 impl RowKind {
@@ -355,12 +375,11 @@ impl App {
             // Esc parks the selection: every tick is kept and the nav becomes
             // reachable. Discarding it is `c`, which is never an accident.
             Action::Back => return SelectAction::Park,
-            Action::Mnemonic('c') => {
-                return if self.is_dirty() {
-                    SelectAction::ConfirmCancel
-                } else {
-                    SelectAction::Cancel
-                }
+            Action::Mnemonic('c') => return self.cancel(),
+            // Enter on the way out discards; Enter on anything else is still
+            // "go with what I have ticked".
+            Action::Activate if self.row_kind(self.cursor) == RowKind::Cancel => {
+                return self.cancel()
             }
             Action::Activate => return SelectAction::Confirm,
             Action::JumpUp => self.move_up_by(JUMP_ROWS),
@@ -551,11 +570,13 @@ mod tests {
     #[test]
     fn move_down_stops_at_last_row() {
         let mut app = app_with_history(three_active_senders(), &[], Preferences::default());
-        // Rows: ActiveHeader(0), SelectAllActive(1), Active(2,3,4) = 5 rows
+        // Rows: ActiveHeader(0), SelectAllActive(1), Active(2,3,4),
+        // Spacer(5), Cancel(6). The way out is the last row there is.
         for _ in 0..10 {
             app.move_down();
         }
-        assert_eq!(app.cursor, 4);
+        assert_eq!(app.cursor, 6);
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
     }
 
     #[test]
@@ -835,6 +856,8 @@ mod tests {
                 RowKind::SelectAllStale,
                 RowKind::Stale(0),
                 RowKind::Stale(1),
+                RowKind::Spacer,
+                RowKind::Cancel,
             ]
         );
     }
@@ -859,7 +882,12 @@ mod tests {
     fn stale_section_is_omitted_when_empty() {
         let app = app_with_history(three_active_senders(), &[], Preferences::default());
         assert!(!app.rows.contains(&RowKind::StaleHeader));
-        assert!(!app.rows.contains(&RowKind::Spacer));
+        // The only spacer left is the one above the way out, at the very end.
+        assert_eq!(
+            app.rows.iter().filter(|row| **row == RowKind::Spacer).count(),
+            1
+        );
+        assert_eq!(app.rows[app.rows.len() - 2], RowKind::Spacer);
     }
 
     #[test]
@@ -880,6 +908,8 @@ mod tests {
                 RowKind::Spacer,
                 RowKind::ActiveHeader,
                 RowKind::SelectAllActive,
+                RowKind::Spacer,
+                RowKind::Cancel,
             ]
         );
     }
@@ -900,6 +930,8 @@ mod tests {
                 RowKind::StaleHeader,
                 RowKind::SelectAllStale,
                 RowKind::Stale(0),
+                RowKind::Spacer,
+                RowKind::Cancel,
             ]
         );
     }
@@ -927,14 +959,24 @@ mod tests {
                 RowKind::StaleHeader,
                 RowKind::SelectAllStale,
                 RowKind::Stale(0),
+                RowKind::Spacer,
+                RowKind::Cancel,
             ]
         );
     }
 
     #[test]
-    fn no_senders_at_all_leaves_only_the_active_header_and_select_all() {
+    fn no_senders_at_all_leaves_only_the_active_header_select_all_and_the_way_out() {
         let app = app_with_history(vec![], &[], Preferences::default());
-        assert_eq!(app.rows, vec![RowKind::ActiveHeader, RowKind::SelectAllActive]);
+        assert_eq!(
+            app.rows,
+            vec![
+                RowKind::ActiveHeader,
+                RowKind::SelectAllActive,
+                RowKind::Spacer,
+                RowKind::Cancel,
+            ]
+        );
         assert_eq!(app.total_senders(), 0);
     }
 
@@ -1111,7 +1153,8 @@ mod tests {
             visited.push(app.cursor);
         }
         visited.dedup();
-        assert_eq!(visited, vec![1, 2, 3, 6, 7, 8, 11, 12, 13]);
+        // 15 is the way out, the last selectable row of all.
+        assert_eq!(visited, vec![1, 2, 3, 6, 7, 8, 11, 12, 13, 15]);
         assert!(!visited.iter().any(|&row| app.is_non_selectable(row)));
     }
 
@@ -1266,14 +1309,14 @@ mod tests {
     #[test]
     fn a_jump_down_near_the_bottom_stops_on_the_last_selectable_row() {
         let mut app = all_three_sections();
-        app.cursor = 12; // one selectable row above the end
+        app.cursor = 12; // a few selectable rows above the end
 
         app.move_down_by(JUMP_ROWS);
 
         let last_selectable = *selectable_rows(&app).last().expect("rows exist");
         assert_eq!(app.cursor, last_selectable);
-        assert_eq!(app.cursor, 13);
-        assert!(matches!(app.row_kind(app.cursor), RowKind::Stale(1)));
+        assert_eq!(app.cursor, 15);
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
     }
 
     #[test]
@@ -1294,7 +1337,7 @@ mod tests {
         for _ in 0..5 {
             app.move_down_by(JUMP_ROWS);
         }
-        assert_eq!(app.cursor, 13, "should rest on the last row, not past it");
+        assert_eq!(app.cursor, 15, "should rest on the last row, not past it");
 
         for _ in 0..5 {
             app.move_up_by(JUMP_ROWS);
@@ -1387,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_down_into_a_trailing_empty_active_section_stops_on_its_select_all() {
+    fn a_jump_over_a_trailing_spacer_and_header_lands_on_a_selectable_row() {
         // Layout: PreviousHeader(0), SelectAllPrevious(1), Previous(0..2),
         // Spacer(4), ActiveHeader(5), SelectAllActive(6). The last two rows
         // before the end are a spacer and a header, so an overshooting jump
@@ -1400,16 +1443,20 @@ mod tests {
 
         app.move_down_by(JUMP_ROWS);
 
-        assert_eq!(app.cursor, 6);
-        assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllActive));
+        // The jump clears the trailing spacer and header and lands on the
+        // way out, which is the only selectable row past the select-all.
+        assert_eq!(app.cursor, 8);
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
     }
 
     #[test]
     fn a_jump_in_an_empty_list_does_not_panic() {
         let mut app = app_with_history(vec![], &[], Preferences::default());
 
+        // Rows: ActiveHeader(0), SelectAllActive(1), Spacer(2), Cancel(3).
         app.move_down_by(JUMP_ROWS);
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
         app.move_up_by(JUMP_ROWS);
         assert_eq!(app.cursor, 1);
         assert!(matches!(app.row_kind(app.cursor), RowKind::SelectAllActive));
@@ -1422,9 +1469,10 @@ mod tests {
             &[],
             Preferences::default(),
         );
-        // Rows: ActiveHeader(0), SelectAllActive(1), Active(0) at 2.
+        // Rows: ActiveHeader(0), SelectAllActive(1), Active(0) at 2,
+        // Spacer(3), Cancel(4).
         app.move_down_by(JUMP_ROWS);
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.cursor, 4);
         app.move_up_by(JUMP_ROWS);
         assert_eq!(app.cursor, 1);
     }
@@ -1567,6 +1615,7 @@ pub(crate) fn render(f: &mut Frame, area: Rect, app: &mut App) {
                 let selected = app.stale_selected[idx];
                 items.push(stale_sender_row(sender, selected, is_cursor));
             }
+            RowKind::Cancel => items.push(super::components::button_line("Discard selection", is_cursor)),
         }
     }
 
@@ -1896,6 +1945,65 @@ mod key_handling_tests {
         let app = app();
 
         assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn the_way_out_is_the_last_row_so_it_never_gets_in_the_way_of_the_senders() {
+        let app = app();
+
+        assert_eq!(app.rows.last(), Some(&RowKind::Cancel));
+        assert_ne!(
+            app.cursor,
+            app.rows.len() - 1,
+            "the cursor opens on the senders, not on the way out"
+        );
+    }
+
+    #[test]
+    fn end_reaches_the_way_out_and_enter_on_it_discards_the_selection() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), SelectAction::Cancel);
+    }
+
+    #[test]
+    fn the_way_out_asks_first_once_a_tick_has_been_changed() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Char('G')));
+
+        assert_eq!(app.on_key(key(KeyCode::Enter)), SelectAction::ConfirmCancel);
+    }
+
+    #[test]
+    fn enter_on_a_sender_row_still_means_go_with_what_i_have_ticked() {
+        let mut app = app();
+
+        assert_ne!(app.row_kind(app.cursor), RowKind::Cancel);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), SelectAction::Confirm);
+    }
+
+    #[test]
+    fn space_on_the_way_out_ticks_nothing() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('G')));
+
+        app.on_key(key(KeyCode::Char(' ')));
+
+        assert!(!app.is_dirty(), "the way out is not a sender");
+        assert_eq!(app.on_key(key(KeyCode::Char('c'))), SelectAction::Cancel);
+    }
+
+    #[test]
+    fn pressing_down_past_the_last_sender_lands_on_the_way_out() {
+        let mut app = app();
+        for _ in 0..20 {
+            app.on_key(key(KeyCode::Down));
+        }
+
+        assert_eq!(app.row_kind(app.cursor), RowKind::Cancel);
     }
 
     #[test]

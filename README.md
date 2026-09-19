@@ -74,7 +74,14 @@ nav and leaves the screen standing. A scan or a run keeps going on its worker,
 the nav marks Run with what it has waiting (`Run (scanning…)`, `Run ●`), and
 coming back to Run finds the same screen with the same cursor, ticks and
 progress. Stopping is never something `Esc` does by accident: cancelling is
-`c`, which asks first whenever there is work or a choice to lose. Quitting
+`c`, which asks first whenever there is work or a choice to lose. Every screen
+that can be cancelled also shows the same action as a row you can move onto
+and press `Enter` on — `[ Cancel scan ]`, `[ Stop run ]`, `[ Discard
+selection ]`, `[ Close ]` — so the hotkey is a shortcut, never the only way.
+On the scan and the run it already has the cursor; on the sender selection it
+sits below the last sender, reached with `End`/`G` or by pressing down past
+the bottom, and `Enter` on a sender row still means "go with what I have
+ticked". Quitting
 while a scan or a run is going asks too, then stops the worker cleanly — an
 attempt in flight is always finished first.
 
@@ -99,7 +106,7 @@ Panel actions are single letters. A letter means one thing throughout the app:
 |-----|------|-------|
 | `a` | Select all | Sender selection |
 | `n` | Select none; also "no" at a confirmation | Sender selection, dialogs |
-| `c` | Cancel what is in front of you: stop a scan or a run, discard a selection, close the results | Scan, sender selection, run, results |
+| `c` | Cancel what is in front of you: stop a scan or a run, discard a selection, close the results — the same as pressing the screen's `[ … ]` row | Scan, sender selection, run, results |
 | `y` | Confirm (same as `Enter`) | Dialogs |
 | `s` | Cycle the sort order | Unsubscribe List |
 | `r` | Show only senders that resumed | Unsubscribe List |

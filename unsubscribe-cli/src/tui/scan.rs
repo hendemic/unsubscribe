@@ -60,6 +60,21 @@ impl ScanScreen {
             .unwrap_or_else(|| ScanEnded::Failed("The scan ended without a result.".to_string()))
     }
 
+    /// The screen's one focusable element, and what it says it does.
+    ///
+    /// Part of the state rather than a decoration the renderer invents:
+    /// `Enter` acts on it, so it has to exist where the key handler can see
+    /// it. `None` while the scan is already stopping -- there is nothing left
+    /// for a button to do.
+    #[must_use]
+    pub fn button(&self) -> Option<&'static str> {
+        match self.state {
+            ScanState::Running => Some("Cancel scan"),
+            ScanState::Cancelling => None,
+            ScanState::Ended => Some("Close"),
+        }
+    }
+
     /// Ask the worker to stop. It does so at its next batch boundary.
     pub fn request_cancel(&mut self) {
         self.shared.cancel();
@@ -98,24 +113,37 @@ impl ScanScreen {
             // Esc parks the scan rather than ending it: the worker keeps
             // going and the nav becomes reachable while it does.
             Action::Back => Nav::Park,
+            // The button is the only thing on this screen to focus, so it
+            // always has focus and Enter is the same key as `c`.
+            Action::Activate if self.button().is_some() => self.cancel(),
             // Stopping is its own key now, and it asks first. Already
             // stopping, asking again would change nothing.
-            Action::Mnemonic('c') => match self.state {
-                ScanState::Running => Nav::Effect(Effect::ConfirmCancelScan),
-                ScanState::Cancelling => Nav::Stay,
-                // Nothing left to stop: the only thing left is to close it.
-                ScanState::Ended => Nav::Pop,
-            },
+            Action::Mnemonic('c') => self.cancel(),
             _ => Nav::Stay,
+        }
+    }
+
+    /// What `c` and the button both do.
+    fn cancel(&mut self) -> Nav {
+        match self.state {
+            ScanState::Running => Nav::Effect(Effect::ConfirmCancelScan),
+            ScanState::Cancelling => Nav::Stay,
+            // Nothing left to stop: the only thing left is to close it.
+            ScanState::Ended => Nav::Pop,
         }
     }
 
     /// The actions this sub-view answers, for the footer and the `?` overlay.
     #[must_use]
     pub fn actions(&self) -> Vec<Action> {
-        match self.state {
-            ScanState::Cancelling => vec![Action::Help, Action::Back],
-            _ => vec![Action::Help, Action::Mnemonic('c'), Action::Back],
+        match self.button() {
+            None => vec![Action::Help, Action::Back],
+            Some(_) => vec![
+                Action::Activate,
+                Action::Mnemonic('c'),
+                Action::Help,
+                Action::Back,
+            ],
         }
     }
 
@@ -141,8 +169,9 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &ScanScreen) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // per-folder bars
-            Constraint::Length(4), // totals
+            Constraint::Min(5),                                    // per-folder bars
+            Constraint::Length(4),                                 // totals
+            Constraint::Length(u16::from(screen.button().is_some())), // the button
         ])
         .split(area);
 
@@ -211,6 +240,10 @@ pub(crate) fn render(f: &mut Frame, area: Rect, screen: &ScanScreen) {
         .block(Block::default().borders(Borders::ALL).title(" Found ")),
         chunks[1],
     );
+
+    if let Some(label) = screen.button() {
+        f.render_widget(super::components::button(label, true), chunks[2]);
+    }
 }
 
 /// A fixed-width progress bar. An unknown total draws as empty rather than
@@ -344,6 +377,61 @@ mod tests {
             !screen.shared.cancel_requested(),
             "nothing is cancelled until the question is answered"
         );
+    }
+
+    // -- the cancel button ---------------------------------------------------
+
+    #[test]
+    fn the_button_is_the_only_thing_to_focus_so_enter_is_the_same_key_as_c() {
+        // A scan has nothing else worth focusing, so stopping it must not
+        // depend on knowing the hotkey.
+        let (mut screen, _tx) = running();
+        assert_eq!(screen.button(), Some("Cancel scan"));
+
+        assert_eq!(
+            nav_name(&screen.on_action(Action::Activate)),
+            "confirm cancel"
+        );
+    }
+
+    #[test]
+    fn the_button_goes_once_there_is_nothing_left_for_it_to_do() {
+        let (mut screen, _tx) = running();
+        screen.request_cancel();
+
+        assert_eq!(screen.button(), None, "already stopping");
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "stay");
+    }
+
+    #[test]
+    fn an_ended_scan_offers_a_button_that_closes_it() {
+        let mut screen = ended_with(ScanOutcome::Cancelled);
+        screen.tick();
+
+        assert_eq!(screen.button(), Some("Close"));
+        assert_eq!(nav_name(&screen.on_action(Action::Activate)), "pop");
+    }
+
+    #[test]
+    fn a_button_that_can_be_pressed_is_a_key_the_screen_advertises() {
+        let (mut screen, _tx) = running();
+        assert!(screen.actions().contains(&Action::Activate));
+
+        screen.request_cancel();
+        assert!(
+            !screen.actions().contains(&Action::Activate),
+            "nothing left to press"
+        );
+    }
+
+    #[test]
+    fn movement_keys_do_nothing_on_a_screen_with_one_button() {
+        let (mut screen, _tx) = running();
+
+        for action in [Action::MoveUp, Action::MoveDown, Action::First, Action::Last] {
+            assert_eq!(nav_name(&screen.on_action(action)), "stay", "{action:?}");
+            assert_eq!(screen.button(), Some("Cancel scan"));
+        }
     }
 
     #[test]

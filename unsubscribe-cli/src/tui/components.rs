@@ -19,6 +19,28 @@ const KEY_COLUMN: usize = 15;
 /// How long a transient status message stays on screen.
 const STATUS_TTL: Duration = Duration::from_secs(4);
 
+/// An action row the cursor can land on, drawn the way Settings draws its
+/// `[ Re-authenticate ]` row so a button looks the same everywhere.
+///
+/// Whether it has the cursor is the screen's business, not this function's:
+/// the row is part of the screen's state so `Enter` can act on it.
+#[must_use]
+pub fn button_line(label: &str, focused: bool) -> Line<'static> {
+    let style = if focused {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    Line::styled(format!("   [ {label} ]"), style)
+}
+
+/// The same row as its own widget, for a screen that gives it a line of the
+/// layout rather than a row of a list.
+#[must_use]
+pub fn button(label: &str, focused: bool) -> Paragraph<'static> {
+    Paragraph::new(button_line(label, focused))
+}
+
 /// A modal question or notice, drawn over whatever screen is beneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dialog {
