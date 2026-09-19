@@ -8,12 +8,12 @@ authors = ["Mike Henderson"]
 [dependencies]
 unsubscribe-core = { path = "../unsubscribe-core" }
 anyhow = "1"
-csv = "1"
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
 toml = "0.8"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,9 +2,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::history::UnsubscribeAttempt;
 use crate::types::{
     AccountConfig, Credential, Folder, FolderMessage, HttpResponse, ScanResult, SenderInfo,
-    UnsubscribeResult,
 };
 
 /// Port for scan progress reporting.
@@ -113,6 +113,25 @@ pub trait CredentialStore {
 }
 
 // ---------------------------------------------------------------------------
+// HistoryStore: durable record of unsubscribe attempts
+// ---------------------------------------------------------------------------
+
+/// Port for the append-only unsubscribe history.
+///
+/// Deliberately separate from `DataStore`: a server or an iOS client wants the
+/// history without the file-oriented warnings and scan-cache methods, and the
+/// two have opposite durability guarantees -- the cache is disposable, the
+/// history is not. The methods are coarse enough that an HTTP-backed
+/// implementation could sit behind this trait later.
+pub trait HistoryStore {
+    /// Append one attempt. Implementations never update or delete.
+    fn record_attempt(&self, attempt: &UnsubscribeAttempt) -> Result<()>;
+
+    /// All attempts recorded for an account, oldest first.
+    fn attempts_for_account(&self, account: &str) -> Result<Vec<UnsubscribeAttempt>>;
+}
+
+// ---------------------------------------------------------------------------
 // DataStore: scan warnings, action logs, and cached scan results
 // ---------------------------------------------------------------------------
 
@@ -157,9 +176,6 @@ pub trait DataStore {
 
     /// Read previously persisted scan warnings.
     fn read_warnings(&self) -> Result<Vec<String>>;
-
-    /// Persist unsubscribe action log entries.
-    fn write_action_log(&self, results: &[UnsubscribeResult]) -> Result<()>;
 
     /// Write cached scan results after a successful scan.
     fn write_scan_cache(&self, cache: &CachedScan) -> Result<()>;

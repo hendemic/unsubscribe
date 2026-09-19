@@ -2,15 +2,16 @@
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
 use unsubscribe_core::{
-    AccountConfig, Credential, DataStore, Folder, SenderInfo, UnsubscribeMethod, UnsubscribeResult,
+    AccountConfig, Credential, DataStore, Folder, HistoryStore, SenderInfo, UnsubscribeAttempt,
+    UnsubscribeMethod, UnsubscribeResult,
 };
+use unsubscribe_persistence::SqliteHistoryStore;
 
 use crate::action_log::append_log_entry;
 use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
 use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
-use crate::time::{is_stale, now_iso8601};
+use crate::time::{is_stale, now_iso8601, now_unix_secs};
 use crate::{http, make_email_sender, make_provider, tui};
 
 pub fn cmd_run(
@@ -96,7 +97,7 @@ pub fn cmd_run(
     // Phase 3: Unsubscribe — only active (non-stale) senders get HTTP unsubscribe.
     // Results are written incrementally so a later archive failure does not lose
     // the record of which senders were already unsubscribed.
-    let log_path = data_dir().join("unsubscribe_log.csv");
+    let log_path = unsubscribe_persistence::data_dir().join("unsubscribe_log.csv");
     std::fs::create_dir_all(log_path.parent().expect("path has parent"))?;
 
     // Remove any previous run's log to start fresh.
@@ -132,6 +133,16 @@ pub fn cmd_run(
         eprintln!("{BOLD}Unsubscribing...{RESET}\n");
         let http_client = http::ReqwestHttpClient::new()?;
 
+        // The history is evidence, not a prerequisite: if it cannot be opened
+        // the run still unsubscribes, it just records nothing.
+        let history = match SqliteHistoryStore::open_default() {
+            Ok(store) => Some(store),
+            Err(e) => {
+                eprintln!("{YELLOW}Warning: could not open unsubscribe history: {e}{RESET}");
+                None
+            }
+        };
+
         let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> = if mailto {
             Some(make_email_sender(account, credential)?)
         } else {
@@ -162,6 +173,16 @@ pub fn cmd_run(
                 // does not abort the unsubscribe run.
                 if let Err(e) = append_log_entry(&result, &log_path) {
                     eprintln!("{YELLOW}Warning: could not write to action log: {e}{RESET}");
+                }
+                // Attempt records cannot be backfilled -- their timestamp is
+                // now -- so each one is written as soon as it is known.
+                if let Some(history) = &history {
+                    let attempt = attempt_from_result(&account.account_id, sender, &result);
+                    if let Err(e) = history.record_attempt(&attempt) {
+                        eprintln!(
+                            "{YELLOW}Warning: could not record unsubscribe history: {e}{RESET}"
+                        );
+                    }
                 }
                 result
             })
@@ -241,13 +262,27 @@ pub fn cmd_run(
     Ok(())
 }
 
-fn data_dir() -> PathBuf {
-    let dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-            home.push(".local/share");
-            home
-        });
-    dir.join("email-unsubscribe")
+/// Build the history record for a completed attempt.
+///
+/// The sender supplies the identity evidence (domain, list id, the raw
+/// `List-Unsubscribe` header) and the result supplies what the attempt did.
+fn attempt_from_result(
+    account: &str,
+    sender: &SenderInfo,
+    result: &UnsubscribeResult,
+) -> UnsubscribeAttempt {
+    UnsubscribeAttempt::new(
+        account.to_string(),
+        sender.email.clone(),
+        sender.domain.clone(),
+        sender.list_id.clone(),
+        now_unix_secs(),
+        result.method,
+        result.success,
+        result.http_status,
+        result.url.clone(),
+        result.final_url.clone(),
+        sender.list_unsubscribe_raw.clone(),
+        result.detail.clone(),
+    )
 }

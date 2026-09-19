@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-use unsubscribe_core::{CachedScan, DataStore, UnsubscribeResult};
+use unsubscribe_core::{CachedScan, DataStore};
 
 /// File-backed `DataStore` using XDG data directory.
 ///
 /// Preserves existing file locations and formats for backward compatibility:
 /// - `warnings.log` -- one warning per line
-/// - `unsubscribe_log.csv` -- CSV with email, method, success, detail, url
 /// - `scan_cache_{account}.json` -- JSON-serialized `CachedScan`
 pub struct FileDataStore {
     data_dir: PathBuf,
@@ -16,7 +15,7 @@ pub struct FileDataStore {
 impl FileDataStore {
     pub fn new() -> Self {
         Self {
-            data_dir: xdg_data_dir(),
+            data_dir: crate::data_dir(),
         }
     }
 
@@ -36,10 +35,6 @@ impl FileDataStore {
 
     fn warnings_path(&self) -> PathBuf {
         self.data_dir.join("warnings.log")
-    }
-
-    fn action_log_path(&self) -> PathBuf {
-        self.data_dir.join("unsubscribe_log.csv")
     }
 
     fn cache_path(&self, account: &str) -> PathBuf {
@@ -79,25 +74,6 @@ impl DataStore for FileDataStore {
         }
     }
 
-    fn write_action_log(&self, results: &[UnsubscribeResult]) -> Result<()> {
-        self.ensure_dir()?;
-        let path = self.action_log_path();
-        let mut wtr =
-            csv::Writer::from_path(&path).context("Failed to create action log CSV")?;
-        wtr.write_record(["email", "method", "success", "detail", "url"])?;
-        for r in results {
-            wtr.write_record([
-                r.email.as_str(),
-                r.method.label(),
-                &r.success.to_string(),
-                r.detail.as_str(),
-                r.url.as_str(),
-            ])?;
-        }
-        wtr.flush()?;
-        Ok(())
-    }
-
     fn write_scan_cache(&self, cache: &CachedScan) -> Result<()> {
         self.ensure_dir()?;
         let path = self.cache_path(&cache.meta.account);
@@ -121,15 +97,4 @@ impl DataStore for FileDataStore {
             Err(e) => Err(e).context("Failed to read scan cache"),
         }
     }
-}
-
-fn xdg_data_dir() -> PathBuf {
-    let dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-            home.push(".local/share");
-            home
-        });
-    dir.join("email-unsubscribe")
 }

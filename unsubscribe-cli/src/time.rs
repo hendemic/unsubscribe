@@ -7,11 +7,16 @@ use unsubscribe_core::SenderInfo;
 /// A sender is considered stale if their most recent message is older than 12 months.
 const STALE_THRESHOLD_SECS: i64 = 365 * 24 * 60 * 60;
 
-pub fn is_stale(sender: &SenderInfo) -> bool {
-    let now = std::time::SystemTime::now()
+/// Current time in Unix seconds (UTC), or 0 if the clock is before the epoch.
+pub fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+pub fn is_stale(sender: &SenderInfo) -> bool {
+    let now = now_unix_secs();
     match sender.last_seen {
         Some(ts) => now - ts > STALE_THRESHOLD_SECS,
         None => false,
