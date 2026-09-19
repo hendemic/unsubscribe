@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::UnsubscribeMethod;
+use crate::types::{SenderInfo, UnsubscribeMethod};
 
 /// One recorded unsubscribe attempt against one sender.
 ///
@@ -109,4 +109,52 @@ pub fn latest_successful_attempts(
             }
             latest
         })
+}
+
+/// A scanned sender that has been successfully unsubscribed from before.
+///
+/// Seeing one again means the unsubscribe was ignored, which is the whole point
+/// of keeping a history -- so consumers surface these first.
+#[derive(Debug, Clone)]
+pub struct PreviouslyUnsubscribed {
+    pub sender: SenderInfo,
+    /// When the last successful unsubscribe happened, in Unix seconds (UTC).
+    pub unsubscribed_at: i64,
+}
+
+/// Scanned senders split by whether they have been unsubscribed from before.
+#[derive(Debug, Clone, Default)]
+pub struct SenderSections {
+    /// Senders with a prior successful unsubscribe, in their scanned order.
+    pub previously_unsubscribed: Vec<PreviouslyUnsubscribed>,
+    /// Everything else, in their scanned order.
+    pub remaining: Vec<SenderInfo>,
+}
+
+/// Split scanned senders against an account's unsubscribe history.
+///
+/// Matching is on the exact sender address, case-insensitively: a sender with
+/// only failed attempts is not "previously unsubscribed", because nothing was
+/// ever ignored. Pure and UI-free so the TUI and a headless server classify
+/// senders the same way.
+#[must_use]
+pub fn split_previously_unsubscribed(
+    senders: Vec<SenderInfo>,
+    attempts: &[UnsubscribeAttempt],
+) -> SenderSections {
+    let latest = latest_successful_attempts(attempts);
+
+    senders.into_iter().fold(
+        SenderSections::default(),
+        |mut sections, sender| {
+            match latest.get(&sender.email.to_lowercase()) {
+                Some(attempt) => sections.previously_unsubscribed.push(PreviouslyUnsubscribed {
+                    unsubscribed_at: attempt.attempted_at,
+                    sender,
+                }),
+                None => sections.remaining.push(sender),
+            }
+            sections
+        },
+    )
 }

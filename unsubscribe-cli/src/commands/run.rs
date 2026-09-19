@@ -6,9 +6,9 @@ use unsubscribe_core::{
     AccountConfig, Credential, DataStore, Folder, HistoryStore, ScanCacheStore, SenderInfo,
     UnsubscribeAttempt, UnsubscribeMethod, UnsubscribeResult,
 };
-use unsubscribe_persistence::SqliteHistoryStore;
 
 use crate::action_log::append_log_entry;
+use crate::commands::load_history;
 use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
 use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{is_stale, now_iso8601, now_unix_secs};
@@ -19,6 +19,7 @@ pub fn cmd_run(
     credential: &Credential,
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
+    history: Option<&dyn HistoryStore>,
     dry_run: bool,
     min_emails: u32,
     cached: bool,
@@ -52,9 +53,12 @@ pub fn cmd_run(
         senders.len()
     );
 
-    // Phase 2: TUI selection
+    // Phase 2: TUI selection. Senders we already unsubscribed from get their own
+    // section, so a sender that ignored an unsubscribe is the first thing seen.
+    let attempts = load_history(history, &account.account_id);
+
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders, scan_timestamp.as_deref())? {
+    let selections = match tui::select_senders(senders, &attempts, scan_timestamp.as_deref())? {
         Some(s) => s,
         None => {
             eprintln!("{YELLOW}Cancelled.{RESET}");
@@ -134,16 +138,6 @@ pub fn cmd_run(
         eprintln!("{BOLD}Unsubscribing...{RESET}\n");
         let http_client = http::ReqwestHttpClient::new()?;
 
-        // The history is evidence, not a prerequisite: if it cannot be opened
-        // the run still unsubscribes, it just records nothing.
-        let history = match SqliteHistoryStore::open_default() {
-            Ok(store) => Some(store),
-            Err(e) => {
-                eprintln!("{YELLOW}Warning: could not open unsubscribe history: {e}{RESET}");
-                None
-            }
-        };
-
         let email_sender: Option<Box<dyn unsubscribe_core::EmailSender>> = if mailto {
             Some(make_email_sender(account, credential)?)
         } else {
@@ -177,7 +171,9 @@ pub fn cmd_run(
                 }
                 // Attempt records cannot be backfilled -- their timestamp is
                 // now -- so each one is written as soon as it is known.
-                if let Some(history) = &history {
+                // The history is evidence, not a prerequisite: an unavailable
+                // one costs the record, not the unsubscribe.
+                if let Some(history) = history {
                     let attempt = attempt_from_result(&account.account_id, sender, &result);
                     if let Err(e) = history.record_attempt(&attempt) {
                         eprintln!(

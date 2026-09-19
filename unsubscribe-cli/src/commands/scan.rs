@@ -4,11 +4,12 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use unsubscribe_core::{
-    AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, ScanCacheStore,
-    ScanWatermark, SenderInfo,
+    latest_successful_attempts, AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder,
+    HistoryStore, ScanCacheStore, ScanWatermark, SenderInfo,
 };
 
-use crate::terminal::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
+use crate::commands::load_history;
+use crate::terminal::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::time::{is_stale, now_iso8601};
 use crate::{make_provider, progress};
 
@@ -116,9 +117,12 @@ pub fn cmd_scan(
     credential: &Credential,
     store: &dyn DataStore,
     cache_store: &dyn ScanCacheStore,
+    history: Option<&dyn HistoryStore>,
     min_emails: u32,
 ) -> Result<()> {
     let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
+    let previously_unsubscribed =
+        latest_successful_attempts(&load_history(history, &account.account_id));
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -142,7 +146,16 @@ pub fn cmd_scan(
         } else {
             &s.display_name
         };
-        let stale_marker = if is_stale(s) { " [stale]" } else { "" };
+        // A sender we already unsubscribed from is mailing again, so say so
+        // even when it is also stale.
+        let (marker, marker_color) =
+            if previously_unsubscribed.contains_key(&s.email.to_lowercase()) {
+                (" [unsubscribed]", RED)
+            } else if is_stale(s) {
+                (" [stale]", DIM)
+            } else {
+                ("", DIM)
+            };
         let (method, method_color) = if s.one_click {
             ("1-click", GREEN)
         } else if !s.unsubscribe_urls.is_empty() {
@@ -151,7 +164,7 @@ pub fn cmd_scan(
             ("mailto", YELLOW)
         };
         println!(
-            " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}{DIM}{stale_marker}{RESET}",
+            " {:<44} {DIM}{:<34}{RESET} {method_color}{:>7}{RESET} {:>8}{marker_color}{marker}{RESET}",
             truncate(name, 44),
             truncate(&s.email, 34),
             method,
@@ -161,10 +174,22 @@ pub fn cmd_scan(
 
     let total_emails: u32 = senders.iter().map(|s| s.email_count).sum();
     let stale_count = senders.iter().filter(|s| is_stale(s)).count();
-    let stale_note = if stale_count > 0 {
-        format!(" ({stale_count} stale)")
-    } else {
+    let previous_count = senders
+        .iter()
+        .filter(|s| previously_unsubscribed.contains_key(&s.email.to_lowercase()))
+        .count();
+    let notes: Vec<String> = [
+        (previous_count, "previously unsubscribed"),
+        (stale_count, "stale"),
+    ]
+    .iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    let stale_note = if notes.is_empty() {
         String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
     };
     println!(
         "\n{BOLD}Total:{RESET} {} senders{stale_note}, {} emails",

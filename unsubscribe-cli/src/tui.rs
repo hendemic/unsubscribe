@@ -6,7 +6,7 @@ use ratatui::widgets::*;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unsubscribe_core::SenderInfo;
+use unsubscribe_core::{split_previously_unsubscribed, SenderInfo, UnsubscribeAttempt};
 
 use crate::time::{is_stale, parse_iso8601_age_secs};
 
@@ -22,24 +22,31 @@ impl Drop for TerminalGuard {
 
 /// State for the TUI selection screen.
 ///
-/// Senders are split into two sections: active senders followed by stale
-/// senders (last message >12 months ago). Each section has its own select-all
-/// toggle row.
+/// Senders are split into up to three sections, in the order they matter:
+/// previously unsubscribed (a prior unsubscribe succeeded and they are mailing
+/// again), active, then stale (last message >12 months ago). Each section has
+/// its own header and select-all toggle row, and an empty section contributes
+/// no rows at all.
 ///
-/// Row layout (0-indexed):
-///   0              — "Select All Active" row
-///   1..=n_active   — active sender rows
-///   n_active+1     — "Select All Stale" row (only when n_stale > 0)
-///   n_active+2..   — stale sender rows
+/// The row layout is fixed once the app is built -- only selection changes
+/// afterwards -- so it is computed once into `rows` and indexed from there.
 struct App {
+    /// Senders with a prior successful unsubscribe, newest attempt date alongside.
+    previous: Vec<SenderInfo>,
+    /// When each previously unsubscribed sender was last unsubscribed (Unix seconds).
+    previous_unsubscribed_at: Vec<i64>,
     /// Active senders (last_seen within 12 months, or unknown).
     active: Vec<SenderInfo>,
     /// Stale senders (last_seen older than 12 months).
     stale: Vec<SenderInfo>,
+    /// Selection state for previously unsubscribed senders. Defaults to false.
+    previous_selected: Vec<bool>,
     /// Selection state for active senders (parallel to `active`).
     active_selected: Vec<bool>,
     /// Selection state for stale senders (parallel to `stale`). Defaults to false.
     stale_selected: Vec<bool>,
+    /// What each visible row represents, in display order.
+    rows: Vec<RowKind>,
     cursor: usize,
     scroll_offset: usize,
     cancelled: bool,
@@ -48,112 +55,103 @@ struct App {
 }
 
 impl App {
-    fn new(senders: Vec<SenderInfo>) -> Self {
-        let mut active = Vec::new();
-        let mut stale = Vec::new();
-        for s in senders {
-            if is_stale(&s) {
-                stale.push(s);
-            } else {
-                active.push(s);
-            }
-        }
-        let n_active = active.len();
-        let n_stale = stale.len();
+    /// Build the selection screen, promoting senders with a prior successful
+    /// unsubscribe into their own section.
+    fn with_history(senders: Vec<SenderInfo>, history: &[UnsubscribeAttempt]) -> Self {
+        let sections = split_previously_unsubscribed(senders, history);
+
+        let (previous, previous_unsubscribed_at): (Vec<_>, Vec<_>) = sections
+            .previously_unsubscribed
+            .into_iter()
+            .map(|p| (p.sender, p.unsubscribed_at))
+            .unzip();
+
+        // A previously unsubscribed sender stays in that section even when it
+        // is also stale: that it came back at all is the interesting part.
+        let (stale, active): (Vec<_>, Vec<_>) =
+            sections.remaining.into_iter().partition(is_stale);
+
+        let rows = build_rows(previous.len(), active.len(), stale.len());
+        let cursor = first_selectable_row(&rows);
+
         Self {
+            previous_selected: vec![false; previous.len()],
+            active_selected: vec![false; active.len()],
+            stale_selected: vec![false; stale.len()],
+            previous,
+            previous_unsubscribed_at,
             active,
             stale,
-            active_selected: vec![false; n_active],
-            stale_selected: vec![false; n_stale],
-            cursor: 1, // start on SelectAllActive, skip the header
+            rows,
+            cursor,
             scroll_offset: 0,
             cancelled: false,
             scan_timestamp: None,
         }
     }
 
-    /// Total number of senders across both sections.
+    /// Total number of senders across all sections.
     fn total_senders(&self) -> usize {
-        self.active.len() + self.stale.len()
+        self.previous.len() + self.active.len() + self.stale.len()
     }
 
-    /// Total rows including section headers and spacer:
-    ///   ActiveHeader + SelectAllActive + active senders
-    ///   + Spacer + StaleHeader + SelectAllStale + stale senders (if any)
+    /// Total rows including section headers and spacers.
     fn total_rows(&self) -> usize {
-        let active_section = 2 + self.active.len(); // header + select-all + senders
-        // spacer + header + select-all + senders
-        let stale_section = if self.stale.is_empty() { 0 } else { 3 + self.stale.len() };
-        active_section + stale_section
+        self.rows.len()
     }
 
     /// Resolve a visible row index into what it represents.
     fn row_kind(&self, row: usize) -> RowKind {
-        if row == 0 {
-            return RowKind::ActiveHeader;
-        }
-        if row == 1 {
-            return RowKind::SelectAllActive;
-        }
-        let idx = row - 2;
-        if idx < self.active.len() {
-            return RowKind::Active(idx);
-        }
-        let after_active = idx - self.active.len();
-        if !self.stale.is_empty() {
-            if after_active == 0 {
-                return RowKind::Spacer;
-            }
-            if after_active == 1 {
-                return RowKind::StaleHeader;
-            }
-            if after_active == 2 {
-                return RowKind::SelectAllStale;
-            }
-            let stale_idx = after_active - 3;
-            if stale_idx < self.stale.len() {
-                return RowKind::Stale(stale_idx);
-            }
-        }
-        RowKind::ActiveHeader // fallback
+        self.rows.get(row).copied().unwrap_or(RowKind::ActiveHeader)
+    }
+
+    /// Flip a whole section, selecting it unless it is already fully selected.
+    fn toggle_section(selected: &mut [bool]) {
+        let all_sel = !selected.is_empty() && selected.iter().all(|&s| s);
+        selected.fill(!all_sel);
     }
 
     fn toggle(&mut self) {
         match self.row_kind(self.cursor) {
-            RowKind::SelectAllActive => {
-                let all_sel = self.active_selected.iter().all(|&s| s)
-                    && !self.active_selected.is_empty();
-                self.active_selected.fill(!all_sel);
-            }
-            RowKind::SelectAllStale => {
-                let all_sel = self.stale_selected.iter().all(|&s| s)
-                    && !self.stale_selected.is_empty();
-                self.stale_selected.fill(!all_sel);
-            }
+            RowKind::SelectAllPrevious => Self::toggle_section(&mut self.previous_selected),
+            RowKind::SelectAllActive => Self::toggle_section(&mut self.active_selected),
+            RowKind::SelectAllStale => Self::toggle_section(&mut self.stale_selected),
+            RowKind::Previous(idx) => self.previous_selected[idx] = !self.previous_selected[idx],
             RowKind::Active(idx) => self.active_selected[idx] = !self.active_selected[idx],
             RowKind::Stale(idx) => self.stale_selected[idx] = !self.stale_selected[idx],
-            RowKind::ActiveHeader | RowKind::StaleHeader | RowKind::Spacer => {}
+            RowKind::PreviousHeader
+            | RowKind::ActiveHeader
+            | RowKind::StaleHeader
+            | RowKind::Spacer => {}
         }
     }
 
     fn select_all(&mut self) {
+        self.previous_selected.fill(true);
         self.active_selected.fill(true);
         self.stale_selected.fill(true);
     }
 
     fn deselect_all(&mut self) {
+        self.previous_selected.fill(false);
         self.active_selected.fill(false);
         self.stale_selected.fill(false);
     }
 
     fn is_non_selectable(&self, row: usize) -> bool {
-        matches!(self.row_kind(row), RowKind::ActiveHeader | RowKind::StaleHeader | RowKind::Spacer)
+        self.row_kind(row).is_non_selectable()
+    }
+
+    /// The first row the cursor is allowed to rest on (the top select-all row).
+    fn first_selectable(&self) -> usize {
+        first_selectable_row(&self.rows)
     }
 
     fn move_up(&mut self) {
-        if self.cursor > 1 {
+        let min = self.first_selectable();
+        if self.cursor > min {
             self.cursor -= 1;
-            while self.is_non_selectable(self.cursor) && self.cursor > 1 {
+            while self.is_non_selectable(self.cursor) && self.cursor > min {
                 self.cursor -= 1;
             }
         }
@@ -170,34 +168,80 @@ impl App {
     }
 
     fn count_selected(&self) -> usize {
-        self.active_selected.iter().filter(|&&s| s).count()
-            + self.stale_selected.iter().filter(|&&s| s).count()
+        [
+            &self.previous_selected,
+            &self.active_selected,
+            &self.stale_selected,
+        ]
+        .iter()
+        .flat_map(|section| section.iter())
+        .filter(|&&s| s)
+        .count()
     }
 
     fn total_emails_selected(&self) -> u32 {
-        let active: u32 = self.active.iter()
-            .zip(self.active_selected.iter())
+        let sections = [
+            (&self.previous, &self.previous_selected),
+            (&self.active, &self.active_selected),
+            (&self.stale, &self.stale_selected),
+        ];
+        sections
+            .iter()
+            .flat_map(|(senders, selected)| senders.iter().zip(selected.iter()))
             .filter(|(_, sel)| **sel)
             .map(|(s, _)| s.email_count)
-            .sum();
-        let stale: u32 = self.stale.iter()
-            .zip(self.stale_selected.iter())
-            .filter(|(_, sel)| **sel)
-            .map(|(s, _)| s.email_count)
-            .sum();
-        active + stale
+            .sum()
     }
 
-    /// Consume the app and produce `(sender, selected, is_stale)` for each sender.
+    /// Consume the app and produce `(sender, selected)` for each sender.
     fn into_results(self) -> Vec<(SenderInfo, bool)> {
+        let previous = self.previous.into_iter().zip(self.previous_selected);
         let active = self.active.into_iter().zip(self.active_selected);
         let stale = self.stale.into_iter().zip(self.stale_selected);
-        active.chain(stale).collect()
+        previous.chain(active).chain(stale).collect()
     }
 }
 
-#[derive(Debug, PartialEq)]
+/// The first row a cursor may rest on: headers and spacers are skipped.
+fn first_selectable_row(rows: &[RowKind]) -> usize {
+    rows.iter()
+        .position(|row| !row.is_non_selectable())
+        .unwrap_or(0)
+}
+
+/// Lay out the visible rows for the given section sizes.
+///
+/// Empty sections contribute nothing -- no header, no select-all, no spacer --
+/// so a run with no history looks exactly as it did before.
+fn build_rows(previous: usize, active: usize, stale: usize) -> Vec<RowKind> {
+    let mut rows = Vec::new();
+
+    if previous > 0 {
+        rows.push(RowKind::PreviousHeader);
+        rows.push(RowKind::SelectAllPrevious);
+        rows.extend((0..previous).map(RowKind::Previous));
+        rows.push(RowKind::Spacer);
+    }
+
+    rows.push(RowKind::ActiveHeader);
+    rows.push(RowKind::SelectAllActive);
+    rows.extend((0..active).map(RowKind::Active));
+
+    if stale > 0 {
+        rows.push(RowKind::Spacer);
+        rows.push(RowKind::StaleHeader);
+        rows.push(RowKind::SelectAllStale);
+        rows.extend((0..stale).map(RowKind::Stale));
+    }
+
+    rows
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum RowKind {
+    PreviousHeader,
+    SelectAllPrevious,
+    Previous(usize),
     ActiveHeader,
     SelectAllActive,
     Active(usize),
@@ -207,10 +251,21 @@ enum RowKind {
     Stale(usize),
 }
 
+impl RowKind {
+    /// Headers and spacers are display only -- the cursor skips over them.
+    fn is_non_selectable(&self) -> bool {
+        matches!(
+            self,
+            Self::PreviousHeader | Self::ActiveHeader | Self::StaleHeader | Self::Spacer
+        )
+    }
+}
+
 /// Run the TUI selection screen. Returns the senders with their selection state.
 /// Selected = true means the user wants to unsubscribe (or archive-only for stale senders).
 pub fn select_senders(
     senders: Vec<SenderInfo>,
+    history: &[UnsubscribeAttempt],
     scan_timestamp: Option<&str>,
 ) -> anyhow::Result<Option<Vec<(SenderInfo, bool)>>> {
     enable_raw_mode()?;
@@ -220,7 +275,7 @@ pub fn select_senders(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(senders);
+    let mut app = App::with_history(senders, history);
     app.scan_timestamp = scan_timestamp.map(String::from);
 
     loop {
@@ -243,7 +298,7 @@ pub fn select_senders(
                 KeyCode::Char(' ') => app.toggle(),
                 KeyCode::Char('a') => app.select_all(),
                 KeyCode::Char('n') => app.deselect_all(),
-                KeyCode::Home | KeyCode::Char('g') => app.cursor = 1, // SelectAllActive
+                KeyCode::Home | KeyCode::Char('g') => app.cursor = app.first_selectable(),
                 KeyCode::End | KeyCode::Char('G') => {
                     app.cursor = app.total_rows().saturating_sub(1);
                 }
@@ -321,21 +376,21 @@ mod tests {
 
     #[test]
     fn cursor_starts_on_select_all_active() {
-        let app = App::new(three_active_senders());
+        let app = App::with_history(three_active_senders(), &[]);
         assert_eq!(app.cursor, 1);
         assert!(matches!(app.row_kind(1), RowKind::SelectAllActive));
     }
 
     #[test]
     fn move_up_stops_at_select_all_active() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.move_up();
         assert_eq!(app.cursor, 1, "should not move above SelectAllActive");
     }
 
     #[test]
     fn move_down_stops_at_last_row() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         // Rows: ActiveHeader(0), SelectAllActive(1), Active(2,3,4) = 5 rows
         for _ in 0..10 {
             app.move_down();
@@ -345,7 +400,7 @@ mod tests {
 
     #[test]
     fn move_up_and_down_traverse_selectable_rows() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         // Start at 1 (SelectAllActive), down to 2, 3, 4
         let mut visited = vec![app.cursor];
         for _ in 0..3 {
@@ -361,7 +416,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_any_unselected() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected.iter().all(|&s| s));
@@ -369,7 +424,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_deselects_when_all_selected() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.active_selected.fill(true);
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -377,7 +432,7 @@ mod tests {
 
     #[test]
     fn toggle_select_all_active_selects_when_partially_selected() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.active_selected[0] = true;
         app.toggle(); // cursor is at 1 (SelectAllActive)
         assert!(app.active_selected.iter().all(|&s| s));
@@ -385,7 +440,7 @@ mod tests {
 
     #[test]
     fn toggle_on_sender_row_toggles_individual() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.cursor = 2; // first active sender (row 2)
         assert!(!app.active_selected[0]);
         app.toggle();
@@ -402,14 +457,14 @@ mod tests {
 
     #[test]
     fn select_all_sets_all_flags() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.select_all();
         assert!(app.active_selected.iter().all(|&s| s));
     }
 
     #[test]
     fn deselect_all_clears_all_flags() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         app.select_all();
         app.deselect_all();
         assert!(app.active_selected.iter().all(|&s| !s));
@@ -421,7 +476,7 @@ mod tests {
 
     #[test]
     fn count_selected_correct() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         assert_eq!(app.count_selected(), 0);
         app.active_selected[0] = true;
         app.active_selected[2] = true;
@@ -430,7 +485,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_sums_only_selected() {
-        let mut app = App::new(three_active_senders());
+        let mut app = App::with_history(three_active_senders(), &[]);
         // a=10, b=20, c=5
         app.active_selected[1] = true; // b=20
         app.active_selected[2] = true; // c=5
@@ -439,7 +494,7 @@ mod tests {
 
     #[test]
     fn total_emails_selected_none_selected_is_zero() {
-        let app = App::new(three_active_senders());
+        let app = App::with_history(three_active_senders(), &[]);
         assert_eq!(app.total_emails_selected(), 0);
     }
 
@@ -453,7 +508,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let app = App::new(senders);
+        let app = App::with_history(senders, &[]);
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert!(!app.stale_selected[0]);
@@ -465,7 +520,7 @@ mod tests {
             make_stale_sender("old@test.com", 2),
             make_sender("new@test.com", 5),
         ];
-        let app = App::new(senders);
+        let app = App::with_history(senders, &[]);
         assert_eq!(app.active.len(), 1);
         assert_eq!(app.stale.len(), 1);
         assert_eq!(app.active[0].email, "new@test.com");
@@ -481,7 +536,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::new(senders);
+        let mut app = App::with_history(senders, &[]);
         app.move_down(); // 2 (active sender)
         app.move_down(); // 5 (select all stale — skips Spacer+StaleHeader)
         assert_eq!(app.cursor, 5);
@@ -497,7 +552,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::new(senders);
+        let mut app = App::with_history(senders, &[]);
         app.cursor = 5; // SelectAllStale
         app.toggle();
         assert!(app.stale_selected[0], "stale sender should be selected");
@@ -510,7 +565,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::new(senders);
+        let mut app = App::with_history(senders, &[]);
         // cursor starts at 1 (SelectAllActive)
         app.toggle();
         assert!(app.active_selected[0], "active sender should be selected");
@@ -523,7 +578,7 @@ mod tests {
             make_sender("active@test.com", 5),
             make_stale_sender("stale@test.com", 3),
         ];
-        let mut app = App::new(senders);
+        let mut app = App::with_history(senders, &[]);
         app.active_selected[0] = true;
         let results = app.into_results();
         assert_eq!(results.len(), 2);
@@ -541,7 +596,7 @@ mod tests {
 
     #[test]
     fn empty_senders_no_panic() {
-        let mut app = App::new(vec![]);
+        let mut app = App::with_history(vec![], &[]);
         assert_eq!(app.cursor, 1);
         assert_eq!(app.count_selected(), 0);
         assert_eq!(app.total_emails_selected(), 0);
@@ -620,6 +675,23 @@ fn draw(f: &mut Frame, app: &mut App) {
         let is_cursor = row == app.cursor;
 
         match app.row_kind(row) {
+            RowKind::PreviousHeader => {
+                items.push(Line::styled(
+                    " \u{2500}\u{2500} Previously Unsubscribed \u{2500}\u{2500}",
+                    Style::default().fg(Color::Yellow).bold(),
+                ));
+            }
+            RowKind::SelectAllPrevious => {
+                items.push(select_all_row(&app.previous_selected, is_cursor));
+            }
+            RowKind::Previous(idx) => {
+                items.push(previous_sender_row(
+                    &app.previous[idx],
+                    app.previous_unsubscribed_at[idx],
+                    app.previous_selected[idx],
+                    is_cursor,
+                ));
+            }
             RowKind::ActiveHeader => {
                 let label = if app.stale.is_empty() {
                     " ── Senders ──"
@@ -629,16 +701,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 items.push(Line::styled(label, Style::default().fg(Color::Yellow).bold()));
             }
             RowKind::SelectAllActive => {
-                let all_selected = app.active_selected.iter().all(|&s| s)
-                    && !app.active_selected.is_empty();
-                let checkbox = if all_selected { "[x]" } else { "[ ]" };
-                let text = format!(" {checkbox} Select All");
-                let style = if is_cursor {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Yellow)
-                };
-                items.push(Line::styled(text, style));
+                items.push(select_all_row(&app.active_selected, is_cursor));
             }
             RowKind::Active(idx) => {
                 let sender = &app.active[idx];
@@ -655,16 +718,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 ));
             }
             RowKind::SelectAllStale => {
-                let all_selected = app.stale_selected.iter().all(|&s| s)
-                    && !app.stale_selected.is_empty();
-                let checkbox = if all_selected { "[x]" } else { "[ ]" };
-                let text = format!(" {checkbox} Select All");
-                let style = if is_cursor {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Yellow)
-                };
-                items.push(Line::styled(text, style));
+                items.push(select_all_row(&app.stale_selected, is_cursor));
             }
             RowKind::Stale(idx) => {
                 let sender = &app.stale[idx];
@@ -704,7 +758,47 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(help, chunks[4]);
 }
 
-fn sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Line<'static> {
+/// The "Select All" row for a section, checked when the whole section is selected.
+fn select_all_row(selected: &[bool], is_cursor: bool) -> Line<'static> {
+    let all_selected = !selected.is_empty() && selected.iter().all(|&s| s);
+    let checkbox = if all_selected { "[x]" } else { "[ ]" };
+    let style = if is_cursor {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Line::styled(format!(" {checkbox} Select All"), style)
+}
+
+/// A sender we already unsubscribed from, annotated with when that happened.
+///
+/// Selecting one retries the unsubscribe and archives, exactly like an active
+/// sender -- the section is about drawing attention, not about behaving
+/// differently.
+fn previous_sender_row(
+    sender: &SenderInfo,
+    unsubscribed_at: i64,
+    selected: bool,
+    is_cursor: bool,
+) -> Line<'static> {
+    let text = format!(
+        "{}  unsubscribed {}",
+        sender_row_text(sender, selected),
+        format_date(unsubscribed_at),
+    );
+    let style = if is_cursor {
+        Style::default().bg(Color::DarkGray).fg(Color::White)
+    } else if selected {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Line::styled(text, style)
+}
+
+/// The text of a sender row, shared by the active and previously unsubscribed
+/// sections so the columns line up between them.
+fn sender_row_text(sender: &SenderInfo, selected: bool) -> String {
     let checkbox = if selected { "[x]" } else { "[ ]" };
     let name = if sender.display_name.is_empty() {
         sender.email.clone()
@@ -721,10 +815,14 @@ fn sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Line<'sta
     let last_email = format_last_seen(sender.last_seen);
     let name_trunc = truncate_str(&name, 35);
     let email_trunc = truncate_str(&sender.email, 28);
-    let text = format!(
+    format!(
         " {checkbox} {name_trunc:<35} ({email_trunc:<28}) {last_email:>8}  [{method:>7}] ({} emails)",
         sender.email_count,
-    );
+    )
+}
+
+fn sender_row(sender: &SenderInfo, selected: bool, is_cursor: bool) -> Line<'static> {
+    let text = sender_row_text(sender, selected);
     let style = if is_cursor {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     } else if selected {
@@ -796,22 +894,33 @@ const MONTH_NAMES: [&str; 12] = [
 
 /// Format a Unix timestamp as "Mon YYYY" (e.g., "Mar 2025"), or "-" if None.
 fn format_last_seen(last_seen: Option<i64>) -> String {
-    let ts = match last_seen {
-        Some(ts) => ts,
-        None => return "-".to_string(),
+    let Some(ts) = last_seen else {
+        return "-".to_string();
     };
+    let (year, month, _) = civil_from_unix(ts);
+    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {year}")
+}
 
-    // Convert Unix timestamp to civil date (Howard Hinnant's algorithm).
-    // The +719468 converts from Unix epoch (1970-01-01) to the algorithm's epoch.
-    let day_count = ts / 86400 + 719468;
+/// Format a Unix timestamp as "Mon DD, YYYY" (e.g., "Sep 12, 2026").
+fn format_date(ts: i64) -> String {
+    let (year, month, day) = civil_from_unix(ts);
+    let month_name = MONTH_NAMES.get((month - 1) as usize).unwrap_or(&"???");
+    format!("{month_name} {day}, {year}")
+}
+
+/// Convert a Unix timestamp to a civil `(year, month, day)` (Howard Hinnant's
+/// algorithm). The +719468 shifts from the Unix epoch to the algorithm's epoch.
+fn civil_from_unix(ts: i64) -> (i64, u32, u32) {
+    let day_count = ts.div_euclid(86400) + 719468;
     let era = if day_count >= 0 { day_count } else { day_count - 146096 } / 146097;
     let doe = (day_count - era * 146097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    let month_name = MONTH_NAMES.get((m - 1) as usize).unwrap_or(&"???");
-    format!("{month_name} {y}")
+    (y, m, d)
 }

@@ -11,9 +11,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::{Path, PathBuf};
-use unsubscribe_core::{AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, ProviderType};
+use unsubscribe_core::{
+    AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, HistoryStore,
+    ProviderType,
+};
 use unsubscribe_persistence::{
-    FileDataStore, KeyringCredentialStore, SqliteCacheStore, TomlConfigStore,
+    FileDataStore, KeyringCredentialStore, SqliteCacheStore, SqliteHistoryStore, TomlConfigStore,
 };
 
 #[derive(Parser)]
@@ -127,6 +130,19 @@ fn main() -> Result<()> {
         )
     })?;
 
+    // The history is enrichment, not a prerequisite: when it cannot be opened
+    // the commands fall back to the view they had before it existed.
+    let history_store = match SqliteHistoryStore::open_default() {
+        Ok(store) => Some(store),
+        Err(e) => {
+            eprintln!("Warning: unsubscribe history unavailable: {e}");
+            None
+        }
+    };
+    let history = history_store
+        .as_ref()
+        .map(|store| store as &dyn HistoryStore);
+
     match cli.command {
         Commands::Run {
             dry_run,
@@ -138,13 +154,21 @@ fn main() -> Result<()> {
             &credential,
             &store,
             &cache_store,
+            history,
             dry_run,
             min_emails,
             cached,
             mailto,
         ),
         Commands::Scan { min_emails } => {
-            commands::scan::cmd_scan(&account, &credential, &store, &cache_store, min_emails)
+            commands::scan::cmd_scan(
+                &account,
+                &credential,
+                &store,
+                &cache_store,
+                history,
+                min_emails,
+            )
         }
         Commands::Export {
             output,
