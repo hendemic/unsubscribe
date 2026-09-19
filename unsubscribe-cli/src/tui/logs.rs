@@ -448,4 +448,118 @@ mod tests {
             assert_eq!(nav_name(&panel.on_action(action)), "stay", "{action:?}");
         }
     }
+
+    #[test]
+    fn an_account_with_no_recorded_history_opens_an_empty_but_working_panel() {
+        let mut panel = LogsPanel::new(Vec::new());
+
+        assert!(panel.entries.is_empty());
+        assert!(panel.visible.is_empty());
+        // The movement keys must not index past the end of an empty feed.
+        for action in keys::LIST_MOVEMENT {
+            assert_eq!(nav_name(&panel.on_action(action)), "stay", "{action:?}");
+            assert_eq!(panel.cursor, 0);
+        }
+        assert_eq!(nav_name(&panel.on_action(Action::Back)), "pop");
+    }
+
+    #[test]
+    fn a_filter_that_empties_an_account_with_history_leaves_the_cursor_at_the_top() {
+        let attempts = [attempt("a1", "one@acme.example.com", T0, true)];
+        let mut panel = LogsPanel::new(event_log(&attempts, &[]));
+
+        // Resumptions only: nothing here is one.
+        panel.on_action(Action::Mnemonic('f'));
+        panel.on_action(Action::Mnemonic('f'));
+
+        assert!(panel.visible.is_empty());
+        assert_eq!(panel.cursor, 0);
+        panel.on_action(Action::Last);
+        assert_eq!(panel.cursor, 0, "Last on an empty listing is still the top");
+    }
+
+    #[test]
+    fn a_search_is_matched_without_regard_to_case() {
+        let mut panel = panel();
+        panel.on_action(Action::Search);
+        for c in "BETA".chars() {
+            panel.on_action(Action::Type(c));
+        }
+
+        assert_eq!(visible_addresses(&panel), ["two@beta.example.org"]);
+    }
+
+    #[test]
+    fn backspace_widens_the_feed_again_one_character_at_a_time() {
+        let mut panel = panel();
+        panel.on_action(Action::Search);
+        for c in "beta".chars() {
+            panel.on_action(Action::Type(c));
+        }
+        assert_eq!(panel.visible.len(), 1);
+
+        panel.on_action(Action::Erase);
+        panel.on_action(Action::Erase);
+        panel.on_action(Action::Erase);
+        panel.on_action(Action::Erase);
+
+        assert_eq!(panel.filter.search, "");
+        assert_eq!(panel.visible.len(), 3, "an empty needle matches everything");
+    }
+
+    #[test]
+    fn backspace_on_an_empty_needle_does_nothing() {
+        let mut panel = panel();
+        panel.on_action(Action::Search);
+
+        panel.on_action(Action::Erase);
+
+        assert_eq!(panel.filter.search, "");
+        assert_eq!(panel.visible.len(), 3);
+    }
+
+    #[test]
+    fn the_filter_and_the_needle_narrow_together() {
+        let mut panel = panel();
+        panel.on_action(Action::Mnemonic('f')); // failures only
+        panel.on_action(Action::Search);
+        for c in "acme".chars() {
+            panel.on_action(Action::Type(c));
+        }
+
+        assert_eq!(
+            visible_addresses(&panel),
+            ["one@acme.example.com"],
+            "the resumption, not the failed attempt at beta"
+        );
+    }
+
+    #[test]
+    fn the_feed_is_held_as_indices_so_a_few_thousand_events_still_scroll_and_filter() {
+        const N: i64 = 2_000;
+        let attempts: Vec<UnsubscribeAttempt> = (0..N)
+            .map(|i| {
+                attempt(
+                    &format!("a{i}"),
+                    &format!("s{i:04}@acme.example.com"),
+                    T0 + i,
+                    i % 2 == 0,
+                )
+            })
+            .collect();
+        let mut panel = LogsPanel::new(event_log(&attempts, &[]));
+
+        panel.on_action(Action::Last);
+        assert_eq!(panel.cursor, (N - 1) as usize);
+
+        panel.on_action(Action::Mnemonic('f'));
+        assert_eq!(panel.visible.len(), (N / 2) as usize);
+        assert_eq!(panel.cursor, panel.visible.len() - 1, "pulled into range");
+
+        // Every visible index still points at a row the filter selected.
+        assert!(panel
+            .visible
+            .iter()
+            .all(|index| panel.entries[*index].is_failure()));
+    }
 }

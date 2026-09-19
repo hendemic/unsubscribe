@@ -1904,4 +1904,66 @@ mod tests {
             "a folder name may contain a q",
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Space is the app's second Enter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn space_opens_the_editor_on_a_text_setting_exactly_as_enter_does() {
+        let mut with_enter = app();
+        focus(&mut with_enter, Field::Host);
+        press(&mut with_enter, KeyCode::Enter);
+
+        let mut with_space = app();
+        focus(&mut with_space, Field::Host);
+        press(&mut with_space, KeyCode::Char(' '));
+
+        assert!(is_editing(&with_enter));
+        assert!(is_editing(&with_space), "Space is not Enter here");
+    }
+
+    #[test]
+    fn space_cycles_a_choice_setting_exactly_as_enter_does() {
+        let mut app = app();
+        focus(&mut app, Field::AuthType);
+        let start = app.draft.get(Field::AuthType);
+
+        press(&mut app, KeyCode::Char(' '));
+        let after_space = app.draft.get(Field::AuthType);
+        press(&mut app, KeyCode::Enter);
+
+        assert_ne!(after_space, start, "Space did not cycle the choice");
+        assert_eq!(app.draft.get(Field::AuthType), start, "and back around");
+    }
+
+    #[test]
+    fn space_hands_the_re_authentication_row_to_the_event_loop_too() {
+        let mut app = app();
+        app.cursor = row_index(&app, Row::Reauthenticate);
+
+        assert_eq!(app.on_action(Key::Toggle), Action::Reauthenticate);
+    }
+
+    #[test]
+    fn space_is_typed_into_a_text_field_rather_than_acting() {
+        let mut app = app();
+        edit(&mut app, Field::ArchiveFolder, "Old Mail");
+
+        assert_eq!(app.draft.get(Field::ArchiveFolder), "Old Mail");
+    }
+
+    #[test]
+    #[ignore = "Browse answers Space but advertises only Enter -- see the report"]
+    fn the_browse_screen_advertises_the_space_it_answers() {
+        let mut screen = app();
+        focus(&mut screen, Field::Host);
+        screen.on_action(Key::Toggle);
+        assert!(is_editing(&screen), "Space is answered here");
+
+        assert!(
+            app().actions().contains(&Key::Toggle),
+            "but the footer never mentions it"
+        );
+    }
 }
