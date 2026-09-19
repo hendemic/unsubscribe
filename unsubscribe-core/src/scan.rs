@@ -72,3 +72,217 @@ pub fn decide_scan_action(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A week, in seconds -- the default `cache_max_age_days` of 7.
+    const WEEK: u64 = 7 * 24 * 3600;
+
+    /// A usable cache of the given age.
+    fn cache(age_secs: u64) -> Option<CachedScanSummary> {
+        Some(CachedScanSummary {
+            sender_count: 12,
+            age_secs: Some(age_secs),
+        })
+    }
+
+    /// A usable cache whose timestamp would not parse.
+    fn undated_cache() -> Option<CachedScanSummary> {
+        Some(CachedScanSummary {
+            sender_count: 12,
+            age_secs: None,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // is_stale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_scan_exactly_at_the_limit_is_still_fresh() {
+        let summary = CachedScanSummary {
+            sender_count: 1,
+            age_secs: Some(WEEK),
+        };
+        assert!(!summary.is_stale(WEEK));
+    }
+
+    #[test]
+    fn a_scan_one_second_past_the_limit_is_stale() {
+        let summary = CachedScanSummary {
+            sender_count: 1,
+            age_secs: Some(WEEK + 1),
+        };
+        assert!(summary.is_stale(WEEK));
+    }
+
+    #[test]
+    fn a_scan_of_unknown_age_is_treated_as_stale() {
+        let summary = CachedScanSummary {
+            sender_count: 1,
+            age_secs: None,
+        };
+        assert!(summary.is_stale(WEEK));
+    }
+
+    // -----------------------------------------------------------------------
+    // No usable cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_cache_and_no_flags_rescans_without_asking() {
+        assert_eq!(
+            decide_scan_action(None, false, false, true, WEEK),
+            ScanAction::Rescan
+        );
+        assert_eq!(
+            decide_scan_action(None, false, false, false, WEEK),
+            ScanAction::Rescan
+        );
+    }
+
+    #[test]
+    fn demanding_the_cache_when_there_is_none_is_reported() {
+        assert_eq!(
+            decide_scan_action(None, true, false, true, WEEK),
+            ScanAction::CacheUnavailable
+        );
+        assert_eq!(
+            decide_scan_action(None, true, false, false, WEEK),
+            ScanAction::CacheUnavailable
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Explicit flags
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rescan_flag_scans_whatever_the_cache_holds() {
+        for state in [None, cache(0), cache(WEEK * 10), undated_cache()] {
+            for interactive in [true, false] {
+                assert_eq!(
+                    decide_scan_action(state, false, true, interactive, WEEK),
+                    ScanAction::Rescan,
+                    "--rescan must scan regardless of cache state or TTY"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rescan_flag_wins_over_the_cached_flag() {
+        // clap rejects the pair, but the policy has to be unambiguous anyway.
+        assert_eq!(
+            decide_scan_action(cache(0), true, true, true, WEEK),
+            ScanAction::Rescan
+        );
+    }
+
+    #[test]
+    fn cached_flag_uses_even_a_long_stale_cache() {
+        assert_eq!(
+            decide_scan_action(cache(WEEK * 52), true, false, true, WEEK),
+            ScanAction::UseCache
+        );
+        assert_eq!(
+            decide_scan_action(undated_cache(), true, false, true, WEEK),
+            ScanAction::UseCache
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-interactive callers are never asked
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn without_a_tty_any_cache_is_used_rather_than_prompted_for() {
+        for state in [cache(0), cache(WEEK * 10), undated_cache()] {
+            assert_eq!(
+                decide_scan_action(state, false, false, false, WEEK),
+                ScanAction::UseCache
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Interactive prompt defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_cache_offers_the_prompt_defaulting_to_reuse() {
+        assert_eq!(
+            decide_scan_action(cache(3600), false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cache_exactly_at_the_limit_still_defaults_to_reuse() {
+        assert_eq!(
+            decide_scan_action(cache(WEEK), false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cache_one_second_past_the_limit_defaults_to_rescan() {
+        assert_eq!(
+            decide_scan_action(cache(WEEK + 1), false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_cache_of_unknown_age_defaults_to_rescan() {
+        assert_eq!(
+            decide_scan_action(undated_cache(), false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_freshness_window_comes_from_the_argument_not_a_constant() {
+        // The same two-day-old cache is fresh under a 7-day window and stale
+        // under a 1-day one, so the preference really does drive the default.
+        let two_days = 2 * 24 * 3600;
+        assert_eq!(
+            decide_scan_action(cache(two_days), false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: true
+            }
+        );
+        assert_eq!(
+            decide_scan_action(cache(two_days), false, false, true, 24 * 3600),
+            ScanAction::Ask {
+                default_cached: false
+            }
+        );
+    }
+
+    #[test]
+    fn sender_count_does_not_affect_the_decision() {
+        // Emptiness is the caller's business: it passes `None` for a cache
+        // with nothing left to offer, so a count of zero here still asks.
+        let empty = Some(CachedScanSummary {
+            sender_count: 0,
+            age_secs: Some(0),
+        });
+        assert_eq!(
+            decide_scan_action(empty, false, false, true, WEEK),
+            ScanAction::Ask {
+                default_cached: true
+            }
+        );
+    }
+}

@@ -374,3 +374,94 @@ pub(crate) fn make_email_sender(
         }
     }
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Parse an argv, or panic with clap's own message.
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("argv should parse")
+    }
+
+    #[test]
+    fn the_command_definition_is_internally_consistent() {
+        // clap's own audit: duplicate flags, dangling `conflicts_with`
+        // targets, bad defaults. Nothing else exercises the definitions.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn run_rejects_cached_and_rescan_together() {
+        let result = Cli::try_parse_from(["unsubscribe", "run", "--cached", "--rescan"]);
+        assert!(result.is_err(), "--cached and --rescan contradict each other");
+    }
+
+    #[test]
+    fn export_rejects_cached_and_rescan_together() {
+        let result = Cli::try_parse_from(["unsubscribe", "export", "--cached", "--rescan"]);
+        assert!(result.is_err(), "--cached and --rescan contradict each other");
+    }
+
+    #[test]
+    fn run_accepts_each_cache_flag_on_its_own() {
+        match parse(["unsubscribe", "run", "--cached"].as_ref()).command {
+            Commands::Run { cached, rescan, .. } => {
+                assert!(cached);
+                assert!(!rescan);
+            }
+            _ => panic!("expected the `run` subcommand"),
+        }
+        match parse(["unsubscribe", "run", "--rescan"].as_ref()).command {
+            Commands::Run { cached, rescan, .. } => {
+                assert!(!cached);
+                assert!(rescan);
+            }
+            _ => panic!("expected the `run` subcommand"),
+        }
+    }
+
+    #[test]
+    fn export_accepts_each_cache_flag_on_its_own() {
+        match parse(["unsubscribe", "export", "--cached"].as_ref()).command {
+            Commands::Export { cached, rescan, .. } => {
+                assert!(cached);
+                assert!(!rescan);
+            }
+            _ => panic!("expected the `export` subcommand"),
+        }
+        match parse(["unsubscribe", "export", "--rescan"].as_ref()).command {
+            Commands::Export { cached, rescan, .. } => {
+                assert!(!cached);
+                assert!(rescan);
+            }
+            _ => panic!("expected the `export` subcommand"),
+        }
+    }
+
+    #[test]
+    fn neither_cache_flag_is_the_default() {
+        match parse(["unsubscribe", "run"].as_ref()).command {
+            Commands::Run {
+                cached,
+                rescan,
+                dry_run,
+                min_emails,
+            } => {
+                assert!(!cached);
+                assert!(!rescan);
+                assert!(!dry_run);
+                assert_eq!(min_emails, None);
+            }
+            _ => panic!("expected the `run` subcommand"),
+        }
+    }
+
+    #[test]
+    fn scan_has_no_cache_flags() {
+        // `scan` always rescans, so offering the flags would be a lie.
+        assert!(Cli::try_parse_from(["unsubscribe", "scan", "--cached"]).is_err());
+        assert!(Cli::try_parse_from(["unsubscribe", "scan", "--rescan"]).is_err());
+    }
+}

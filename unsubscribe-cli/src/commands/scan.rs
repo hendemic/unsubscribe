@@ -394,3 +394,251 @@ fn truncate(s: &str, max: usize) -> &str {
         None => s,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use unsubscribe_core::{AuthType, ProviderType};
+
+    /// A cache store whose answer to `read_scan_cache` is fixed per test.
+    ///
+    /// Mocked at the port, so these tests exercise the real decision path
+    /// without a database or a mailbox.
+    struct FakeCacheStore {
+        /// What `read_scan_cache` returns: `Err` stands in for a corrupt cache.
+        answer: RefCell<Option<Result<Option<CachedScan>>>>,
+    }
+
+    impl FakeCacheStore {
+        fn with(cache: Option<CachedScan>) -> Self {
+            Self {
+                answer: RefCell::new(Some(Ok(cache))),
+            }
+        }
+
+        fn unreadable() -> Self {
+            Self {
+                answer: RefCell::new(Some(Err(anyhow::anyhow!("database disk image is malformed")))),
+            }
+        }
+    }
+
+    impl ScanCacheStore for FakeCacheStore {
+        fn read_scan_cache(&self, _account: &str) -> Result<Option<CachedScan>> {
+            self.answer
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| Ok(None))
+        }
+
+        fn write_scan_cache(&self, _cache: &CachedScan) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_cached_senders(&self, _account: &str, _emails: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopDataStore;
+
+    impl DataStore for NoopDataStore {
+        fn write_warnings(&self, _warnings: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn read_warnings(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn sender(email: &str, email_count: u32) -> SenderInfo {
+        SenderInfo {
+            display_name: String::new(),
+            email: email.to_string(),
+            domain: String::new(),
+            unsubscribe_urls: vec!["https://acme.com/unsub".to_string()],
+            unsubscribe_mailto: Vec::new(),
+            one_click: false,
+            list_id: None,
+            list_unsubscribe_raw: None,
+            email_count,
+            messages: Vec::new(),
+            last_seen: None,
+        }
+    }
+
+    fn cached_scan(senders: Vec<SenderInfo>) -> CachedScan {
+        CachedScan {
+            meta: CacheMeta {
+                scanned_at: "2026-03-18T19:30:00Z".to_string(),
+                format_version: 1,
+                account: "user@example.com".to_string(),
+            },
+            senders,
+            watermark: ScanWatermark {
+                highest_uid: std::collections::HashMap::new(),
+                uid_validity: std::collections::HashMap::new(),
+                adapter_state: None,
+            },
+        }
+    }
+
+    fn account() -> AccountConfig {
+        AccountConfig {
+            account_id: "user@example.com".to_string(),
+            provider_type: ProviderType::Imap,
+            host: Some("imap.example.com".to_string()),
+            port: Some(993),
+            username: "user@example.com".to_string(),
+            auth_type: AuthType::Password,
+            scan_folders: vec!["INBOX".to_string()],
+            archive_folder: "Unsubscribed".to_string(),
+            smtp_host: None,
+            smtp_port: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // usable_cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_absent_cache_is_not_usable() {
+        let store = FakeCacheStore::with(None);
+        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_cache_is_treated_as_absent_rather_than_fatal() {
+        let store = FakeCacheStore::unreadable();
+        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+    }
+
+    #[test]
+    fn a_cache_whose_senders_all_fall_below_min_emails_is_not_usable() {
+        // Nothing would be offered, so there is nothing worth asking about.
+        let store = FakeCacheStore::with(Some(cached_scan(vec![
+            sender("a@acme.com", 1),
+            sender("b@acme.com", 2),
+        ])));
+        assert!(usable_cache(&store, "user@example.com", 3).is_none());
+    }
+
+    #[test]
+    fn a_cache_with_no_senders_at_all_is_not_usable() {
+        let store = FakeCacheStore::with(Some(cached_scan(vec![])));
+        assert!(usable_cache(&store, "user@example.com", 0).is_none());
+    }
+
+    #[test]
+    fn usable_cache_keeps_only_senders_at_or_above_min_emails() {
+        let store = FakeCacheStore::with(Some(cached_scan(vec![
+            sender("below@acme.com", 2),
+            sender("exactly@acme.com", 3),
+            sender("above@acme.com", 9),
+        ])));
+
+        let (scanned_at, senders) =
+            usable_cache(&store, "user@example.com", 3).expect("cache is usable");
+        assert_eq!(scanned_at, "2026-03-18T19:30:00Z");
+        assert_eq!(
+            senders.iter().map(|s| s.email.as_str()).collect::<Vec<_>>(),
+            ["exactly@acme.com", "above@acme.com"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_scan, on the paths that never touch the mailbox
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cached_flag_with_no_cache_fails_and_points_at_the_scan_command() {
+        let store = FakeCacheStore::with(None);
+        let result = resolve_scan(
+            &account(),
+            &Credential::Password("pw".to_string()),
+            &NoopDataStore,
+            &store,
+            true,
+            false,
+            &Preferences::default(),
+        );
+        let Err(err) = result else {
+            panic!("--cached with no cache must fail");
+        };
+
+        assert!(
+            err.to_string().contains("unsubscribe scan"),
+            "the error should say how to make a cache: {err}"
+        );
+    }
+
+    #[test]
+    fn cached_flag_with_an_unreadable_cache_also_fails() {
+        let store = FakeCacheStore::unreadable();
+        assert!(resolve_scan(
+            &account(),
+            &Credential::Password("pw".to_string()),
+            &NoopDataStore,
+            &store,
+            true,
+            false,
+            &Preferences::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cached_flag_returns_the_filtered_cached_senders_without_scanning() {
+        let store = FakeCacheStore::with(Some(cached_scan(vec![
+            sender("below@acme.com", 1),
+            sender("keep@acme.com", 5),
+        ])));
+
+        let resolved = resolve_scan(
+            &account(),
+            &Credential::Password("pw".to_string()),
+            &NoopDataStore,
+            &store,
+            true,
+            false,
+            &Preferences::default(),
+        )
+        .expect("the cache should satisfy --cached");
+
+        assert!(resolved.from_cache);
+        assert_eq!(resolved.scanned_at, "2026-03-18T19:30:00Z");
+        assert_eq!(
+            resolved
+                .senders
+                .iter()
+                .map(|s| s.email.as_str())
+                .collect::<Vec<_>>(),
+            ["keep@acme.com"]
+        );
+        // The cache does not store warnings, so there are none to report.
+        assert!(resolved.warnings.is_empty());
+    }
+
+    #[test]
+    fn cached_flag_honours_the_min_emails_preference() {
+        let store = FakeCacheStore::with(Some(cached_scan(vec![sender("news@acme.com", 4)])));
+        let preferences = Preferences {
+            min_emails: 5,
+            ..Preferences::default()
+        };
+
+        // Every cached sender is filtered out, which leaves nothing to use.
+        assert!(resolve_scan(
+            &account(),
+            &Credential::Password("pw".to_string()),
+            &NoopDataStore,
+            &store,
+            true,
+            false,
+            &preferences,
+        )
+        .is_err());
+    }
+}
