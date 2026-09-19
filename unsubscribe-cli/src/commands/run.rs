@@ -3,7 +3,9 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
-use unsubscribe_core::{AccountConfig, Credential, DataStore, Folder, SenderInfo, UnsubscribeResult};
+use unsubscribe_core::{
+    AccountConfig, Credential, DataStore, Folder, Preferences, SenderInfo, UnsubscribeResult,
+};
 
 use crate::action_log::append_log_entry;
 use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
@@ -15,8 +17,8 @@ pub fn cmd_run(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    preferences: &Preferences,
     dry_run: bool,
-    min_emails: u32,
     cached: bool,
     mailto: bool,
 ) -> Result<()> {
@@ -26,11 +28,11 @@ pub fn cmd_run(
 
     // Phase 1: Scan (or load from cache)
     let (senders, warnings, scan_timestamp) = if cached {
-        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        let (senders, timestamp) = load_cached_scan(store, &account.account_id, preferences)?;
         eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
         (senders, Vec::new(), Some(timestamp))
     } else {
-        let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
+        let (senders, warnings) = do_scan(account, credential, store, preferences)?;
         let timestamp = now_iso8601();
         (senders, warnings, Some(timestamp))
     };
@@ -50,7 +52,7 @@ pub fn cmd_run(
 
     // Phase 2: TUI selection
     eprintln!("{BOLD}Opening selection screen...{RESET}\n");
-    let selections = match tui::select_senders(senders, scan_timestamp.as_deref())? {
+    let selections = match tui::select_senders(senders, scan_timestamp.as_deref(), preferences)? {
         Some(s) => s,
         None => {
             eprintln!("{YELLOW}Cancelled.{RESET}");
@@ -59,7 +61,7 @@ pub fn cmd_run(
     };
 
     // Partition selected senders: active ones get HTTP unsubscribe + archive,
-    // stale ones (last message >12 months ago) get archive-only.
+    // stale ones (no message within `stale_after_months`) get archive-only.
     let selected: Vec<&SenderInfo> = selections
         .iter()
         .filter(|(_, selected)| *selected)
@@ -72,7 +74,9 @@ pub fn cmd_run(
     }
 
     let (to_unsub, to_archive_only): (Vec<&SenderInfo>, Vec<&SenderInfo>) =
-        selected.iter().partition(|s| !is_stale(s));
+        selected
+            .iter()
+            .partition(|s| !is_stale(s, preferences.stale_after_months));
 
     let total_emails: u32 = selected.iter().map(|s| s.email_count).sum();
     if !to_unsub.is_empty() {

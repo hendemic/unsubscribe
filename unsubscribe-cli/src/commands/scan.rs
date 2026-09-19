@@ -4,7 +4,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use unsubscribe_core::{
-    AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, ScanWatermark, SenderInfo,
+    AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder, Preferences,
+    ScanWatermark, SenderInfo,
 };
 
 use crate::terminal::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
@@ -15,7 +16,7 @@ pub fn do_scan(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<(Vec<SenderInfo>, Vec<String>)> {
     eprintln!("{BOLD}Scanning mailbox...{RESET}\n");
     let provider = make_provider(account, credential)?;
@@ -68,17 +69,17 @@ pub fn do_scan(
     let senders: Vec<_> = scan_result
         .senders
         .into_iter()
-        .filter(|s| s.email_count >= min_emails)
+        .filter(|s| s.email_count >= preferences.min_emails)
         .collect();
 
     Ok((senders, scan_result.warnings))
 }
 
-/// Load cached scan results, applying min_emails filter.
+/// Load cached scan results, applying the `min_emails` preference.
 pub fn load_cached_scan(
     store: &dyn DataStore,
     account: &str,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<(Vec<SenderInfo>, String)> {
     let cache = store
         .read_scan_cache(account)?
@@ -89,7 +90,7 @@ pub fn load_cached_scan(
     let senders: Vec<_> = cache
         .senders
         .into_iter()
-        .filter(|s| s.email_count >= min_emails)
+        .filter(|s| s.email_count >= preferences.min_emails)
         .collect();
 
     Ok((senders, cache.meta.scanned_at))
@@ -110,9 +111,9 @@ pub fn cmd_scan(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
-    min_emails: u32,
+    preferences: &Preferences,
 ) -> Result<()> {
-    let (senders, warnings) = do_scan(account, credential, store, min_emails)?;
+    let (senders, warnings) = do_scan(account, credential, store, preferences)?;
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
@@ -136,7 +137,11 @@ pub fn cmd_scan(
         } else {
             &s.display_name
         };
-        let stale_marker = if is_stale(s) { " [stale]" } else { "" };
+        let stale_marker = if is_stale(s, preferences.stale_after_months) {
+            " [stale]"
+        } else {
+            ""
+        };
         let (method, method_color) = if s.one_click {
             ("1-click", GREEN)
         } else if !s.unsubscribe_urls.is_empty() {
@@ -154,7 +159,10 @@ pub fn cmd_scan(
     }
 
     let total_emails: u32 = senders.iter().map(|s| s.email_count).sum();
-    let stale_count = senders.iter().filter(|s| is_stale(s)).count();
+    let stale_count = senders
+        .iter()
+        .filter(|s| is_stale(s, preferences.stale_after_months))
+        .count();
     let stale_note = if stale_count > 0 {
         format!(" ({stale_count} stale)")
     } else {
@@ -175,16 +183,16 @@ pub fn cmd_export(
     account: &AccountConfig,
     credential: &Credential,
     store: &dyn DataStore,
+    preferences: &Preferences,
     output: &Path,
-    min_emails: u32,
     cached: bool,
 ) -> Result<()> {
     let senders = if cached {
-        let (senders, timestamp) = load_cached_scan(store, &account.account_id, min_emails)?;
+        let (senders, timestamp) = load_cached_scan(store, &account.account_id, preferences)?;
         eprintln!("{DIM}Using cached scan from {timestamp}{RESET}");
         senders
     } else {
-        let (senders, _) = do_scan(account, credential, store, min_emails)?;
+        let (senders, _) = do_scan(account, credential, store, preferences)?;
         senders
     };
 
@@ -205,7 +213,7 @@ pub fn cmd_export(
             .best_unsubscribe_url()
             .unwrap_or_default()
             .to_string();
-        let stale = is_stale(s).to_string();
+        let stale = is_stale(s, preferences.stale_after_months).to_string();
 
         wtr.write_record([
             &s.display_name,

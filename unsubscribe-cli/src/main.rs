@@ -11,7 +11,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::{Path, PathBuf};
-use unsubscribe_core::{AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, ProviderType};
+use unsubscribe_core::{
+    AccountConfig, ConfigStore, Credential, CredentialStore, EmailProvider, Preferences,
+    ProviderType,
+};
 use unsubscribe_persistence::{FileDataStore, KeyringCredentialStore, TomlConfigStore};
 
 #[derive(Parser)]
@@ -33,8 +36,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         /// Only include senders with at least this many emails
-        #[arg(short, long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(short, long)]
+        min_emails: Option<u32>,
         /// Use cached scan results instead of rescanning
         #[arg(long)]
         cached: bool,
@@ -45,8 +49,9 @@ enum Commands {
     /// Only scan and list senders with unsubscribe links
     Scan {
         /// Only include senders with at least this many emails
-        #[arg(short, long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(short, long)]
+        min_emails: Option<u32>,
     },
     /// Export scan results to CSV
     Export {
@@ -54,8 +59,9 @@ enum Commands {
         #[arg(short, long, default_value = "unsubscribe_senders.csv")]
         output: PathBuf,
         /// Only include senders with at least this many emails
-        #[arg(long, default_value = "3")]
-        min_emails: u32,
+        /// [default: the `min_emails` preference, or 3]
+        #[arg(long)]
+        min_emails: Option<u32>,
         /// Use cached scan results instead of rescanning
         #[arg(long)]
         cached: bool,
@@ -114,6 +120,7 @@ fn main() -> Result<()> {
     }
 
     let (account, credential) = load_account(&config_dir)?;
+    let preferences = TomlConfigStore::new(&config_dir).read_preferences()?;
     let store = FileDataStore::new();
 
     match cli.command {
@@ -122,13 +129,33 @@ fn main() -> Result<()> {
             min_emails,
             cached,
             mailto,
-        } => commands::run::cmd_run(&account, &credential, &store, dry_run, min_emails, cached, mailto),
-        Commands::Scan { min_emails } => commands::scan::cmd_scan(&account, &credential, &store, min_emails),
+        } => commands::run::cmd_run(
+            &account,
+            &credential,
+            &store,
+            &with_min_emails(preferences, min_emails),
+            dry_run,
+            cached,
+            mailto,
+        ),
+        Commands::Scan { min_emails } => commands::scan::cmd_scan(
+            &account,
+            &credential,
+            &store,
+            &with_min_emails(preferences, min_emails),
+        ),
         Commands::Export {
             output,
             min_emails,
             cached,
-        } => commands::scan::cmd_export(&account, &credential, &store, &output, min_emails, cached),
+        } => commands::scan::cmd_export(
+            &account,
+            &credential,
+            &store,
+            &with_min_emails(preferences, min_emails),
+            &output,
+            cached,
+        ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential),
         Commands::Warnings
         | Commands::Update { .. }
@@ -136,6 +163,20 @@ fn main() -> Result<()> {
         | Commands::Reauth
         | Commands::Uninstall
         | Commands::Completions { .. } => unreachable!(),
+    }
+}
+
+/// Apply a `--min-emails` flag on top of the configured preferences.
+///
+/// The flag wins when given; otherwise the `[preferences]` value (or its
+/// default) stands.
+fn with_min_emails(preferences: Preferences, flag: Option<u32>) -> Preferences {
+    match flag {
+        Some(min_emails) => Preferences {
+            min_emails,
+            ..preferences
+        },
+        None => preferences,
     }
 }
 
