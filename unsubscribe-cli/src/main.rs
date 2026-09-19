@@ -40,9 +40,12 @@ enum Commands {
         /// Only include senders with at least this many emails
         #[arg(short, long, default_value = "3")]
         min_emails: u32,
-        /// Use cached scan results instead of rescanning
+        /// Use cached scan results without asking
         #[arg(long)]
         cached: bool,
+        /// Rescan the mailbox without asking, ignoring any cached scan
+        #[arg(long, conflicts_with = "cached")]
+        rescan: bool,
         /// Send unsubscribe emails for mailto-only senders
         #[arg(long)]
         mailto: bool,
@@ -61,9 +64,12 @@ enum Commands {
         /// Only include senders with at least this many emails
         #[arg(long, default_value = "3")]
         min_emails: u32,
-        /// Use cached scan results instead of rescanning
+        /// Use cached scan results without asking
         #[arg(long)]
         cached: bool,
+        /// Rescan the mailbox without asking, ignoring any cached scan
+        #[arg(long, conflicts_with = "cached")]
+        rescan: bool,
     },
     /// List available IMAP folders (useful for configuring scan_folders)
     ///
@@ -148,6 +154,7 @@ fn main() -> Result<()> {
             dry_run,
             min_emails,
             cached,
+            rescan,
             mailto,
         } => commands::run::cmd_run(
             &account,
@@ -158,6 +165,7 @@ fn main() -> Result<()> {
             dry_run,
             min_emails,
             cached,
+            rescan,
             mailto,
         ),
         Commands::Scan { min_emails } => {
@@ -174,6 +182,7 @@ fn main() -> Result<()> {
             output,
             min_emails,
             cached,
+            rescan,
         } => commands::scan::cmd_export(
             &account,
             &credential,
@@ -182,6 +191,7 @@ fn main() -> Result<()> {
             &output,
             min_emails,
             cached,
+            rescan,
         ),
         Commands::ListFolders => commands::misc::cmd_list_folders(&account, &credential),
         Commands::Warnings

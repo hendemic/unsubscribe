@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use unsubscribe_core::{split_previously_unsubscribed, SenderInfo, UnsubscribeAttempt};
 
-use crate::time::{is_stale, parse_iso8601_age_secs};
+use crate::time::{
+    is_stale, parse_iso8601_age_secs, utc_to_local_display, MONTH_NAMES, SCAN_MAX_AGE_SECS,
+};
 
 /// Guard that restores the terminal on drop, even if we panic or return early
 struct TerminalGuard;
@@ -641,7 +643,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let is_stale_scan = parse_iso8601_age_secs(ts)
-            .map(|scan_secs| now_secs.saturating_sub(scan_secs) > 7 * 24 * 3600)
+            .map(|scan_secs| now_secs.saturating_sub(scan_secs) > SCAN_MAX_AGE_SECS)
             .unwrap_or(false);
         let color = if is_stale_scan { Color::Red } else { Color::DarkGray };
         let display_ts = utc_to_local_display(ts).unwrap_or_else(|| ts.clone());
@@ -863,34 +865,6 @@ fn truncate_str(s: &str, max: usize) -> String {
         None => s.to_string(),
     }
 }
-
-/// Convert a UTC ISO 8601 timestamp to a local-time display string.
-/// Uses libc::localtime_r for timezone conversion.
-fn utc_to_local_display(utc_ts: &str) -> Option<String> {
-    let unix_secs = parse_iso8601_age_secs(utc_ts)? as i64;
-
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time_t = unix_secs as libc::time_t;
-    let result = unsafe { libc::localtime_r(&time_t, &mut tm) };
-    if result.is_null() {
-        return None;
-    }
-
-    let month_name = MONTH_NAMES.get(tm.tm_mon as usize)?;
-    Some(format!(
-        "{} {:02}, {} {:02}:{:02}",
-        month_name,
-        tm.tm_mday,
-        1900 + tm.tm_year,
-        tm.tm_hour,
-        tm.tm_min,
-    ))
-}
-
-const MONTH_NAMES: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
 
 /// Format a Unix timestamp as "Mon YYYY" (e.g., "Mar 2025"), or "-" if None.
 fn format_last_seen(last_seen: Option<i64>) -> String {

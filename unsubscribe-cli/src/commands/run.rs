@@ -9,9 +9,9 @@ use unsubscribe_core::{
 
 use crate::action_log::append_log_entry;
 use crate::commands::load_history;
-use crate::commands::scan::{do_scan, load_cached_scan, print_warnings_summary};
+use crate::commands::scan::{print_warnings_summary, resolve_scan};
 use crate::terminal::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
-use crate::time::{is_stale, now_iso8601, now_unix_secs};
+use crate::time::{is_stale, now_unix_secs};
 use crate::{http, make_email_sender, make_provider, tui};
 
 pub fn cmd_run(
@@ -23,26 +23,39 @@ pub fn cmd_run(
     dry_run: bool,
     min_emails: u32,
     cached: bool,
+    rescan: bool,
     mailto: bool,
 ) -> Result<()> {
     if dry_run {
         eprintln!("{BOLD}{YELLOW}=== DRY RUN MODE — no changes will be made ==={RESET}\n");
     }
 
-    // Phase 1: Scan (or load from cache)
-    let (senders, warnings, scan_timestamp) = if cached {
-        let (senders, timestamp) = load_cached_scan(cache_store, &account.account_id, min_emails)?;
-        eprintln!("{BOLD}Using cached scan from {timestamp}{RESET}\n");
-        (senders, Vec::new(), Some(timestamp))
-    } else {
-        let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
-        let timestamp = now_iso8601();
-        (senders, warnings, Some(timestamp))
-    };
+    // Phase 1: Scan, or reuse a cached scan the user chose to keep
+    let resolved = resolve_scan(
+        account,
+        credential,
+        store,
+        cache_store,
+        cached,
+        rescan,
+        min_emails,
+    )?;
+    let from_cache = resolved.from_cache;
+    let warnings = resolved.warnings;
+    let senders = resolved.senders;
+    // The TUI header shows when the senders on screen were found, cached or not.
+    let scan_timestamp = Some(resolved.scanned_at);
+
+    if from_cache {
+        eprintln!(
+            "{BOLD}Using cached scan from {}{RESET}\n",
+            scan_timestamp.as_deref().unwrap_or_default()
+        );
+    }
 
     if senders.is_empty() {
         println!("{YELLOW}No senders with unsubscribe links found.{RESET}");
-        if !cached {
+        if !from_cache {
             print_warnings_summary(&warnings);
         }
         return Ok(());
@@ -267,7 +280,7 @@ pub fn cmd_run(
         }
     }
 
-    if !cached {
+    if !from_cache {
         print_warnings_summary(&warnings);
     }
 

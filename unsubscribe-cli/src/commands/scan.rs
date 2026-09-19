@@ -1,16 +1,21 @@
 //! Scan command and the scan pipeline shared with `run` and `export`:
 //! scanning the mailbox (or loading a cached scan) and printing results.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use unsubscribe_core::{
-    latest_successful_attempts, AccountConfig, CacheMeta, CachedScan, Credential, DataStore, Folder,
-    HistoryStore, ScanCacheStore, ScanWatermark, SenderInfo,
+    decide_scan_action, latest_successful_attempts, AccountConfig, CacheMeta, CachedScan,
+    CachedScanSummary, Credential, DataStore, Folder, HistoryStore, ScanAction, ScanCacheStore,
+    ScanWatermark, SenderInfo,
 };
 
 use crate::commands::load_history;
 use crate::terminal::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
-use crate::time::{is_stale, now_iso8601};
+use crate::time::{
+    age_secs_since, format_relative_age, is_stale, now_iso8601, utc_to_local_date,
+    SCAN_MAX_AGE_SECS,
+};
 use crate::{make_provider, progress};
 
 pub fn do_scan(
@@ -80,17 +85,92 @@ pub fn do_scan(
     Ok((senders, scan_result.warnings))
 }
 
-/// Load cached scan results, applying min_emails filter.
-pub fn load_cached_scan(
+/// The senders a `run` or `export` works from, and where they came from.
+pub struct ResolvedScan {
+    pub senders: Vec<SenderInfo>,
+    /// Scan warnings. Empty when the senders came from the cache, which does
+    /// not store them.
+    pub warnings: Vec<String>,
+    /// When the scan behind these senders was taken (ISO 8601, UTC).
+    pub scanned_at: String,
+    pub from_cache: bool,
+}
+
+/// Decide between the cached scan and a fresh one, then produce the senders.
+///
+/// The decision itself is [`decide_scan_action`] in core; this only gathers the
+/// inputs, asks the question when core says to, and carries out the answer.
+pub fn resolve_scan(
+    account: &AccountConfig,
+    credential: &Credential,
+    store: &dyn DataStore,
+    cache_store: &dyn ScanCacheStore,
+    cached: bool,
+    rescan: bool,
+    min_emails: u32,
+) -> Result<ResolvedScan> {
+    let usable = usable_cache(cache_store, &account.account_id, min_emails);
+    let summary = usable.as_ref().map(|(scanned_at, senders)| CachedScanSummary {
+        sender_count: senders.len(),
+        age_secs: age_secs_since(scanned_at),
+    });
+
+    let action = decide_scan_action(
+        summary,
+        cached,
+        rescan,
+        std::io::stdin().is_terminal(),
+        SCAN_MAX_AGE_SECS,
+    );
+
+    let use_cache = match action {
+        ScanAction::UseCache => true,
+        ScanAction::Rescan => false,
+        ScanAction::CacheUnavailable => {
+            bail!("No cached scan results found. Run `unsubscribe scan` first.")
+        }
+        ScanAction::Ask { default_cached } => {
+            let (scanned_at, senders) = usable.as_ref().expect("Ask implies a usable cache");
+            prompt_use_cached(scanned_at, senders.len(), default_cached)?
+        }
+    };
+
+    if use_cache {
+        let (scanned_at, senders) = usable.expect("cache was checked before use");
+        return Ok(ResolvedScan {
+            senders,
+            warnings: Vec::new(),
+            scanned_at,
+            from_cache: true,
+        });
+    }
+
+    let (senders, warnings) = do_scan(account, credential, store, cache_store, min_emails)?;
+    Ok(ResolvedScan {
+        senders,
+        warnings,
+        scanned_at: now_iso8601(),
+        from_cache: false,
+    })
+}
+
+/// The cached scan for an account, if there is one worth offering.
+///
+/// An unreadable cache is warned about and then treated as absent -- it costs
+/// a rescan, not a run. So is an empty one: after enough runs prune their
+/// senders the cache holds nothing to choose, and asking would be noise.
+fn usable_cache(
     cache_store: &dyn ScanCacheStore,
     account: &str,
     min_emails: u32,
-) -> Result<(Vec<SenderInfo>, String)> {
-    let cache = cache_store
-        .read_scan_cache(account)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("No cached scan results found. Run `unsubscribe scan` first.")
-        })?;
+) -> Option<(String, Vec<SenderInfo>)> {
+    let cache = match cache_store.read_scan_cache(account) {
+        Ok(cache) => cache?,
+        Err(e) => {
+            eprintln!("{YELLOW}Warning: could not read the scan cache: {e}{RESET}");
+            return None;
+        }
+    };
 
     let senders: Vec<_> = cache
         .senders
@@ -98,7 +178,47 @@ pub fn load_cached_scan(
         .filter(|s| s.email_count >= min_emails)
         .collect();
 
-    Ok((senders, cache.meta.scanned_at))
+    (!senders.is_empty()).then_some((cache.meta.scanned_at, senders))
+}
+
+/// Ask whether to reuse the cached scan. Returns true for "use cached".
+///
+/// Anything unrecognised -- including a bare Enter or a closed stdin -- takes
+/// the default, which is reuse for a fresh scan and a rescan for a stale one.
+fn prompt_use_cached(scanned_at: &str, sender_count: usize, default_cached: bool) -> Result<bool> {
+    let when = utc_to_local_date(scanned_at).unwrap_or_else(|| scanned_at.to_string());
+    let age = age_secs_since(scanned_at)
+        .map(format_relative_age)
+        .map(|age| {
+            // A stale cache says so in red: it is the reason the default flipped.
+            if default_cached {
+                format!(" ({DIM}{age}{RESET})")
+            } else {
+                format!(" ({RED}{age}{RESET})")
+            }
+        })
+        .unwrap_or_default();
+    let choices = if default_cached {
+        "[U]se cached / [r]escan"
+    } else {
+        "[u]se cached / [R]escan"
+    };
+
+    eprint!(
+        "{BOLD}Last scan:{RESET} {when}{age} \u{2014} {sender_count} senders. {choices}: "
+    );
+    std::io::stderr().flush()?;
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return Ok(default_cached);
+    }
+
+    Ok(match answer.trim().chars().next() {
+        Some('u') | Some('U') => true,
+        Some('r') | Some('R') => false,
+        _ => default_cached,
+    })
 }
 
 pub fn print_warnings_summary(warnings: &[String]) {
@@ -210,15 +330,21 @@ pub fn cmd_export(
     output: &Path,
     min_emails: u32,
     cached: bool,
+    rescan: bool,
 ) -> Result<()> {
-    let senders = if cached {
-        let (senders, timestamp) = load_cached_scan(cache_store, &account.account_id, min_emails)?;
-        eprintln!("{DIM}Using cached scan from {timestamp}{RESET}");
-        senders
-    } else {
-        let (senders, _) = do_scan(account, credential, store, cache_store, min_emails)?;
-        senders
-    };
+    let resolved = resolve_scan(
+        account,
+        credential,
+        store,
+        cache_store,
+        cached,
+        rescan,
+        min_emails,
+    )?;
+    if resolved.from_cache {
+        eprintln!("{DIM}Using cached scan from {}{RESET}", resolved.scanned_at);
+    }
+    let senders = resolved.senders;
 
     let mut wtr =
         csv::Writer::from_path(output).context("Failed to create CSV")?;
