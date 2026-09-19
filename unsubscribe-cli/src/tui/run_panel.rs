@@ -1,4 +1,4 @@
-//! The Run panel: what the last scan found, and the two ways to act on it.
+//! The Run panel: what the last scan found, and the three ways to act on it.
 //!
 //! The numbers are not computed here. [`RunStats::gather`] hands the cached
 //! scan and the account's history to the same core functions a run uses, and
@@ -30,8 +30,8 @@ pub struct RunStats {
     /// Warnings the last scan recorded.
     pub warnings: usize,
     /// What core says about reusing the cached scan, asked as the "unsubscribe
-    /// from the last scan" action asks it: demand the cache, and see whether
-    /// there is one.
+    /// from cached" action asks it: demand the cache, and see whether there
+    /// is one.
     pub cache: ScanAction,
 }
 
@@ -98,21 +98,26 @@ impl RunStats {
     }
 }
 
-/// One of the two things the Run panel offers to do.
+/// One of the three things the Run panel offers to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunChoice {
     ScanAndUnsubscribe,
     FromLastScan,
+    /// Scan and refresh the cache, but stop there rather than moving on to
+    /// sender selection.
+    ScanOnly,
 }
 
 impl RunChoice {
-    pub const ALL: [RunChoice; 2] = [Self::ScanAndUnsubscribe, Self::FromLastScan];
+    pub const ALL: [RunChoice; 3] =
+        [Self::ScanAndUnsubscribe, Self::FromLastScan, Self::ScanOnly];
 
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::ScanAndUnsubscribe => "Scan and unsubscribe",
-            Self::FromLastScan => "Unsubscribe from last scan",
+            Self::ScanAndUnsubscribe => "Unsubscribe from new scan",
+            Self::FromLastScan => "Unsubscribe from cached",
+            Self::ScanOnly => "Scan only",
         }
     }
 
@@ -131,6 +136,10 @@ impl RunChoice {
                 "Choose from the {} senders the last scan found.",
                 stats.sender_count
             ),
+            Self::ScanOnly => {
+                "Read the mailbox and update the cached scan, without unsubscribing."
+                    .to_string()
+            }
         }
     }
 
@@ -138,7 +147,7 @@ impl RunChoice {
     #[must_use]
     pub fn is_available(self, stats: &RunStats) -> bool {
         match self {
-            Self::ScanAndUnsubscribe => true,
+            Self::ScanAndUnsubscribe | Self::ScanOnly => true,
             Self::FromLastScan => stats.has_usable_cache(),
         }
     }
@@ -176,6 +185,7 @@ impl RunPanel {
                 match self.selected() {
                     RunChoice::ScanAndUnsubscribe => Nav::Effect(Effect::Scan),
                     RunChoice::FromLastScan => Nav::Effect(Effect::Review),
+                    RunChoice::ScanOnly => Nav::Effect(Effect::ScanOnly),
                 }
             }
             Action::Back => Nav::Pop,
@@ -301,6 +311,7 @@ mod tests {
             Nav::Quit => "quit",
             Nav::Effect(Effect::Scan) => "scan",
             Nav::Effect(Effect::Review) => "review",
+            Nav::Effect(Effect::ScanOnly) => "scan only",
             Nav::Effect(_) => "other effect",
         }
     }
@@ -498,12 +509,16 @@ mod tests {
     }
 
     #[test]
-    fn moving_walks_the_two_actions_and_stops_at_both_ends() {
+    fn moving_walks_the_three_actions_and_stops_at_both_ends() {
         let mut panel = panel(with_cache());
 
         panel.on_action(Action::MoveDown);
         assert_eq!(panel.selected(), RunChoice::FromLastScan);
         panel.on_action(Action::MoveDown);
+        assert_eq!(panel.selected(), RunChoice::ScanOnly);
+        panel.on_action(Action::MoveDown);
+        assert_eq!(panel.selected(), RunChoice::ScanOnly);
+        panel.on_action(Action::MoveUp);
         assert_eq!(panel.selected(), RunChoice::FromLastScan);
         panel.on_action(Action::MoveUp);
         assert_eq!(panel.selected(), RunChoice::ScanAndUnsubscribe);
@@ -518,6 +533,8 @@ mod tests {
         assert_eq!(nav_name(&panel.on_action(Action::Activate)), "scan");
         panel.on_action(Action::MoveDown);
         assert_eq!(nav_name(&panel.on_action(Action::Activate)), "review");
+        panel.on_action(Action::MoveDown);
+        assert_eq!(nav_name(&panel.on_action(Action::Activate)), "scan only");
     }
 
     #[test]
@@ -562,7 +579,15 @@ mod tests {
         let mut panel = panel(with_cache());
         panel.cursor = 99;
 
-        assert_eq!(panel.selected(), RunChoice::FromLastScan);
+        assert_eq!(panel.selected(), RunChoice::ScanOnly);
+    }
+
+    #[test]
+    fn scan_only_is_always_available_and_says_it_will_not_unsubscribe() {
+        let description = RunChoice::ScanOnly.description(&RunStats::default());
+
+        assert!(RunChoice::ScanOnly.is_available(&RunStats::default()));
+        assert!(description.contains("without unsubscribing"), "{description}");
     }
 
     #[test]
@@ -586,7 +611,7 @@ mod tests {
         for action in [Action::PageDown, Action::JumpDown, Action::Last] {
             let mut panel = panel(with_cache());
             panel.on_action(action);
-            assert_eq!(panel.selected(), RunChoice::FromLastScan, "{action:?}");
+            assert_eq!(panel.selected(), RunChoice::ScanOnly, "{action:?}");
         }
         for action in [Action::PageUp, Action::JumpUp, Action::First] {
             let mut panel = panel(with_cache());
